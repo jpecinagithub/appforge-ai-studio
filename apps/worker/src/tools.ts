@@ -51,6 +51,18 @@ function strArg(args: Record<string, unknown>, name: string, required = true): s
 }
 
 /**
+ * Content para write_file: tolerante con objetos/arrays (el modelo a veces
+ * pasa el objeto JS en vez del texto JSON). Los serializa con indentación.
+ */
+function contentArg(args: Record<string, unknown>): string {
+  const v = args['content'];
+  if (v === undefined || v === null) throw new Error('missing required argument: content');
+  if (typeof v === 'string') return v;
+  if (typeof v === 'object') return JSON.stringify(v, null, 2);
+  throw new Error(`argument content must be a string (got ${typeof v})`);
+}
+
+/**
  * Resolve `p` inside `root`. Rejects absolute paths, null bytes and any
  * path escaping `root` (e.g. `../` traversal) with an INVALID_PATH error.
  */
@@ -146,7 +158,7 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
   const t0 = Date.now();
   try {
     const p = strArg(args, 'path');
-    const content = strArg(args, 'content');
+    const content = contentArg(args);
     const abs = resolveIn(ctx.frontendDir, p);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
@@ -381,7 +393,7 @@ const S = (description: string) => ({ type: 'string', description });
 export const TOOL_DEFS: ToolDef[] = [
   { name: 'list_files', description: 'List the project file tree (frontend/ as root).', parameters: { type: 'object', properties: { path: S('Subdirectory relative to frontend/, default ".".') }, additionalProperties: false } },
   { name: 'read_file', description: 'Read a text file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
-  { name: 'write_file', description: 'Write (create or overwrite) a file relative to frontend/. Creates parent dirs.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), content: S('Full file content.') }, required: ['path', 'content'], additionalProperties: false } },
+  { name: 'write_file', description: 'Write (create or overwrite) a file relative to frontend/. Creates parent dirs. content MUST be a string with the full file text (for .json files, pass the JSON text, not an object).', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), content: S('Full file content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
   { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/.', parameters: { type: 'object', properties: { path: S('Path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/.', parameters: { type: 'object', properties: { path: S('Directory path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
