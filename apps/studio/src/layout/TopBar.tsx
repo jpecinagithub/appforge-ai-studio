@@ -17,7 +17,7 @@ function Logo() {
         <span className="block text-[15px] font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
           AppForge <span className="text-cyan-600 dark:text-cyan-300">AI Studio</span>
         </span>
-        <span className="block text-[10px] font-medium uppercase tracking-widest text-zinc-400 dark:text-zinc-500">
+        <span className="block text-xs text-teal-600 dark:text-teal-400">
           Created by jpecina
         </span>
       </span>
