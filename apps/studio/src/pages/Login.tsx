@@ -33,7 +33,7 @@ export function Login({ sessionExpired }: { sessionExpired?: boolean }) {
           <h1 className="text-lg font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
             AppForge <span className="text-cyan-600 dark:text-cyan-300">AI Studio</span>
           </h1>
-          <p className="mt-1 text-xs uppercase tracking-widest text-zinc-400 dark:text-zinc-500">
+          <p className="mt-1 text-sm text-teal-600 dark:text-teal-400">
             {t('brand.tagline')}
           </p>
           <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">{t('login.subtitle')}</p>
