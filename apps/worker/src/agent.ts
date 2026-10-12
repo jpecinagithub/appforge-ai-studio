@@ -50,9 +50,16 @@ const DEFAULT_LIMITS: AgentLimits = {
 function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
   const userLang = lang === 'es' ? 'Spanish' : 'English';
   return [
-    'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory (frontend/ holds the Vite+React+TypeScript app).',
+    'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
     '',
-    `Available tools: ${toolNames.join(', ')}. All file paths are relative to the project root and confined to it (".." escapes are rejected).`,
+    'PROJECT LAYOUT (paths are relative to the project root):',
+    '- frontend/ — the Vite+React+TypeScript app. ALL source code goes here (e.g. frontend/src/App.tsx, frontend/src/components/Board.tsx).',
+    '- PROJECT_CONTEXT.md — notes about the project; read it first, keep it updated.',
+    '- Never write app code outside frontend/.',
+    '',
+    `Available tools: ${toolNames.join(', ')}.`,
+    '- To explore files, use list_files (NOT run_command with ls/cat — only npm, npx, node are allowlisted in run_command, which runs with cwd=frontend/).',
+    '- write_file/create_directory paths must start with frontend/ for app code.',
     '',
     'RULES:',
     '1. Keep an internal plan of at most 5 tasks. Do not narrate the plan; just work.',
