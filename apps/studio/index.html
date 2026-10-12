@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="description" content="AppForge AI Studio — AI-assisted web app development studio. Created by jpecina." />
+    <title>AppForge AI Studio</title>
+    <script>
+      // Aplica el tema guardado antes del primer pintado (evita flash).
+      try {
+        var t = localStorage.getItem('appforge_theme') || 'dark';
+        if (t === 'dark') document.documentElement.classList.add('dark');
+        var l = localStorage.getItem('appforge_lang') || 'es';
+        document.documentElement.lang = l;
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

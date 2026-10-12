@@ -1,0 +1,38 @@
+# AppForge AI Studio — single-server deployment (Oracle Cloud / any Linux host).
+# Run from this directory:  docker compose up -d --build
+
+services:
+  studio:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    container_name: appforge-studio
+    env_file:
+      - ../.env # repo-root env created from .env.example
+    environment:
+      - DATA_DIR=/data/appforge
+      - PORT=3001
+    ports:
+      - "3001:3001"
+    volumes:
+      - appforge-data:/data/appforge
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    container_name: appforge-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - studio
+    restart: unless-stopped
+
+volumes:
+  appforge-data: # projects, SQLite db, revisions, logs — survives rebuilds
+  caddy-data:
+  caddy-config:

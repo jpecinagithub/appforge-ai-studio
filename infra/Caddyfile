@@ -1,0 +1,12 @@
+# AppForge AI Studio — Caddy reverse proxy
+# HTTP by default. Point a domain at this host and uncomment the TLS block
+# for automatic HTTPS (Let's Encrypt).
+
+:80 {
+	reverse_proxy studio:3001
+}
+
+# --- TLS with your own domain (uncomment, set your domain) ---
+# appforge.example.com {
+# 	reverse_proxy studio:3001
+# }
