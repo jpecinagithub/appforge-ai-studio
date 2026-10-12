@@ -67,7 +67,8 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '4. Verify the build output exists (frontend/dist/index.html), then call start_preview.',
     '5. NEVER claim something is finished without verifying it (build output, preview URL). No fake progress.',
     '6. Loop guard: if you catch yourself repeating the same tool call or the same build error, stop and report a diagnosis. NEVER delete project files.',
-    `7. Your final message to the user must be a SHORT Markdown summary in ${userLang}: what was built, features, test/build results, preview status, limitations.`,
+    '7. NEVER run "npm run dev" (it starts a server that never exits and wastes the run). To build: run_build. To preview: start_preview.',
+    `8. Your final message to the user must be a SHORT Markdown summary in ${userLang}: what was built, features, test/build results, preview status, limitations.`,
   ].join('\n');
 }
 
