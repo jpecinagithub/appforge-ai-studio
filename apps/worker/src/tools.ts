@@ -60,8 +60,9 @@ export function resolveIn(root: string, p: string): string {
     e.code = 'INVALID_PATH';
     throw e;
   }
-  const resolved = path.resolve(root, p);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+  const absRoot = path.resolve(root);
+  const resolved = path.resolve(absRoot, p);
+  if (resolved !== absRoot && !resolved.startsWith(absRoot + path.sep)) {
     const e = new Error(`path escapes project directory: ${p}`) as Error & { code: string };
     e.code = 'INVALID_PATH';
     throw e;
