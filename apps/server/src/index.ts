@@ -481,6 +481,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': opts.corsOrigin ?? '*',
     });
     let lastSeq = 0;
     let closed = false;
