@@ -141,7 +141,14 @@ export async function chatLlm(cfg: LlmConfig, messages: LlmMessage[], tools: Too
     } catch (err) {
       if (err instanceof LlmError && (err.code === 'LLM_RATE_LIMIT' || err.code === 'LLM_SERVER_ERROR')) throw err;
       if (err instanceof Error && err.name === 'AbortError') {
-        throw new LlmError('LLM_TIMEOUT', `LLM call timed out after ${cfg.timeoutMs}ms`);
+        // Timeouts are transient (provider-side stalls): retry with backoff
+        // like 429/5xx instead of failing the whole run on the first stall.
+        lastError = new LlmError('LLM_TIMEOUT', `LLM call timed out after ${cfg.timeoutMs}ms (attempt ${attempt}/${MAX_ATTEMPTS})`);
+        if (attempt < MAX_ATTEMPTS) {
+          await sleep(backoffMs(attempt, null));
+          continue;
+        }
+        throw lastError;
       }
       // Any other error (network, parse): fail fast per contract (retries only on 429/5xx).
       throw err instanceof LlmError ? err : new LlmError('LLM_REQUEST_FAILED', String((err as Error)?.message ?? err));
