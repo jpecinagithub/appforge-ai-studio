@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Download, Loader2, LogOut, Moon, Rocket, Settings as SettingsIcon, Sun } from 'lucide-react';
-import { downloadArchive, isDemoMode } from '../api/client';
+import { downloadArchive, isDemoMode, setDemoMode } from '../api/client';
 import { useActiveProject } from '../project/active';
 import { useAgent } from '../agent';
 import { useAuth } from '../auth';
@@ -33,6 +33,11 @@ export function TopBar() {
   const { anyWorking } = useAgent();
   const navigate = useNavigate();
   const [downloading, setDownloading] = useState(false);
+
+  const onLogout = () => {
+    setDemoMode(false);
+    logout();
+  };
 
   const onDownload = async () => {
     if (!project || downloading) return;
@@ -135,7 +140,7 @@ export function TopBar() {
           </span>
         </Link>
 
-        <IconBtn label={t('topbar.logout')} onClick={logout}>
+        <IconBtn label={t('topbar.logout')} onClick={onLogout}>
           <LogOut size={17} />
         </IconBtn>
       </div>
