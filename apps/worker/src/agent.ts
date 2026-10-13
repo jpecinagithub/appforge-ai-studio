@@ -446,9 +446,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         content: JSON.stringify({ ...result, output: result.output?.slice(0, 16000) }),
       });
     }
-    // Finalize at the budget boundary, instead of discarding a successful last
-    // tool call or abandoning fresh compiler errors with no chance to repair.
-    if ((!repairing && iter >= limits.maxIterations) || (repairing && repairCalls >= repairTurns)) {
+    // Repair turns must receive fresh compiler/browser diagnostics after each
+    // response, not only after spending the entire repair reserve on patches.
+    if ((!repairing && iter >= limits.maxIterations) || (repairing && resp.toolCalls.length > 0)) {
       if (await verify()) return;
       if (repairCalls >= repairTurns) break;
     }
