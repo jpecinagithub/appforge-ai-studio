@@ -49,11 +49,13 @@ if (process.argv[2] === 'start') {
     fs.writeFileSync(file, JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ projectId: item.projectId, runId: run.id }));
   }
-} else if (process.argv[2] === 'repair') {
+} else if (['repair', 'repair-controls'].includes(process.argv[2])) {
   const projectId = process.argv[3];
   if (!projectId) throw new Error('repair requires a project id');
   const project = await api(`/projects/${projectId}`);
-  const prompt = 'Completa la petición original de este proyecto. Revisa los errores y los archivos existentes, corrige la compilación y comprueba en el navegador que el catálogo funciona y cada coche permite marcar y desmarcar thumbs up. Todo control visible debe funcionar. Conserva los favoritos al recargar. Publica la preview verificada.';
+  const prompt = process.argv[2] === 'repair-controls'
+    ? 'La prueba real de esta tienda encuentra dos controles decorativos: Buscar coche no filtra y Ver detalles no tiene acción. Lee CarCatalog.tsx y Car.tsx y corrige ambos conservando el catálogo. Añade contador visible de resultados y estado sin resultados; el detalle debe abrir información del coche y poder cerrarse. Conserva marcar/desmarcar favoritos y su persistencia. Prueba con test_preview: buscar Tesla y comprobar 1 resultado, buscar xyz y comprobar sin resultados, limpiar la búsqueda, abrir/cerrar detalles y marcar/desmarcar favorito con recarga. Usa aserciones exactas del texto real. No declares terminado sin probar estos controles. No cambies la configuración de compilación.'
+    : 'Completa la petición original de este proyecto. Revisa los errores y los archivos existentes, corrige la compilación y comprueba en el navegador que el catálogo funciona y cada coche permite marcar y desmarcar thumbs up. Todo control visible debe funcionar. Conserva los favoritos al recargar. Publica la preview verificada.';
   const run = await api(`/projects/${projectId}/runs`, { prompt });
   const report = JSON.parse(fs.readFileSync(file, 'utf8'));
   report.push({ name: project.name, projectId, runId: run.id, prompt });
