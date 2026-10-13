@@ -17,6 +17,7 @@ export function Login({ sessionExpired }: { sessionExpired?: boolean }) {
       setError(true);
       return;
     }
+    setDemoMode(false);
     setToken(value.trim());
   };
 
