@@ -1,5 +1,5 @@
 # AppForge AI Studio — backend container
-FROM node:22-slim
+FROM node:24-slim
 
 # ---------------------------------------------------------------------------
 # Environment variables (all documented; see .env.example at repo root):
