@@ -207,6 +207,12 @@ export function previewUrlFor(projectId: string): string {
   return `${API_BASE}/p/${encodeURIComponent(projectId)}/`;
 }
 
+/** URL absoluta compartible de una app servida por Oracle. */
+export function publicAppUrlFor(projectId: string, origin?: string): string {
+  const fallbackOrigin = origin ?? (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
+  return new URL(previewUrlFor(projectId), fallbackOrigin).href;
+}
+
 /** Abre la preview real o, en demo, un documento local funcional. */
 export function openProjectPreview(projectId: string): void {
   if (!isDemoMode()) {

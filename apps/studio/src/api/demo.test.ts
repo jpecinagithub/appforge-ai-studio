@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { previewUrlFor } from './client';
+import { previewUrlFor, publicAppUrlFor } from './client';
 import { demoPreviewHtml } from './demo';
 
 describe('demo previews', () => {
@@ -19,5 +19,11 @@ describe('demo previews', () => {
 describe('previewUrlFor', () => {
   it('encodes project ids as a single safe path segment', () => {
     expect(previewUrlFor('project/with spaces?')).toBe('/p/project%2Fwith%20spaces%3F/');
+  });
+
+  it('builds an absolute, shareable app URL', () => {
+    expect(publicAppUrlFor('my app', 'https://studio.example')).toBe(
+      'https://studio.example/p/my%20app/',
+    );
   });
 });

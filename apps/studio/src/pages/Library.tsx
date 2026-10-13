@@ -1,8 +1,8 @@
 /* oxlint-disable react/set-state-in-effect -- async resource loading owns loading/error state */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowDownToLine, ExternalLink, FolderOpen, Search, Trash2 } from 'lucide-react';
-import { api, downloadArchive, previewUrlFor } from '../api/client';
+import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2 } from 'lucide-react';
+import { api, downloadArchive, isDemoMode, openProjectPreview, publicAppUrlFor } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
 import {
@@ -30,6 +30,7 @@ function initialsOf(name: string): string {
 export function Library() {
   const { t, lang } = useT();
   const navigate = useNavigate();
+  const demoMode = isDemoMode();
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
@@ -37,6 +38,7 @@ export function Library() {
   const [sort, setSort] = useState<'newest' | 'oldest'>('newest');
   const [typeFilter, setTypeFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [deploymentFilter, setDeploymentFilter] = useState<'all' | 'deployed' | 'notDeployed'>('all');
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -64,6 +66,9 @@ export function Library() {
     const list = projects.filter((p) => {
       if (typeFilter !== 'all' && p.type !== typeFilter) return false;
       if (statusFilter !== 'all' && p.status !== statusFilter) return false;
+      const deployed = !demoMode && p.previewUrl != null;
+      if (deploymentFilter === 'deployed' && !deployed) return false;
+      if (deploymentFilter === 'notDeployed' && deployed) return false;
       if (q && !p.name.toLowerCase().includes(q) && !(p.description ?? '').toLowerCase().includes(q)) return false;
       return true;
     });
@@ -71,7 +76,9 @@ export function Library() {
       sort === 'newest' ? b.updatedAt.localeCompare(a.updatedAt) : a.updatedAt.localeCompare(b.updatedAt),
     );
     return list;
-  }, [projects, search, sort, typeFilter, statusFilter]);
+  }, [projects, search, sort, typeFilter, statusFilter, deploymentFilter, demoMode]);
+
+  const deployedCount = projects?.filter((p) => !demoMode && p.previewUrl != null).length ?? 0;
 
   const onDownload = async (p: Project) => {
     setDownloadingId(p.id);
@@ -109,7 +116,10 @@ export function Library() {
 
   return (
     <div>
-      <PageHeader title={t('library.title')} subtitle={t('library.subtitle')} />
+      <PageHeader
+        title={t('library.title')}
+        subtitle={`${t('library.subtitle')} ${t('library.deployedCount', { count: deployedCount })}`}
+      />
 
       {error != null && (
         <div className="mb-4">
@@ -145,6 +155,16 @@ export function Library() {
           <option value="active">{t('projects.statusActive')}</option>
           <option value="archived">{t('projects.statusArchived')}</option>
         </Select>
+        <Select
+          value={deploymentFilter}
+          onChange={(e) => setDeploymentFilter(e.target.value as 'all' | 'deployed' | 'notDeployed')}
+          aria-label={t('library.filterDeployment')}
+          className="w-auto"
+        >
+          <option value="all">{t('library.allDeployments')}</option>
+          <option value="deployed">{t('library.deployed')}</option>
+          <option value="notDeployed">{t('library.notDeployed')}</option>
+        </Select>
       </div>
 
       {!projects || projects.length === 0 ? (
@@ -157,7 +177,11 @@ export function Library() {
         <Empty title={t('common.noResults')} />
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {filtered.map((p) => (
+          {filtered.map((p) => {
+            const deployed = !demoMode && p.previewUrl != null;
+            const appUrl = deployed ? publicAppUrlFor(p.id) : null;
+            const domain = appUrl ? new URL(appUrl).host : null;
+            return (
             <Card key={p.id} className="flex flex-col overflow-hidden">
               <div className="flex aspect-video items-center justify-center bg-gradient-to-br from-zinc-200 via-zinc-100 to-cyan-100 dark:from-zinc-800 dark:via-zinc-900 dark:to-cyan-950">
                 <span className="text-5xl font-bold tracking-tight text-zinc-400/70 dark:text-zinc-600/70">
@@ -181,18 +205,47 @@ export function Library() {
                   <Badge tone={p.status === 'archived' ? 'zinc' : 'green'}>
                     {p.status === 'archived' ? t('projects.statusArchived') : t('projects.statusActive')}
                   </Badge>
+                  <Badge tone={deployed ? 'cyan' : 'amber'}>
+                    {deployed ? t('library.deployed') : t('library.notDeployed')}
+                  </Badge>
                 </div>
+                {appUrl && domain ? (
+                  <div className="rounded-lg border border-cyan-200 bg-cyan-50/70 p-2.5 dark:border-cyan-900 dark:bg-cyan-950/30">
+                    <div className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-cyan-700 dark:text-cyan-300">
+                      <Server className="h-3.5 w-3.5" />
+                      Oracle · {domain}
+                    </div>
+                    <a
+                      href={appUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={appUrl}
+                      className="block break-all text-xs text-cyan-700 underline-offset-2 hover:underline dark:text-cyan-300"
+                    >
+                      {appUrl}
+                    </a>
+                  </div>
+                ) : (
+                  <p className="rounded-lg bg-zinc-100 px-2.5 py-2 text-xs text-zinc-500 dark:bg-zinc-800/70 dark:text-zinc-400">
+                    {demoMode ? t('library.demoPreview') : t('library.buildRequired')}
+                  </p>
+                )}
                 <div className="mt-auto flex items-center justify-between pt-2">
-                  <Btn variant="primary" size="sm" onClick={() => navigate(`/projects/${p.id}`)}>
-                    <FolderOpen className="h-3.5 w-3.5" />
-                    {t('common.open')}
+                  <Btn
+                    variant="primary"
+                    size="sm"
+                    onClick={() => openProjectPreview(p.id)}
+                    disabled={!p.previewUrl}
+                  >
+                    <Globe2 className="h-3.5 w-3.5" />
+                    {deployed ? t('library.openApp') : t('library.previewAction')}
                   </Btn>
                   <div className="flex gap-1">
                     <IconBtn
-                      label={t('library.previewAction')}
-                      onClick={() => window.open(previewUrlFor(p.id), '_blank', 'noopener')}
+                      label={t('library.openProject')}
+                      onClick={() => navigate(`/projects/${p.id}`)}
                     >
-                      <ExternalLink className="h-4 w-4" />
+                      <FolderOpen className="h-4 w-4" />
                     </IconBtn>
                     <IconBtn
                       label={t('library.downloadZip')}
@@ -208,7 +261,8 @@ export function Library() {
                 </div>
               </div>
             </Card>
-          ))}
+            );
+          })}
         </div>
       )}
 

@@ -304,7 +304,6 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   app.addHook('onRequest', async (req, reply) => {
     const url = req.raw.url ?? '';
     const isApi = url === '/api' || url.startsWith('/api/');
-    const isPreview = url === '/p' || url.startsWith('/p/');
     if (isApi) {
       const now = Date.now();
       const arr = (hits.get(req.ip) ?? []).filter((t) => now - t < 60_000);
@@ -315,7 +314,9 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
         return;
       }
     }
-    if (adminToken && (isApi || isPreview)) {
+    // Generated apps under /p are intentionally public deployments. Only the
+    // administrative API requires the bearer token.
+    if (adminToken && isApi) {
       const h = req.headers.authorization ?? '';
       const bearer = h.startsWith('Bearer ') ? h.slice(7) : null;
       const qToken = (req.query as Record<string, unknown> | undefined)?.token;
