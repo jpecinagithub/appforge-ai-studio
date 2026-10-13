@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- async resource loading owns loading/error state */
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, Eye, Hammer } from 'lucide-react';

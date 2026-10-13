@@ -1,3 +1,4 @@
+/* oxlint-disable react/only-export-components -- provider and hook intentionally share one module */
 import { createContext, useContext } from 'react';
 import type { StreamEvent } from '../api/sse';
 import type { ChatMessage, Project, Run } from '../api/types';

@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- debouncing and async resource loading are intentional */
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, Eye, Plus, Search, Trash2 } from 'lucide-react';

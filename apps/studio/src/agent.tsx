@@ -1,3 +1,4 @@
+/* oxlint-disable react/only-export-components -- provider and hook intentionally share one module */
 import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { RunStatus } from './api/types';

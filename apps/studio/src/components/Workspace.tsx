@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- tab resources synchronize with project/build lifecycle */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -16,7 +17,8 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { ApiError, api, previewUrlFor } from '../api/client';
+import { ApiError, api, isDemoMode, openProjectPreview, previewUrlFor } from '../api/client';
+import { demoPreviewHtml } from '../api/demo';
 import type { StreamEvent } from '../api/sse';
 import { useProjectWork } from '../project/work';
 import type { WorkspaceTab } from '../project/work';
@@ -197,6 +199,7 @@ function PreviewPane() {
   }
 
   const ready = status === 'ready';
+  const demoDocument = isDemoMode() ? demoPreviewHtml(project.id) : null;
   return (
     <div className="flex h-full flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
@@ -226,7 +229,7 @@ function PreviewPane() {
         </IconBtn>
         <IconBtn
           label={t('preview.openStandalone')}
-          onClick={() => window.open(previewUrlFor(project.id), '_blank')}
+          onClick={() => openProjectPreview(project.id)}
         >
           <ExternalLink size={15} />
         </IconBtn>
@@ -240,9 +243,10 @@ function PreviewPane() {
         <div className="mx-auto h-full" style={{ width: DEVICE_WIDTH[device], maxWidth: '100%' }}>
           <iframe
             key={`${previewKey}-${reloadKey}`}
-            src={previewUrlFor(project.id)}
+            src={demoDocument ? undefined : previewUrlFor(project.id)}
+            srcDoc={demoDocument ?? undefined}
             title="preview"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+            sandbox="allow-scripts allow-forms allow-modals"
             className="h-full w-full rounded-md border border-zinc-300 bg-white dark:border-zinc-700"
           />
         </div>

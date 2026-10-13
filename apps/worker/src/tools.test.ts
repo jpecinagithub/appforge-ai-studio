@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createTools, resolveIn, type ToolContext } from './tools.js';
+import { createTools, resolveIn, runCmd, type ToolContext } from './tools.js';
 
 let projectDir: string;
 let frontendDir: string;
@@ -97,5 +97,11 @@ describe('run_command allowlist', () => {
     const r = await tools.run_command(ctx, { cmd: 'node', args: ['--version'] });
     expect(r.ok).toBe(true);
     expect(r.output ?? '').toContain('v');
+  });
+
+  it('resolves the npm launcher without a shell on every platform', async () => {
+    const r = await runCmd('npm', ['--version'], { cwd: frontendDir, timeoutMs: 10_000 });
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toMatch(/^\d+\.\d+/);
   });
 });

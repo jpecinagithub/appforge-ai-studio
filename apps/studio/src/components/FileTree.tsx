@@ -10,14 +10,17 @@ import {
 } from 'lucide-react';
 import type { FileNode } from '../api/types';
 
-function iconFor(name: string) {
+function FileTypeIcon({ name }: { name: string }) {
   const ext = name.split('.').pop()?.toLowerCase() ?? '';
-  if (ext === 'md' || ext === 'txt') return FileText;
-  if (ext === 'json') return Braces;
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'svg'].includes(ext)) return FileImage;
+  const className = 'shrink-0 text-zinc-400 dark:text-zinc-500';
+  if (ext === 'md' || ext === 'txt') return <FileText size={15} className={className} />;
+  if (ext === 'json') return <Braces size={15} className={className} />;
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'ico', 'svg'].includes(ext)) {
+    return <FileImage size={15} className={className} />;
+  }
   if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'css', 'html', 'sql', 'yml', 'yaml'].includes(ext))
-    return FileCode2;
-  return File;
+    return <FileCode2 size={15} className={className} />;
+  return <File size={15} className={className} />;
 }
 
 function flattenFiles(nodes: FileNode[], out: FileNode[] = []): FileNode[] {
@@ -40,7 +43,6 @@ interface NodeRowProps {
 function NodeRow({ node, depth, selected, onSelect, expanded, toggle }: NodeRowProps) {
   const isDir = node.type === 'dir';
   const open = expanded[node.path] ?? depth < 2;
-  const Icon = isDir ? (open ? FolderOpen : Folder) : iconFor(node.name);
   const isSelected = selected === node.path;
 
   return (
@@ -56,10 +58,15 @@ function NodeRow({ node, depth, selected, onSelect, expanded, toggle }: NodeRowP
             : 'text-zinc-700 hover:bg-zinc-200/60 dark:text-zinc-300 dark:hover:bg-zinc-800'
         }`}
       >
-        <Icon
-          size={15}
-          className={`shrink-0 ${isDir ? 'text-amber-500 dark:text-amber-400' : 'text-zinc-400 dark:text-zinc-500'}`}
-        />
+        {isDir ? (
+          open ? (
+            <FolderOpen size={15} className="shrink-0 text-amber-500 dark:text-amber-400" />
+          ) : (
+            <Folder size={15} className="shrink-0 text-amber-500 dark:text-amber-400" />
+          )
+        ) : (
+          <FileTypeIcon name={node.name} />
+        )}
         <span className="truncate">{node.name}</span>
       </button>
       {isDir && open && node.children && (
@@ -107,7 +114,6 @@ export function FileTree({
           <p className="px-3 py-4 text-xs text-zinc-400 dark:text-zinc-500">—</p>
         )}
         {flat.map((n) => {
-          const Icon = iconFor(n.name);
           const isSelected = selected === n.path;
           return (
             <button
@@ -121,7 +127,7 @@ export function FileTree({
                   : 'text-zinc-700 hover:bg-zinc-200/60 dark:text-zinc-300 dark:hover:bg-zinc-800'
               }`}
             >
-              <Icon size={15} className="shrink-0 text-zinc-400 dark:text-zinc-500" />
+              <FileTypeIcon name={n.name} />
               <span className="truncate">{n.name}</span>
             </button>
           );

@@ -284,6 +284,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const repairCounts = new Map<string, number>();
   const recentSigs: string[] = [];
   let lastError: string | null = null;
+  const criticalFailures = new Map<string, string>();
+  let previewReady = false;
   const startedAt = Date.now();
 
   const dbStatus = () => (db.prepare('SELECT status FROM runs WHERE id=?').get(runId) as { status: string } | undefined)?.status;
@@ -324,6 +326,11 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
     if (resp.toolCalls.length === 0) {
       const summary = resp.content ?? t('emptySummary');
+      if (criticalFailures.size > 0 || (modifiedFiles.length > 0 && !previewReady)) {
+        const detail = [...criticalFailures.values()].join('; ') || t('previewNotVerified');
+        finishError(`${t('unverifiedCompletion')} ${detail}`, 'UNVERIFIED_COMPLETION');
+        return;
+      }
       emit(db, runId, 'done', { summary: summary.slice(0, 4000) });
       addAssistantMessage(db, project.id, summary);
       if (modifiedFiles.length > 0) {
@@ -377,6 +384,22 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         }
       }
 
+      if (['install_dependencies', 'run_build', 'start_preview'].includes(tc.name)) {
+        if (result.ok) {
+          criticalFailures.delete(tc.name);
+          if (tc.name === 'run_build') {
+            criticalFailures.delete('install_dependencies');
+          }
+          if (tc.name === 'start_preview') {
+            previewReady = true;
+            criticalFailures.delete('install_dependencies');
+            criticalFailures.delete('run_build');
+          }
+        } else {
+          criticalFailures.set(tc.name, result.error ?? result.code ?? `${tc.name} failed`);
+        }
+      }
+
       emit(db, runId, 'tool_result', {
         id: tc.id,
         name: tc.name,
@@ -395,6 +418,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
       if (result.ok && ['write_file', 'patch_file', 'delete_file'].includes(tc.name) && typeof tc.arguments.path === 'string') {
         modifiedFiles.push(tc.arguments.path as string);
+        previewReady = false;
       }
     }
   }
@@ -413,6 +437,8 @@ const ES: Record<string, string> = {
   loopDetected: 'Detecté que el agente repetía la misma operación sin avanzar y lo detuve. Los archivos generados se conservan; puedes continuar desde este estado.',
   repairLimit: 'El mismo fallo se repitió tras varios intentos de reparación y detuve el agente. Diagnóstico:',
   maxIterations: 'Se alcanzó el máximo de iteraciones sin completar el trabajo. Los archivos generados se conservan; puedes continuar desde este estado.',
+  unverifiedCompletion: 'El agente intentó terminar sin un build y una preview verificados.',
+  previewNotVerified: 'la preview no fue verificada',
 };
 
 const EN: Record<string, string> = {
@@ -426,4 +452,6 @@ const EN: Record<string, string> = {
   loopDetected: 'I detected the agent repeating the same operation without progress and stopped it. Generated files are preserved; you can continue from this state.',
   repairLimit: 'The same failure repeated after several repair attempts, so I stopped the agent. Diagnosis:',
   maxIterations: 'Reached the maximum number of iterations without completing the work. Generated files are preserved; you can continue from this state.',
+  unverifiedCompletion: 'The agent tried to finish without a verified build and preview.',
+  previewNotVerified: 'the preview was not verified',
 };

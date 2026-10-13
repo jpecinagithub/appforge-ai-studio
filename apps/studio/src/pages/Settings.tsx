@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- async resource loading owns loading/error state */
 import { useCallback, useEffect, useState } from 'react';
 import { Save } from 'lucide-react';
 import { API_BASE, api } from '../api/client';

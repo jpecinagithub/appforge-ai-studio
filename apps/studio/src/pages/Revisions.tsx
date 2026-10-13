@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- async resource loading and project selection are intentional */
 import { useCallback, useEffect, useState } from 'react';
 import { History, Plus } from 'lucide-react';
 import { api } from '../api/client';

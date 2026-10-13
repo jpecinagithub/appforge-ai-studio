@@ -1,4 +1,4 @@
-import { demoArchiveBlob, demoFetch } from './demo';
+import { demoArchiveBlob, demoFetch, demoPreviewHtml } from './demo';
 import type {
   BuildRecord,
   ChatMessage,
@@ -13,7 +13,7 @@ import type {
 
 /** Base del backend. Vacío = mismo origen (proxy de dev o despliegue conjunto). */
 export const API_BASE: string =
-  (import.meta.env.VITE_API_URL as string | undefined) ?? '';
+  ((import.meta.env.VITE_API_URL as string | undefined) ?? '').replace(/\/$/, '');
 
 const TOKEN_KEY = 'appforge_token';
 const DEMO_KEY = 'appforge_demo';
@@ -204,7 +204,20 @@ export const api = {
 
 /** URL pública de la preview estática de un proyecto. */
 export function previewUrlFor(projectId: string): string {
-  return `${API_BASE}/p/${projectId}/`;
+  return `${API_BASE}/p/${encodeURIComponent(projectId)}/`;
+}
+
+/** Abre la preview real o, en demo, un documento local funcional. */
+export function openProjectPreview(projectId: string): void {
+  if (!isDemoMode()) {
+    window.open(previewUrlFor(projectId), '_blank', 'noopener');
+    return;
+  }
+  const html = demoPreviewHtml(projectId);
+  if (!html) return;
+  const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+  window.open(url, '_blank', 'noopener');
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 /** Descarga el ZIP del proyecto (GET /api/projects/:id/archive). */
