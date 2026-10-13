@@ -70,13 +70,16 @@ function MessageBubble({ message }: { message: ChatMessage }) {
 
 function RunStatusBar() {
   const { t } = useT();
-  const { activeRun, cancelRun } = useProjectWork();
+  const { activeRun, cancelRun, events } = useProjectWork();
   const [cancelling, setCancelling] = useState(false);
 
   if (!activeRun) return null;
 
   const busy = activeRun.status === 'queued' || activeRun.status === 'running';
   if (busy) {
+    const latest = [...events].reverse().find((event) => event.kind === 'status');
+    const phase = (latest?.data as { phase?: string } | undefined)?.phase;
+    const label = phase === 'validating' ? 'chat.validating' : phase === 'repairing' ? 'chat.repairing' : 'chat.thinking';
     const onCancel = async () => {
       setCancelling(true);
       try {
@@ -88,7 +91,7 @@ function RunStatusBar() {
     return (
       <div className="flex items-center gap-2 border-t border-zinc-200 bg-zinc-50 px-4 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900/60">
         <Spinner />
-        <span className="flex-1 text-zinc-600 dark:text-zinc-300">{t('chat.thinking')}</span>
+        <span className="flex-1 text-zinc-600 dark:text-zinc-300">{t(label)}</span>
         <Btn variant="ghost" size="sm" onClick={onCancel} disabled={cancelling}>
           {cancelling ? t('chat.cancelling') : t('chat.cancelRun')}
         </Btn>

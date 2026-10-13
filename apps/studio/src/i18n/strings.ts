@@ -132,6 +132,8 @@ const es = {
   'chat.roleAssistant': 'AppForge',
   'chat.roleSystem': 'Sistema',
   'chat.thinking': 'El agente está trabajando…',
+  'chat.validating': 'Comprobando la app en el navegador…',
+  'chat.repairing': 'Corrigiendo los errores detectados…',
   'chat.sendError': 'No se pudo enviar el mensaje.',
 
   'run.queued': 'En cola',
@@ -447,6 +449,8 @@ const en: Record<EsKey, string> = {
   'chat.roleAssistant': 'AppForge',
   'chat.roleSystem': 'System',
   'chat.thinking': 'The agent is working…',
+  'chat.validating': 'Checking the app in the browser…',
+  'chat.repairing': 'Fixing the detected errors…',
   'chat.sendError': 'Could not send the message.',
 
   'run.queued': 'Queued',

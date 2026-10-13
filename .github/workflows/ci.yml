@@ -35,3 +35,5 @@ jobs:
 
       - name: Verify AppForge
         run: npm run verify
+        env:
+          APPFORGE_BROWSER_EXECUTABLE: /usr/bin/google-chrome

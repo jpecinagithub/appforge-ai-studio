@@ -60,7 +60,12 @@ export function ProjectView() {
       if (!id) return;
       try {
         const final = await api.getRun(runId);
-        if (projectIdRef.current === id) setActiveRun(final);
+        const updated = await api.getProject(id);
+        if (projectIdRef.current === id) {
+          setActiveRun(final);
+          setProjectState(updated);
+          setProject(updated);
+        }
       } catch {
         /* conserva el último estado conocido */
       }
@@ -75,7 +80,7 @@ export function ProjectView() {
         setPreviewKey((k) => k + 1);
       }
     },
-    [id, reloadMessages, setRunStatus],
+    [id, reloadMessages, setRunStatus, setProject],
   );
 
   const subscribe = useCallback(
@@ -112,10 +117,9 @@ export function ProjectView() {
       }
       setSending(true);
       try {
-        await api.postMessage(id, { role: 'user', content: prompt });
+        const run = await api.createRun(id, prompt);
         setChatDraft('');
         await reloadMessages();
-        const run = await api.createRun(id, prompt);
         setActiveRun(run);
         setRunStatus(id, run.status);
         subscribe(run);

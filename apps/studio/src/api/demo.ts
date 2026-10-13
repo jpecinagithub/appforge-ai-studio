@@ -379,6 +379,7 @@ export async function demoFetch(path: string, init: RequestInit = {}): Promise<D
           error: null,
         };
         runs.push(run);
+        (messages[projectId] ??= []).push({ id: uid(), projectId, role: 'user', content: run.prompt, createdAt: run.createdAt, tokens: null });
         return json(run);
       }
     }

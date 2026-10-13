@@ -15,9 +15,11 @@ import type {
   LlmMessage,
   RunEventKind,
   RunStats,
+  ToolResult,
 } from 'appforge-shared';
-import { StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js';
+import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js';
 import { createTools, nowIso, type ToolContext } from './tools.js';
+import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
 
@@ -62,14 +64,18 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '',
     'RULES:',
     '1. Keep an internal plan of at most 5 tasks. Do not narrate the plan; just work.',
-    '2. Prefer patch_file over rewriting whole files. Read only the files you actually need.',
-    '3. After generating or editing code, validate: run typecheck (run_command with npx tsc --noEmit -p tsconfig.app.json, or rely on the build) and then run_build. Fix failures (max 2 repair attempts per distinct failure).',
-    '4. Verify the build output exists (frontend/dist/index.html), then call start_preview.',
+    '2. For a new app, use write_files to create ALL related files in ONE call. Keep simple apps in App.tsx + index.css; split only when useful. For edits, read the relevant file then patch_file.',
+    '3. run_build installs dependencies automatically and checks strict TypeScript. Do not spend turns installing first, listing files already in context, or running a separate typecheck. Fix ALL reported errors together before rebuilding.',
+    '4. Call test_preview with interaction steps for EVERY distinct visible control: search, filters, details, main actions, then reload to verify persistence. Use click/fill/select followed by exact expect_text assertions of the changed result. Split independent cases into separate calls if needed. Then start_preview. A successful compile does not prove that buttons work. Interactive apps cannot finish without a successful interaction test of the current source.',
     '5. NEVER claim something is finished without verifying it (build output, preview URL). No fake progress.',
-    '6. Loop guard: if you catch yourself repeating the same tool call or the same build error, stop and report a diagnosis. NEVER delete project files.',
+    '6. Do not repeat a failed build without editing its cause. Do not give up after the first failure: diagnostics are returned so you can repair them. NEVER delete project files.',
     '7. NEVER run "npm run dev" (it starts a server that never exits and wastes the run). To build: run_build. To preview: start_preview.',
     '8. write_file content must ALWAYS be a string with the complete file text. For .json files, write the JSON text — never pass a JSON object/array as content.',
     `9. Your final message to the user must be a SHORT Markdown summary in ${userLang}: what was built, features, test/build results, preview status, limitations.`,
+    '10. React uses the automatic JSX runtime: import only hooks you use; use import type for interfaces. Do not give a component and an imported data type the same name (CarCard vs CarData). noUnusedLocals/noUnusedParameters/verbatimModuleSyntax are enabled. Never weaken tsconfig or the build script to hide errors.',
+    '11. Only import packages declared in package.json; prefer native React, CSS and inline SVG for simple apps. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
+    '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
+    '13. Do not invent external photo URLs or assume an image depicts the named product. Unless the user supplied verified assets, use self-contained inline SVG/CSS illustrations relevant to each sample, clearly labeled as illustrations. A car catalog must not show unrelated restaurant/office photos.',
   ].join('\n');
 }
 
@@ -189,12 +195,17 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const project = db.prepare('SELECT * FROM projects WHERE id=?').get(run.project_id) as Record<string, any> | undefined;
   const t = (key: string) => (settings.language === 'es' ? ES[key] : EN[key]);
+  const modifiedFiles: string[] = [];
+  let lastError: string | null = null;
 
   const finishError = (message: string, code?: string) => {
     stats.errors += 1;
-    emit(db, runId, 'error', { code: code ?? 'AGENT_ERROR', message });
     addAssistantMessage(db, run.project_id, `⚠️ ${t('errorPrefix')}\n\n${message}`);
     updateRun(db, runId, { status: 'error', finishedAt: nowIso(), stats, error: message });
+    if (project) {
+      try { rewriteProjectContext({ projectDir: path.join(opts.dataDir, 'projects', project.id), projectName: project.name, prompt: run.prompt, modifiedFiles, summary: message, lastError: lastError ?? message, runId, status: 'error' }); } catch { /* best effort */ }
+    }
+    emit(db, runId, 'error', { code: code ?? 'AGENT_ERROR', message });
     db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(nowIso(), run.project_id);
     clearCancel(runId);
   };
@@ -274,29 +285,110 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       content: [
         `PROJECT CONTEXT:\n${readProjectContext(projectDir).slice(0, 4000)}`,
         `\nFILE TREE (frontend/):\n${treeText || '(empty)'}`,
+        `\nCURRENT CORE FILES:\n${['package.json', 'tsconfig.app.json', 'src/App.tsx', 'src/index.css'].map((file) => {
+          try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, 14000)}`; } catch { return `--- ${file}: missing ---`; }
+        }).join('\n')}`,
         `\nRECENT CONVERSATION:\n${recent || '(none)'}`,
         `\nUSER REQUEST:\n${run.prompt}`,
       ].join('\n'),
     },
   ];
 
-  const modifiedFiles: string[] = [];
-  const repairCounts = new Map<string, number>();
-  const recentSigs: string[] = [];
-  let lastError: string | null = null;
   const criticalFailures = new Map<string, string>();
-  let previewReady = false;
   const startedAt = Date.now();
 
   const dbStatus = () => (db.prepare('SELECT status FROM runs WHERE id=?').get(runId) as { status: string } | undefined)?.status;
 
   const cancelledNow = () => isCancelRequested(runId) || dbStatus() === 'cancelled';
 
-  for (let iter = 1; iter <= limits.maxIterations; iter++) {
+  // Installation/build/browser checks do not consume generation turns. A separate,
+  // bounded repair phase remains available even when the last generation turn fails.
+  const repairTurns = 6;
+  let repairing = false;
+  let repairCalls = 0;
+  let proposedSummary = '';
+  const initialFingerprint = sourceFingerprint(frontendDir);
+
+  const perform = async (name: string, args: Record<string, unknown>, id: string = randomUUID()): Promise<ToolResult> => {
+    if (cancelledNow()) return { ok: false, code: 'CANCELLED', error: t('cancelled'), durationMs: 0 };
+    const remaining = limits.runTimeoutMs - (Date.now() - startedAt);
+    if (remaining <= 0) return { ok: false, code: 'RUN_TIMEOUT', error: t('runTimeout'), durationMs: 0 };
+    ctx.cmdTimeoutMs = Math.min(limits.cmdTimeoutMs, remaining);
+    ctx.buildTimeoutMs = Math.min(600_000, remaining);
+    emit(db, runId, 'tool_call', { id, name, arguments: args });
+    let result: ToolResult;
+    try {
+      result = tools[name] ? await tools[name](ctx, args) : { ok: false, code: 'UNKNOWN_TOOL', error: `unknown tool: ${name}`, durationMs: 0 };
+    } catch (error) {
+      result = { ok: false, code: 'TOOL_EXCEPTION', error: (error as Error).message, durationMs: 0 };
+    }
+    stats.toolCalls++;
+    if (name === 'run_build' || name === 'start_preview') stats.buildMs += result.durationMs;
+    const tracked = ['write_file', 'write_files', 'patch_file', 'install_dependencies', 'run_build', 'test_preview', 'start_preview'].includes(name);
+    const fileTool = ['write_file', 'write_files', 'patch_file', 'delete_file'].includes(name);
+    const filePaths = name === 'write_files'
+      ? ((args.files as Array<{ path?: string }> | undefined) ?? []).map((file) => file.path ?? '?')
+      : [String(args.path ?? '?')];
+    if (!result.ok) {
+      stats.errors++;
+      lastError = `${result.error ?? result.code}\n${result.output ?? ''}`.slice(0, 12000);
+      if (tracked) {
+        if (fileTool) for (const file of filePaths) criticalFailures.set(`file:${file}`, lastError);
+        else criticalFailures.set(name, lastError);
+      }
+    } else {
+      criticalFailures.delete(name);
+      if (fileTool) for (const file of filePaths) criticalFailures.delete(`file:${file}`);
+      if (name === 'run_build' || name === 'start_preview') {
+        criticalFailures.delete('install_dependencies');
+        criticalFailures.delete('run_build');
+      }
+      if (['write_file', 'patch_file', 'delete_file'].includes(name) && typeof args.path === 'string') modifiedFiles.push(args.path);
+      if (name === 'write_files') modifiedFiles.push(...((result.data as { paths?: string[] })?.paths ?? []));
+    }
+    emit(db, runId, 'tool_result', { id, name, ok: result.ok, code: result.code, error: result.error, output: (result.output ?? '').slice(0, 12000), durationMs: result.durationMs });
+    return result;
+  };
+
+  const complete = () => {
+    const summary = proposedSummary || t('verifiedSummary');
+    addAssistantMessage(db, project.id, summary);
+    try { rewriteProjectContext({ projectDir, projectName: project.name, prompt: run.prompt, modifiedFiles: [...new Set(modifiedFiles)], summary, lastError: null, runId, status: 'done' }); } catch { /* best effort */ }
+    updateRun(db, runId, { status: 'done', finishedAt: nowIso(), stats, error: null });
+    db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(nowIso(), project.id);
+    emit(db, runId, 'done', { summary: summary.slice(0, 4000) });
+    clearCancel(runId);
+  };
+
+  const verify = async (): Promise<boolean> => {
+    emit(db, runId, 'status', { phase: 'validating' });
+    const result = modifiedFiles.length === 0 && sourceFingerprint(frontendDir) === initialFingerprint
+      ? { ok: false, error: 'No implementation was made. Complete the requested changes first.', durationMs: 0 }
+      : await perform('start_preview', {});
+    if (!result.ok && modifiedFiles.length === 0) lastError = result.error ?? lastError;
+    if (cancelledNow()) return false;
+    if (result.ok && (ctx.interactiveControls ?? 0) > 0 && ctx.interactionFingerprint !== ctx.builtFingerprint) {
+      lastError = 'Interaction verification missing for the current source. Use test_preview with real click/fill/select actions and exact expect_text assertions of their results. Exercise each distinct visible control, including search and detail buttons; a rendering smoke test is insufficient.';
+      criticalFailures.set('interactions', lastError);
+    } else if (result.ok) {
+      criticalFailures.delete('interactions');
+    }
+    if (result.ok && criticalFailures.size === 0 && Date.now() - startedAt < limits.runTimeoutMs) {
+      complete();
+      return true;
+    }
+    repairing = true;
+    // Include actual diagnostics, not just "exit code 2", and keep JSON intact.
+    history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. You have ${repairTurns - repairCalls} repair turns left. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
+    emit(db, runId, 'status', { phase: 'repairing', remaining: repairTurns - repairCalls });
+    return false;
+  };
+
+  for (let iter = 1; iter <= limits.maxIterations + repairTurns; iter++) {
     if (cancelledNow()) {
-      emit(db, runId, 'status', { phase: 'cancelled' });
       addAssistantMessage(db, project.id, t('cancelled'));
       updateRun(db, runId, { status: 'cancelled', finishedAt: nowIso(), stats, error: null });
+      emit(db, runId, 'status', { phase: 'cancelled' });
       clearCancel(runId);
       return;
     }
@@ -306,13 +398,25 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
 
     stats.iterations = iter;
-    emit(db, runId, 'status', { phase: 'thinking', iteration: iter });
+    if (repairing) {
+      if (repairCalls >= repairTurns) break;
+      repairCalls++;
+    }
+    emit(db, runId, 'status', { phase: repairing ? 'repairing' : 'thinking', iteration: iter });
 
     let resp;
     const llmT0 = Date.now();
     try {
-      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm(llmConfig!, history, TOOL_DEFS);
+      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: startedAt + limits.runTimeoutMs }, history, TOOL_DEFS);
     } catch (e) {
+      if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
+        stats.errors++;
+        lastError = e.message;
+        history.push({ role: 'user', content: `${e.message} The invalid response made no file changes. Retry with smaller complete files or patches.` });
+        emit(db, runId, 'log', { text: e.message });
+        if (iter >= limits.maxIterations) repairing = true;
+        continue;
+      }
       finishError(`${t('llmFailed')}: ${(e as Error).message}`, 'LLM_ERROR');
       return;
     }
@@ -325,108 +429,36 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     if (resp.content) emit(db, runId, 'log', { text: resp.content.slice(0, 2000) });
 
     if (resp.toolCalls.length === 0) {
-      const summary = resp.content ?? t('emptySummary');
-      if (criticalFailures.size > 0 || (modifiedFiles.length > 0 && !previewReady)) {
-        const detail = [...criticalFailures.values()].join('; ') || t('previewNotVerified');
-        finishError(`${t('unverifiedCompletion')} ${detail}`, 'UNVERIFIED_COMPLETION');
-        return;
-      }
-      emit(db, runId, 'done', { summary: summary.slice(0, 4000) });
-      addAssistantMessage(db, project.id, summary);
-      if (modifiedFiles.length > 0) {
-        try {
-          rewriteProjectContext({ projectDir, projectName: project.name, prompt: run.prompt, modifiedFiles, summary, lastError, runId, status: 'done' });
-        } catch {
-          /* non-fatal */
-        }
-      }
-      updateRun(db, runId, { status: 'done', finishedAt: nowIso(), stats, error: null });
-      db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(nowIso(), project.id);
-      clearCancel(runId);
-      return;
-    }
-
-    // Loop detection: 3 identical tool calls in a row (same name + args)
-    for (const tc of resp.toolCalls) {
-      recentSigs.push(`${tc.name}:${JSON.stringify(tc.arguments)}`);
-      if (recentSigs.length > 3) recentSigs.shift();
-    }
-    if (recentSigs.length === 3 && recentSigs[0] === recentSigs[1] && recentSigs[1] === recentSigs[2]) {
-      finishError(t('loopDetected'), 'LOOP_DETECTED');
-      return;
+      proposedSummary = resp.content ?? '';
+      if (sourceFingerprint(frontendDir) === initialFingerprint && modifiedFiles.length === 0 && !ctx.builtFingerprint) {
+        history.push({ role: 'user', content: 'No implementation was made. Execute the requested changes with the file tools; a description alone is not a completed app.' });
+      } else if (await verify()) return;
     }
 
     for (const tc of resp.toolCalls) {
       if (cancelledNow()) break;
-      emit(db, runId, 'tool_call', { id: tc.id, name: tc.name, arguments: tc.arguments });
-      const handler = tools[tc.name];
-      const callT0 = Date.now();
-      let result;
-      try {
-        result = handler
-          ? await handler(ctx, tc.arguments)
-          : { ok: false, code: 'UNKNOWN_TOOL', error: `unknown tool: ${tc.name}`, durationMs: 0 };
-      } catch (e) {
-        result = { ok: false, code: 'TOOL_EXCEPTION', error: (e as Error).message, durationMs: Date.now() - callT0 };
-      }
-      stats.toolCalls += 1;
-      if (tc.name === 'run_build') stats.buildMs += result.durationMs;
-
-      if ((tc.name === 'run_build' || tc.name === 'install_dependencies') && !result.ok) {
-        stats.errors += 1;
-        lastError = result.error ?? result.code ?? 'build failed';
-        const sig = `${result.code}|${(result.output ?? result.error ?? '').slice(-400)}`;
-        const n = (repairCounts.get(sig) ?? 0) + 1;
-        repairCounts.set(sig, n);
-        if (n > limits.maxRepairAttempts) {
-          finishError(`${t('repairLimit')}\n\n${lastError}`, 'REPAIR_LIMIT');
-          return;
-        }
-      }
-
-      if (['install_dependencies', 'run_build', 'start_preview'].includes(tc.name)) {
-        if (result.ok) {
-          criticalFailures.delete(tc.name);
-          if (tc.name === 'run_build') {
-            criticalFailures.delete('install_dependencies');
-          }
-          if (tc.name === 'start_preview') {
-            previewReady = true;
-            criticalFailures.delete('install_dependencies');
-            criticalFailures.delete('run_build');
-          }
-        } else {
-          criticalFailures.set(tc.name, result.error ?? result.code ?? `${tc.name} failed`);
-        }
-      }
-
-      emit(db, runId, 'tool_result', {
-        id: tc.id,
-        name: tc.name,
-        ok: result.ok,
-        code: result.code,
-        error: result.error,
-        output: (result.output ?? '').slice(-4000),
-        durationMs: result.durationMs,
-      });
+      proposedSummary = '';
+      const result = await perform(tc.name, tc.arguments, tc.id);
       history.push({
         role: 'tool',
         toolCallId: tc.id,
         name: tc.name,
-        content: JSON.stringify(result).slice(0, 8000),
+        content: JSON.stringify({ ...result, output: result.output?.slice(0, 16000) }),
       });
-
-      if (result.ok && ['write_file', 'patch_file', 'delete_file'].includes(tc.name) && typeof tc.arguments.path === 'string') {
-        modifiedFiles.push(tc.arguments.path as string);
-        previewReady = false;
-      }
+    }
+    // Finalize at the budget boundary, instead of discarding a successful last
+    // tool call or abandoning fresh compiler errors with no chance to repair.
+    if ((!repairing && iter >= limits.maxIterations) || (repairing && repairCalls >= repairTurns)) {
+      if (await verify()) return;
+      if (repairCalls >= repairTurns) break;
     }
   }
 
-  finishError(t('maxIterations'), 'MAX_ITERATIONS');
+  finishError(`${t('repairLimit')}\n\n${lastError ?? t('maxIterations')}`, 'REPAIR_LIMIT');
 }
 
 const ES: Record<string, string> = {
+  verifiedSummary: 'Cambios completados. Compilación y carga en Chromium verificadas para escritorio y móvil. La web está disponible en Preview y en la Librería.',
   errorPrefix: 'La ejecución ha fallado:',
   noProject: 'El proyecto ya no existe.',
   noKey: 'Falta la API key del proveedor LLM. Configura GROQ_API_KEY u OPENROUTER_API_KEY en el servidor (variables de entorno) y vuelve a intentarlo.',
@@ -435,13 +467,14 @@ const ES: Record<string, string> = {
   llmFailed: 'Fallo la llamada al modelo',
   emptySummary: 'Trabajo terminado.',
   loopDetected: 'Detecté que el agente repetía la misma operación sin avanzar y lo detuve. Los archivos generados se conservan; puedes continuar desde este estado.',
-  repairLimit: 'El mismo fallo se repitió tras varios intentos de reparación y detuve el agente. Diagnóstico:',
+  repairLimit: 'La verificación sigue fallando después de la fase automática de reparación. Los archivos se conservan. Diagnóstico:',
   maxIterations: 'Se alcanzó el máximo de iteraciones sin completar el trabajo. Los archivos generados se conservan; puedes continuar desde este estado.',
   unverifiedCompletion: 'El agente intentó terminar sin un build y una preview verificados.',
   previewNotVerified: 'la preview no fue verificada',
 };
 
 const EN: Record<string, string> = {
+  verifiedSummary: 'Changes completed. Build and Chromium rendering verified on desktop and mobile. The app is available in Preview and the Library.',
   errorPrefix: 'The run failed:',
   noProject: 'The project no longer exists.',
   noKey: 'Missing LLM provider API key. Set GROQ_API_KEY or OPENROUTER_API_KEY as server environment variables and retry.',
@@ -450,7 +483,7 @@ const EN: Record<string, string> = {
   llmFailed: 'Model call failed',
   emptySummary: 'Work finished.',
   loopDetected: 'I detected the agent repeating the same operation without progress and stopped it. Generated files are preserved; you can continue from this state.',
-  repairLimit: 'The same failure repeated after several repair attempts, so I stopped the agent. Diagnosis:',
+  repairLimit: 'Verification still fails after the automatic repair phase. Files are preserved. Diagnosis:',
   maxIterations: 'Reached the maximum number of iterations without completing the work. Generated files are preserved; you can continue from this state.',
   unverifiedCompletion: 'The agent tried to finish without a verified build and preview.',
   previewNotVerified: 'the preview was not verified',
