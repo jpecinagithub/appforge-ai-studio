@@ -3,7 +3,7 @@
  * Credentials are read from its environment, never written to the report.
  */
 import fs from 'node:fs';
-const base = process.env.APPFORGE_ACCEPTANCE_URL || 'http://127.0.0.1:3001';
+const base = process.env.APPFORGE_ACCEPTANCE_URL || `http://127.0.0.1:${process.env.PORT || 3001}`;
 const file = process.env.APPFORGE_ACCEPTANCE_REPORT || '/tmp/appforge-acceptance.json';
 const api = async (route, body) => {
   const response = await fetch(`${base}/api${route}`, { method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${process.env.APPFORGE_ADMIN_TOKEN}`, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
@@ -26,6 +26,35 @@ if (process.argv[2] === 'start') {
     fs.writeFileSync(file, JSON.stringify(report, null, 2));
   }
   console.log(JSON.stringify(report, null, 2));
+} else if (process.argv[2] === 'cancel') {
+  const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+  for (const item of report) {
+    const run = await api(`/runs/${item.runId}`);
+    if (['queued', 'running'].includes(run.status)) await api(`/runs/${item.runId}/cancel`, {});
+  }
+  console.log('Acceptance runs cancelled; project files preserved.');
+} else if (process.argv[2] === 'retry') {
+  const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const latest = new Map(report.map((item) => [item.projectId, item]));
+  for (const item of latest.values()) {
+    const previous = await api(`/runs/${item.runId}`);
+    if (previous.status === 'done') continue;
+    const visual = ' No uses URLs de fotografías inventadas ni fotos ajenas al contenido. Utiliza ilustraciones SVG/CSS locales relevantes y etiquetadas como ilustraciones. Comprueba interacciones y recarga con test_preview.';
+    const run = await api(`/projects/${item.projectId}/runs`, { prompt: item.prompt + visual });
+    report.push({ ...item, runId: run.id });
+    fs.writeFileSync(file, JSON.stringify(report, null, 2));
+    console.log(JSON.stringify({ projectId: item.projectId, runId: run.id }));
+  }
+} else if (process.argv[2] === 'repair') {
+  const projectId = process.argv[3];
+  if (!projectId) throw new Error('repair requires a project id');
+  const project = await api(`/projects/${projectId}`);
+  const prompt = 'Completa la petición original de este proyecto. Revisa los errores y los archivos existentes, corrige la compilación y comprueba en el navegador que el catálogo funciona y cada coche permite marcar y desmarcar thumbs up. Todo control visible debe funcionar. Conserva los favoritos al recargar. Publica la preview verificada.';
+  const run = await api(`/projects/${projectId}/runs`, { prompt });
+  const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+  report.push({ name: project.name, projectId, runId: run.id, prompt });
+  fs.writeFileSync(file, JSON.stringify(report, null, 2));
+  console.log(JSON.stringify({ projectId, runId: run.id }));
 } else {
   const report = JSON.parse(fs.readFileSync(file, 'utf8'));
   for (const item of report) {

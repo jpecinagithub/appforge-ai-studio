@@ -1,13 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
-import { chromium, type Page } from 'playwright-core';
+import { chromium, type Page, type BrowserContext } from 'playwright-core';
 import type { ToolResult } from 'appforge-shared';
 
 export interface BrowserStep {
   action: 'click' | 'fill' | 'select' | 'expect_text' | 'reload';
   selector?: string;
   value?: string;
+}
+
+export interface BrowserSession {
+  storage?: Awaited<ReturnType<BrowserContext['storageState']>>;
+  origin?: string;
 }
 
 const MIME: Record<string, string> = {
@@ -17,7 +22,7 @@ const MIME: Record<string, string> = {
 };
 
 /** Serve the actual bundle under the same nested path used in production. */
-export async function checkBrowser(distDir: string, projectId: string, steps: BrowserStep[] = [], timeoutMs = 45_000): Promise<ToolResult> {
+export async function checkBrowser(distDir: string, projectId: string, steps: BrowserStep[] = [], timeoutMs = 45_000, session: BrowserSession = {}): Promise<ToolResult> {
   const t0 = Date.now();
   const prefix = `/p/${projectId}/`;
   const server = http.createServer((req, res) => {
@@ -34,6 +39,7 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
     } catch { res.writeHead(400).end(); }
   });
   let browser;
+  let context: BrowserContext | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const errors: string[] = [];
   try {
@@ -44,7 +50,12 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
       executablePath: process.env.APPFORGE_BROWSER_EXECUTABLE || undefined,
       headless: true, timeout: Math.min(timeoutMs, 15_000), args: ['--no-sandbox', '--disable-dev-shm-usage'],
     });
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    // Keep test data between tool calls within this run. The temporary server's
+    // port changes, so remap only its own localStorage origin to the new port.
+    const origin = new URL(url).origin;
+    const storageState = session.storage ? { ...session.storage, origins: session.storage.origins.map((entry) => ({ ...entry, origin: entry.origin === session.origin ? origin : entry.origin })) } : undefined;
+    context = await browser.newContext({ viewport: { width: 1280, height: 800 }, storageState });
+    session.origin = origin;
     const page = await context.newPage();
     page.setDefaultTimeout(5000);
     page.on('pageerror', (error) => errors.push(error.message));
@@ -79,6 +90,9 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
     return { ok: false, code: 'BROWSER_FAILED', error: diagnostic, output: diagnostic, durationMs: Date.now() - t0 };
   } finally {
     if (timer) clearTimeout(timer);
+    if (context) {
+      try { session.storage = await context.storageState(); } catch { /* browser may have crashed */ }
+    }
     await browser?.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));

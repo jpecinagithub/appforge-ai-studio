@@ -75,6 +75,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '10. React uses the automatic JSX runtime: import only hooks you use; use import type for interfaces. Do not give a component and an imported data type the same name (CarCard vs CarData). noUnusedLocals/noUnusedParameters/verbatimModuleSyntax are enabled. Never weaken tsconfig or the build script to hide errors.',
     '11. Only import packages declared in package.json; prefer native React, CSS and inline SVG for simple apps. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
     '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
+    '13. Do not invent external photo URLs or assume an image depicts the named product. Unless the user supplied verified assets, use self-contained inline SVG/CSS illustrations relevant to each sample, clearly labeled as illustrations. A car catalog must not show unrelated restaurant/office photos.',
   ].join('\n');
 }
 

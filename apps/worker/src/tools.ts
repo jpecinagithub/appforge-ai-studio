@@ -12,7 +12,7 @@ import type Database from 'better-sqlite3';
 import type { FileNode, ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
 import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
-import { checkBrowser, type BrowserStep } from './browser.js';
+import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -30,6 +30,7 @@ export interface ToolContext {
   interactionFingerprint?: string;
   /** Server-created build record; the manual Rebuild uses the same pipeline. */
   buildId?: string;
+  browserSession?: BrowserSession;
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
@@ -407,7 +408,8 @@ async function testPreview(ctx: ToolContext, args: Record<string, unknown>): Pro
   // Invalidate previous checks first, including a failed interaction test.
   ctx.browserFingerprint = undefined;
   ctx.interactionFingerprint = undefined;
-  const result = await checkBrowser(path.join(ctx.frontendDir, 'dist'), ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000));
+  ctx.browserSession ??= {};
+  const result = await checkBrowser(path.join(ctx.frontendDir, 'dist'), ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000), ctx.browserSession);
   if (result.ok && ctx.builtFingerprint === sourceFingerprint(ctx.frontendDir)) {
     ctx.browserFingerprint = ctx.builtFingerprint;
     if (steps.some((step) => ['click', 'fill', 'select'].includes(step.action)) && steps.some((step) => step.action === 'expect_text')) {
@@ -487,7 +489,7 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'search_code', description: 'Substring search across text files under frontend/ (skips node_modules, dist, .git).', parameters: { type: 'object', properties: { pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
   { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'test_preview', description: 'Build if needed, then run the current app in real Chromium on desktop/mobile. Use steps to test the requested interactions. Selectors are Playwright CSS selectors (e.g. button:has-text("Añadir")); expect_text checks visible text; reload tests persistence. Returns accessible page snapshot and runtime errors.', parameters: { type: 'object', properties: { steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: { action: { type: 'string', enum: ['click', 'fill', 'select', 'expect_text', 'reload'] }, selector: S('CSS selector for click/fill/select'), value: S('Input/select value or visible text to expect') }, required: ['action'], additionalProperties: false } } }, additionalProperties: false } },
+  { name: 'test_preview', description: 'Build if needed, then run the current app in real Chromium on desktop/mobile. Use steps to test requested interactions. Selectors must identify ONE element: e.g. button:has-text("Añadir"), or button:has-text("Me gusta") >> nth=0 for the first repeated card. expect_text checks visible text; reload tests persistence. Returns accessible page snapshot and runtime errors.', parameters: { type: 'object', properties: { steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: { action: { type: 'string', enum: ['click', 'fill', 'select', 'expect_text', 'reload'] }, selector: S('CSS selector for click/fill/select; append >> nth=0 for the first of repeated matches'), value: S('Input/select value or visible text to expect') }, required: ['action'], additionalProperties: false } } }, additionalProperties: false } },
   { name: 'start_preview', description: 'Verify a current build in Chromium, then publish the preview at /p/:projectId/. Never reuses an outdated build.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'create_revision', description: 'Git checkpoint of the project (add -A + commit) and record it as a revision.', parameters: { type: 'object', properties: { label: S('Revision label.') }, additionalProperties: false } },
   { name: 'run_command', description: 'Run an allowlisted command (npm, npx, node) WITHOUT a shell, cwd=frontend/.', parameters: { type: 'object', properties: { cmd: S('One of: npm, npx, node.'), args: { type: 'array', items: { type: 'string' }, description: 'Arguments, each a string.' } }, required: ['cmd'], additionalProperties: false } },
