@@ -40,17 +40,18 @@ it('automatically installs, repairs a final-turn TypeScript failure and tests th
     expect(history.at(-1)?.content).toContain('repair turns');
     return response('write_files', { files: [{ path: 'src/App.tsx', content: goodApp }] });
   });
-  model.mockImplementationOnce(async () => response('test_preview', { steps: [
+  model.mockImplementationOnce(async (_cfg, history: LlmMessage[]) => {
+    expect(history.at(-1)?.content).toContain('Interaction verification missing');
+    return response('test_preview', { steps: [
     { action: 'click', selector: 'button' }, { action: 'expect_text', value: 'Favoritos: 1' },
-  ] }));
-  model.mockResolvedValueOnce({ content: 'Catálogo generado y me gusta comprobado.', toolCalls: [], usage: { promptTokens: 1, completionTokens: 1 } });
+  ] }); });
   db.prepare('INSERT INTO runs(id,project_id,prompt,status,created_at) VALUES (?,?,?,?,?)').run('repair-run', projectId, 'Catálogo con me gusta', 'queued', new Date().toISOString());
   await runAgentOnce(db, 'repair-run', { dataDir, settings });
   const run = db.prepare('SELECT status,error,stats_json FROM runs WHERE id=?').get('repair-run') as { status: string; error: string; stats_json: string };
   expect(run.error).toBeNull();
   expect(run.status).toBe('done');
   expect(JSON.parse(run.stats_json).iterations).toBeGreaterThan(settings.maxIterations);
-  expect(model).toHaveBeenCalledTimes(4);
+  expect(model).toHaveBeenCalledTimes(3);
   const builds = db.prepare('SELECT status, logs FROM builds WHERE project_id=? ORDER BY started_at').all(projectId) as Array<{ status: string; logs: string }>;
   expect(builds.map((b) => b.status)).toEqual(['failed', 'success']);
   expect(builds[0].logs).toContain('TS6133');
