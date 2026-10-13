@@ -26,8 +26,8 @@ import type {
   Settings,
 } from 'appforge-shared';
 import { openDb } from './db.js';
-import { buildFileTree, createProject, deleteProject, dirSize, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings } from 'appforge-worker';
+import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
+import { createTools, requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -765,42 +765,18 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 // Builds (background execution)
 // ---------------------------------------------------------------------------
 
-const MAX_LOG_CHARS = 100_000;
-
 async function executeBuild(db: Database.Database, dataDir: string, buildId: string): Promise<void> {
   const row = db.prepare('SELECT * FROM builds WHERE id=?').get(buildId) as Record<string, any> | undefined;
   if (!row) return;
-  const fdir = frontendDir(dataDir, row.project_id);
   const t0 = Date.now();
-  let logs = '';
-  const push = (s: string) => {
-    logs += s;
-    if (logs.length > MAX_LOG_CHARS) logs = logs.slice(0, MAX_LOG_CHARS) + '\n…[logs truncated]';
-  };
-  const failBuild = (message: string) => {
-    db.prepare("UPDATE builds SET status='failed', finished_at=?, duration_ms=?, logs=?, error=? WHERE id=?").run(nowIso(), Date.now() - t0, logs, message, buildId);
-  };
   try {
-    db.prepare("UPDATE builds SET status='running', started_at=? WHERE id=?").run(nowIso(), buildId);
-    const lock = fs.existsSync(path.join(fdir, 'package-lock.json'));
-    const installArgs = lock ? ['ci', '--no-audit', '--no-fund'] : ['install', '--no-audit', '--no-fund'];
-    push(`$ npm ${installArgs.join(' ')}\n`);
-    const inst = await runCmd('npm', installArgs, { cwd: fdir, timeoutMs: 600_000 });
-    push(`${inst.stdout}\n${inst.stderr}\n`);
-    if (inst.timedOut) { failBuild('npm install timed out after 10 minutes'); return; }
-    if (inst.code !== 0) { failBuild(`npm install failed with exit code ${inst.code}`); return; }
-    push('$ npm run build\n');
-    const b = await runCmd('npm', ['run', 'build'], { cwd: fdir, timeoutMs: 600_000 });
-    push(`${b.stdout}\n${b.stderr}\n`);
-    if (b.timedOut) { failBuild('npm run build timed out after 10 minutes'); return; }
-    if (b.code !== 0) { failBuild(`npm run build failed with exit code ${b.code}`); return; }
-    const distSize = dirSize(path.join(fdir, 'dist'));
-    db.prepare("UPDATE builds SET status='success', finished_at=?, duration_ms=?, logs=?, artifacts_json=?, error=NULL WHERE id=?").run(
-      nowIso(), Date.now() - t0, logs, JSON.stringify({ distSize }), buildId,
-    );
-    db.prepare('UPDATE projects SET preview_url=?, updated_at=? WHERE id=?').run(`/p/${row.project_id}/`, nowIso(), row.project_id);
+    const ctx: ToolContext = { db, projectId: row.project_id, projectDir: projectDir(dataDir, row.project_id), frontendDir: frontendDir(dataDir, row.project_id), cmdTimeoutMs: 180_000, buildTimeoutMs: 600_000, buildId };
+    const result = await createTools().start_preview(ctx, {});
+    if (!result.ok) {
+      db.prepare("UPDATE builds SET status='failed', finished_at=?, duration_ms=?, logs=COALESCE(logs,'') || ?, error=? WHERE id=?").run(nowIso(), Date.now() - t0, `\n${result.output ?? result.error}`, result.error ?? 'verification failed', buildId);
+    }
   } catch (e) {
-    failBuild(`build crashed: ${(e as Error).message}`.slice(0, 2000));
+    db.prepare("UPDATE builds SET status='failed', finished_at=?, error=? WHERE id=?").run(nowIso(), `build crashed: ${(e as Error).message}`.slice(0, 2000), buildId);
   }
 }
 

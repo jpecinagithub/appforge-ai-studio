@@ -5,7 +5,7 @@ FROM node:24-slim
 # Environment variables (all documented; see .env.example at repo root):
 #   PORT                 API listen port (default 3001)
 #   DATA_DIR             data root: projects + appforge.db (default /data/appforge)
-#   APPFORGE_ADMIN_TOKEN if set, every /api/* and /p/* route requires
+#   APPFORGE_ADMIN_TOKEN if set, every /api/* route requires
 #                        Authorization: Bearer <token>
 #   CORS_ORIGIN          allowed frontend origin (default "*" in dev)
 #   LLM_PROVIDER         groq | openrouter (default groq)
@@ -20,7 +20,7 @@ FROM node:24-slim
 # ---------------------------------------------------------------------------
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git curl ca-certificates \
+  && apt-get install -y --no-install-recommends git curl ca-certificates chromium \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -44,6 +44,7 @@ COPY templates templates
 
 VOLUME /data/appforge
 ENV DATA_DIR=/data/appforge
+ENV APPFORGE_BROWSER_EXECUTABLE=/usr/bin/chromium
 EXPOSE 3001
 
 CMD ["npx", "tsx", "apps/server/src/index.ts"]

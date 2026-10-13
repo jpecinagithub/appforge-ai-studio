@@ -29,6 +29,8 @@ export interface LlmConfig {
   maxTokens: number;
   timeoutMs: number;
   apiKey: string;
+  /** Absolute run deadline, shared across HTTP retries. */
+  deadline?: number;
 }
 
 export interface ToolDef {
@@ -146,9 +148,10 @@ function backoffMs(attempt: number, retryAfter: string | null): number {
   return Math.min(1000 * 2 ** (attempt - 1), 15_000);
 }
 
-function parseResponse(body: unknown): LlmResponse {
+export function parseResponse(body: unknown): LlmResponse {
   const choice = (body as { choices?: Array<any> })?.choices?.[0];
   if (!choice) throw new LlmError('LLM_EMPTY', 'LLM returned no choices');
+  if (choice.finish_reason === 'length') throw new LlmError('LLM_TRUNCATED', 'The model response was truncated. Use smaller file batches with complete contents.');
   const msg = choice.message ?? {};
   const toolCalls: LlmToolCall[] = [];
   for (const tc of msg.tool_calls ?? []) {
@@ -190,7 +193,9 @@ export async function chatLlm(cfg: LlmConfig, messages: LlmMessage[], tools: Too
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const res = await postJsonCurl(url, headers, payload, cfg.timeoutMs);
+      const remaining = (cfg.deadline ?? Infinity) - Date.now();
+      if (remaining <= 0) throw new LlmError('RUN_TIMEOUT', 'The run deadline was reached');
+      const res = await postJsonCurl(url, headers, payload, Math.min(cfg.timeoutMs, remaining));
       if (res.status === 429 || res.status >= 500) {
         lastError = new LlmError(
           res.status === 429 ? 'LLM_RATE_LIMIT' : 'LLM_SERVER_ERROR',

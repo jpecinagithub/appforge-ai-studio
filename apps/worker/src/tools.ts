@@ -11,6 +11,8 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { FileNode, ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
+import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
+import { checkBrowser, type BrowserStep } from './browser.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -22,6 +24,12 @@ export interface ToolContext {
   cmdTimeoutMs: number;
   /** longer timeout for npm install / npm run build */
   buildTimeoutMs: number;
+  /** In-memory receipts are valid only for exactly the sources that were checked. */
+  builtFingerprint?: string;
+  browserFingerprint?: string;
+  interactionFingerprint?: string;
+  /** Server-created build record; the manual Rebuild uses the same pipeline. */
+  buildId?: string;
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
@@ -179,6 +187,26 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
   }
 }
 
+async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
+  const t0 = Date.now();
+  try {
+    if (!Array.isArray(args.files) || args.files.length === 0 || args.files.length > 20) throw new Error('files must contain 1 to 20 files');
+    // Validate the entire batch before writing any file.
+    const files = args.files.map((file) => {
+      const p = strArg(file, 'path');
+      const content = contentArg(file);
+      return { path: p, abs: resolveIn(ctx.frontendDir, p), content };
+    });
+    for (const file of files) {
+      fs.mkdirSync(path.dirname(file.abs), { recursive: true });
+      fs.writeFileSync(file.abs, file.content, 'utf8');
+    }
+    return { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
+  } catch (e) {
+    return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
+  }
+}
+
 /** Replaces the FIRST occurrence of `search` in the file. */
 async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
   const t0 = Date.now();
@@ -269,12 +297,20 @@ async function searchCode(ctx: ToolContext, args: Record<string, unknown>): Prom
 async function installDependencies(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
   const t0 = Date.now();
   void args;
-  const lock = fs.existsSync(path.join(ctx.frontendDir, 'package-lock.json'));
+  const receipt = path.join(ctx.frontendDir, 'node_modules', '.appforge-dependencies');
+  const fingerprint = dependencyFingerprint(ctx.frontendDir);
+  if (fs.existsSync(receipt) && fs.readFileSync(receipt, 'utf8') === fingerprint) {
+    return { ok: true, output: 'Dependencies already match package.json and package-lock.json.', durationMs: Date.now() - t0 };
+  }
+  // A generated package.json may add dependencies without updating its lockfile.
+  const lock = lockMatchesManifest(ctx.frontendDir);
   const npmArgs = lock ? ['ci', '--no-audit', '--no-fund'] : ['install', '--no-audit', '--no-fund'];
   const r = await runCmd('npm', npmArgs, { cwd: ctx.frontendDir, timeoutMs: ctx.buildTimeoutMs });
   const output = trunc(`$ npm ${npmArgs.join(' ')}\n${r.stdout}\n${r.stderr}`);
   if (r.timedOut) return { ok: false, code: 'INSTALL_TIMEOUT', error: 'npm install timed out', durationMs: r.durationMs, output };
   if (r.code !== 0) return { ok: false, code: 'INSTALL_FAILED', error: `npm install exited with code ${r.code}`, durationMs: r.durationMs, output };
+  fs.mkdirSync(path.dirname(receipt), { recursive: true });
+  fs.writeFileSync(receipt, dependencyFingerprint(ctx.frontendDir), 'utf8');
   return { ok: true, durationMs: r.durationMs, output };
 }
 
@@ -292,8 +328,9 @@ async function runBuild(ctx: ToolContext, args: Record<string, unknown>): Promis
   const t0 = Date.now();
   void args;
   // Registra el build en la BD para que la pestaña Builds del estudio lo muestre.
-  const buildId = randomUUID();
-  ctx.db
+  const buildId = ctx.buildId ?? randomUUID();
+  if (ctx.buildId) ctx.db.prepare("UPDATE builds SET status='running', started_at=? WHERE id=?").run(nowIso(), buildId);
+  else ctx.db
     .prepare(
       'INSERT INTO builds(id, project_id, status, started_at, finished_at, duration_ms, logs, artifacts_json, error) VALUES (?,?,?,?,?,?,?,?,?)',
     )
@@ -303,8 +340,17 @@ async function runBuild(ctx: ToolContext, args: Record<string, unknown>): Promis
       .prepare('UPDATE builds SET status=?, finished_at=?, duration_ms=?, logs=?, artifacts_json=?, error=? WHERE id=?')
       .run(status, nowIso(), durationMs, logs, artifacts ? JSON.stringify(artifacts) : null, error, buildId);
   };
+  ctx.builtFingerprint = undefined;
+  ctx.browserFingerprint = undefined;
+  ctx.interactionFingerprint = undefined;
+  const installed = await installDependencies(ctx, {});
+  if (!installed.ok) {
+    finish('failed', installed.output ?? '', null, installed.error ?? 'dependency installation failed', Date.now() - t0);
+    return installed;
+  }
+  const inputFingerprint = sourceFingerprint(ctx.frontendDir);
   const r = await runCmd('npm', ['run', 'build'], { cwd: ctx.frontendDir, timeoutMs: ctx.buildTimeoutMs });
-  const output = trunc(`$ npm run build\n${r.stdout}\n${r.stderr}`);
+  const output = trunc(`${installed.output}\n$ npm run build\n${r.stdout}\n${r.stderr}`);
   if (r.timedOut) {
     finish('failed', output, null, 'build timed out', r.durationMs);
     return { ok: false, code: 'BUILD_TIMEOUT', error: 'build timed out', durationMs: r.durationMs, output };
@@ -319,6 +365,11 @@ async function runBuild(ctx: ToolContext, args: Record<string, unknown>): Promis
     return { ok: false, code: 'BUILD_NO_OUTPUT', error: 'build succeeded but dist/index.html is missing', durationMs: r.durationMs, output };
   }
   const durationMs = Date.now() - t0;
+  if (sourceFingerprint(ctx.frontendDir) !== inputFingerprint) {
+    finish('failed', output, null, 'source files changed during build; rebuild required', durationMs);
+    return fail('BUILD_SOURCE_CHANGED', 'source files changed during build; rebuild required', durationMs);
+  }
+  ctx.builtFingerprint = inputFingerprint;
   finish('success', output, { distSize: dirSizeSync(path.join(ctx.frontendDir, 'dist')) }, null, durationMs);
   return { ok: true, data: { dist: 'dist/index.html', buildId }, durationMs, output };
 }
@@ -331,15 +382,39 @@ async function startPreview(ctx: ToolContext, args: Record<string, unknown>): Pr
   const t0 = Date.now();
   void args;
   const distIndex = path.join(ctx.frontendDir, 'dist', 'index.html');
-  if (!fs.existsSync(distIndex)) {
+  if (!fs.existsSync(distIndex) || ctx.builtFingerprint !== sourceFingerprint(ctx.frontendDir)) {
     const built = await runBuild(ctx, {});
     if (!built.ok) {
       return { ok: false, code: 'PREVIEW_BUILD_FAILED', error: built.error, durationMs: Date.now() - t0, output: built.output };
     }
   }
+  if (ctx.browserFingerprint !== ctx.builtFingerprint) {
+    const tested = await testPreview(ctx, {});
+    if (!tested.ok) return tested;
+  }
   const url = `/p/${ctx.projectId}/`;
   ctx.db.prepare('UPDATE projects SET preview_url=?, updated_at=? WHERE id=?').run(url, nowIso(), ctx.projectId);
   return { ok: true, data: { url, status: 'ready' }, durationMs: Date.now() - t0 };
+}
+
+async function testPreview(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
+  const steps = (args.steps ?? []) as BrowserStep[];
+  if (!Array.isArray(steps) || steps.length > 12) return fail('INVALID_ARGS', 'steps must be an array of at most 12 actions');
+  if (ctx.builtFingerprint !== sourceFingerprint(ctx.frontendDir)) {
+    const built = await runBuild(ctx, {});
+    if (!built.ok) return built;
+  }
+  // Invalidate previous checks first, including a failed interaction test.
+  ctx.browserFingerprint = undefined;
+  ctx.interactionFingerprint = undefined;
+  const result = await checkBrowser(path.join(ctx.frontendDir, 'dist'), ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000));
+  if (result.ok && ctx.builtFingerprint === sourceFingerprint(ctx.frontendDir)) {
+    ctx.browserFingerprint = ctx.builtFingerprint;
+    if (steps.some((step) => ['click', 'fill', 'select'].includes(step.action)) && steps.some((step) => step.action === 'expect_text')) {
+      ctx.interactionFingerprint = ctx.builtFingerprint;
+    }
+  }
+  return result;
 }
 
 async function gitCommit(ctx: ToolContext, label: string): Promise<{ sha: string; empty: boolean }> {
@@ -402,6 +477,7 @@ async function runCommand(ctx: ToolContext, args: Record<string, unknown>): Prom
 const S = (description: string) => ({ type: 'string', description });
 
 export const TOOL_DEFS: ToolDef[] = [
+  { name: 'write_files', description: 'Write a complete set of related files in ONE call. Preferred when implementing a new app; paths relative to frontend/.', parameters: { type: 'object', properties: { files: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { path: S('Relative path'), content: S('Complete file text') }, required: ['path', 'content'], additionalProperties: false } } }, required: ['files'], additionalProperties: false } },
   { name: 'list_files', description: 'List the project file tree (frontend/ as root).', parameters: { type: 'object', properties: { path: S('Subdirectory relative to frontend/, default ".".') }, additionalProperties: false } },
   { name: 'read_file', description: 'Read a text file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'write_file', description: 'Write (create or overwrite) a file relative to frontend/. Creates parent dirs. content MUST be a string with the full file text (for .json files, pass the JSON text, not an object).', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), content: S('Full file content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
@@ -409,9 +485,10 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/.', parameters: { type: 'object', properties: { path: S('Path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/.', parameters: { type: 'object', properties: { path: S('Directory path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'search_code', description: 'Substring search across text files under frontend/ (skips node_modules, dist, .git).', parameters: { type: 'object', properties: { pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
-  { name: 'install_dependencies', description: 'Install frontend dependencies (npm ci when a lockfile exists, else npm install).', parameters: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'run_build', description: 'Run the production build (npm run build, includes typecheck) in frontend/ and verify dist/index.html.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'start_preview', description: 'Ensure the production build exists and mark the preview ready (served at /p/:projectId/).', parameters: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'test_preview', description: 'Build if needed, then run the current app in real Chromium on desktop/mobile. Use steps to test the requested interactions. Selectors are Playwright CSS selectors (e.g. button:has-text("Añadir")); expect_text checks visible text; reload tests persistence. Returns accessible page snapshot and runtime errors.', parameters: { type: 'object', properties: { steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: { action: { type: 'string', enum: ['click', 'fill', 'select', 'expect_text', 'reload'] }, selector: S('CSS selector for click/fill/select'), value: S('Input/select value or visible text to expect') }, required: ['action'], additionalProperties: false } } }, additionalProperties: false } },
+  { name: 'start_preview', description: 'Verify a current build in Chromium, then publish the preview at /p/:projectId/. Never reuses an outdated build.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'create_revision', description: 'Git checkpoint of the project (add -A + commit) and record it as a revision.', parameters: { type: 'object', properties: { label: S('Revision label.') }, additionalProperties: false } },
   { name: 'run_command', description: 'Run an allowlisted command (npm, npx, node) WITHOUT a shell, cwd=frontend/.', parameters: { type: 'object', properties: { cmd: S('One of: npm, npx, node.'), args: { type: 'array', items: { type: 'string' }, description: 'Arguments, each a string.' } }, required: ['cmd'], additionalProperties: false } },
 ];
@@ -421,6 +498,7 @@ export function createTools(): Record<string, ToolHandler> {
     list_files: listFiles,
     read_file: readFile,
     write_file: writeFile,
+    write_files: writeFiles,
     patch_file: patchFile,
     delete_file: deleteFile,
     create_directory: createDirectory,
@@ -428,6 +506,7 @@ export function createTools(): Record<string, ToolHandler> {
     install_dependencies: installDependencies,
     run_build: runBuild,
     start_preview: startPreview,
+    test_preview: testPreview,
     create_revision: createRevision,
     run_command: runCommand,
   };

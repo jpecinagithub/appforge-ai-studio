@@ -36,7 +36,6 @@ export function CreateApp() {
         description: description.trim() || undefined,
         type,
       });
-      await api.postMessage(project.id, { role: 'user', content: prompt.trim() });
       try {
         await api.createRun(project.id, prompt.trim());
       } catch (e) {
