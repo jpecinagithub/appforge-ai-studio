@@ -50,6 +50,34 @@ describe('health', () => {
   });
 });
 
+describe('authentication boundary', () => {
+  it('keeps the API private while generated web apps remain public', async () => {
+    const secured = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR, adminToken: 'test-admin-token' });
+    try {
+      const unauthorized = await secured.inject({ method: 'GET', url: '/api/health' });
+      expect(unauthorized.statusCode).toBe(401);
+
+      const created = await secured.inject({
+        method: 'POST',
+        url: '/api/projects',
+        headers: { authorization: 'Bearer test-admin-token' },
+        payload: { name: 'Public Oracle app' },
+      });
+      expect(created.statusCode).toBe(201);
+      const projectId = (created.json() as { id: string }).id;
+      const distDir = path.join(dataDir, 'projects', projectId, 'frontend', 'dist');
+      fs.mkdirSync(distDir, { recursive: true });
+      fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><h1>Public app</h1>');
+
+      const preview = await secured.inject({ method: 'GET', url: `/p/${projectId}/` });
+      expect(preview.statusCode).toBe(200);
+      expect(preview.body).toContain('Public app');
+    } finally {
+      await secured.close();
+    }
+  });
+});
+
 describe('runs: single active run per project', () => {
   it('returns 409 RUN_ACTIVE when a run is already active', async () => {
     const p = await createProject('Run conflict app');
