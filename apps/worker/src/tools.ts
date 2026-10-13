@@ -89,8 +89,19 @@ export async function runCmd(
   opts: { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv },
 ): Promise<{ code: number; stdout: string; stderr: string; durationMs: number; timedOut: boolean }> {
   const t0 = Date.now();
+  // Windows cannot execute npm.cmd/npx.cmd with shell:false. Invoke their
+  // JavaScript entry point with the current Node binary instead.
+  let executable = cmd;
+  let executableArgs = args;
+  if (process.platform === 'win32' && /^(npm|npx)$/i.test(cmd)) {
+    const bin = cmd.toLowerCase();
+    const fromEnv = bin === 'npm' ? process.env.npm_execpath : process.env.npx_execpath;
+    const cli = fromEnv ?? path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', `${bin}-cli.js`);
+    executable = process.execPath;
+    executableArgs = [cli, ...args];
+  }
   return new Promise((resolve) => {
-    execFile(cmd, args, { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: 32 * 1024 * 1024, env: opts.env }, (err, stdout, stderr) => {
+    execFile(executable, executableArgs, { cwd: opts.cwd, timeout: opts.timeoutMs, maxBuffer: 32 * 1024 * 1024, env: opts.env }, (err, stdout, stderr) => {
       const durationMs = Date.now() - t0;
       const timedOut = !!err && ((err as NodeJS.ErrnoException & { killed?: boolean }).killed === true || /timed out/i.test(err.message));
       const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? ((err as { code: number }).code as number) : 1) : 0;

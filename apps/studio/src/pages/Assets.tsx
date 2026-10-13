@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- async resource loading and project selection are intentional */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowDownToLine, Code2, FileText, Folder, FolderOpen } from 'lucide-react';
