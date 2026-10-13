@@ -28,9 +28,12 @@ export interface ToolContext {
   builtFingerprint?: string;
   browserFingerprint?: string;
   interactionFingerprint?: string;
+  interactiveControls?: number;
   /** Server-created build record; the manual Rebuild uses the same pipeline. */
   buildId?: string;
   browserSession?: BrowserSession;
+  lastBrowserSteps?: BrowserStep[];
+  lastBrowserStart?: BrowserSession;
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
@@ -390,7 +393,8 @@ async function startPreview(ctx: ToolContext, args: Record<string, unknown>): Pr
     }
   }
   if (ctx.browserFingerprint !== ctx.builtFingerprint) {
-    const tested = await testPreview(ctx, {});
+    if (ctx.lastBrowserSteps?.length) ctx.browserSession = structuredClone(ctx.lastBrowserStart ?? {});
+    const tested = await testPreview(ctx, { steps: ctx.lastBrowserSteps ?? [] });
     if (!tested.ok) return tested;
   }
   const url = `/p/${ctx.projectId}/`;
@@ -409,9 +413,15 @@ async function testPreview(ctx: ToolContext, args: Record<string, unknown>): Pro
   ctx.browserFingerprint = undefined;
   ctx.interactionFingerprint = undefined;
   ctx.browserSession ??= {};
+  const startingSession = structuredClone(ctx.browserSession);
   const result = await checkBrowser(path.join(ctx.frontendDir, 'dist'), ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000), ctx.browserSession);
   if (result.ok && ctx.builtFingerprint === sourceFingerprint(ctx.frontendDir)) {
+    ctx.interactiveControls = (result.data as { interactiveControls: number }).interactiveControls;
     ctx.browserFingerprint = ctx.builtFingerprint;
+    if (steps.length > 0) {
+      ctx.lastBrowserSteps = steps;
+      ctx.lastBrowserStart = startingSession;
+    }
     if (steps.some((step) => ['click', 'fill', 'select'].includes(step.action)) && steps.some((step) => step.action === 'expect_text')) {
       ctx.interactionFingerprint = ctx.builtFingerprint;
     }

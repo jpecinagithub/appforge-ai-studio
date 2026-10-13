@@ -11,7 +11,9 @@ it('keeps localStorage between browser tool calls despite temporary port changes
     fs.writeFileSync(path.join(dir, 'index.html'), '<button>Me gusta</button><p id="count"></p><script>let n=Number(localStorage.getItem("likes")||0);const show=()=>document.getElementById("count").textContent="Likes: "+n;show();document.querySelector("button").onclick=()=>{localStorage.setItem("likes",String(++n));show();};</script>');
     const first = await checkBrowser(dir, 'test', [{ action: 'click', selector: 'button' }, { action: 'expect_text', value: 'Likes: 1' }], 30000, session);
     expect(first.ok).toBe(true);
-    const second = await checkBrowser(dir, 'test', [{ action: 'reload' }, { action: 'expect_text', value: 'Likes: 1' }], 30000, session);
+    const second = await checkBrowser(dir, 'test', [{ action: 'reload' }, { action: 'expect_text', selector: '#count', value: 'Likes: 1' }], 30000, session);
     expect(second.ok).toBe(true);
+    const partial = await checkBrowser(dir, 'test', [{ action: 'expect_text', value: '1' }], 30000, session);
+    expect(partial.ok).toBe(false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

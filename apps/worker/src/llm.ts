@@ -248,8 +248,9 @@ export async function chatLlm(cfg: LlmConfig, messages: LlmMessage[], tools: Too
  *   3. patch_file — add a paragraph
  *   4. install_dependencies
  *   5. run_build
- *   6. start_preview
- *   7. final summary (no tool calls → run ends)
+ *   6. test_preview — increment and reset the counter
+ *   7. start_preview
+ *   8. final summary (no tool calls → run ends)
  *
  * It personalizes the copied template, installs, builds and previews it for
  * real — but it is NOT artificial intelligence. Never present stub output as
@@ -289,7 +290,14 @@ export class StubLlm {
       case 5:
         return stubTool('stub-5', 'run_build', {});
       case 6:
-        return stubTool('stub-6', 'start_preview', {});
+        return stubTool('stub-6', 'test_preview', { steps: [
+          { action: 'click', selector: 'button:has-text("+1")' },
+          { action: 'expect_text', value: '1' },
+          { action: 'click', selector: 'button:has-text("Reset")' },
+          { action: 'expect_text', value: '0' },
+        ] });
+      case 7:
+        return stubTool('stub-7', 'start_preview', {});
       default:
         return {
           content:

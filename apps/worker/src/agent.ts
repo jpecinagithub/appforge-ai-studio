@@ -66,7 +66,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '1. Keep an internal plan of at most 5 tasks. Do not narrate the plan; just work.',
     '2. For a new app, use write_files to create ALL related files in ONE call. Keep simple apps in App.tsx + index.css; split only when useful. For edits, read the relevant file then patch_file.',
     '3. run_build installs dependencies automatically and checks strict TypeScript. Do not spend turns installing first, listing files already in context, or running a separate typecheck. Fix ALL reported errors together before rebuilding.',
-    '4. Call test_preview with interaction steps for the requested behaviors (click/fill/select followed by expect_text; reload to verify persistence), then start_preview. A successful compile does not prove that buttons work.',
+    '4. Call test_preview with interaction steps for EVERY distinct visible control: search, filters, details, main actions, then reload to verify persistence. Use click/fill/select followed by exact expect_text assertions of the changed result. Split independent cases into separate calls if needed. Then start_preview. A successful compile does not prove that buttons work. Interactive apps cannot finish without a successful interaction test of the current source.',
     '5. NEVER claim something is finished without verifying it (build output, preview URL). No fake progress.',
     '6. Do not repeat a failed build without editing its cause. Do not give up after the first failure: diagnostics are returned so you can repair them. NEVER delete project files.',
     '7. NEVER run "npm run dev" (it starts a server that never exits and wastes the run). To build: run_build. To preview: start_preview.',
@@ -367,6 +367,12 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       : await perform('start_preview', {});
     if (!result.ok && modifiedFiles.length === 0) lastError = result.error ?? lastError;
     if (cancelledNow()) return false;
+    if (result.ok && (ctx.interactiveControls ?? 0) > 0 && ctx.interactionFingerprint !== ctx.builtFingerprint) {
+      lastError = 'Interaction verification missing for the current source. Use test_preview with real click/fill/select actions and exact expect_text assertions of their results. Exercise each distinct visible control, including search and detail buttons; a rendering smoke test is insufficient.';
+      criticalFailures.set('interactions', lastError);
+    } else if (result.ok) {
+      criticalFailures.delete('interactions');
+    }
     if (result.ok && criticalFailures.size === 0 && Date.now() - startedAt < limits.runTimeoutMs) {
       complete();
       return true;

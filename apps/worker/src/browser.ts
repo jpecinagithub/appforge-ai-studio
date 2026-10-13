@@ -75,10 +75,11 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
       const text = (await page.locator('body').innerText()).slice(0, 6000);
       // Capture accessible controls as feedback for the agent's next interaction test.
       const snapshot = (await page.locator('body').ariaSnapshot()).slice(0, 8000);
+      const interactiveControls = await page.locator('button:visible, input:visible, select:visible, textarea:visible, [role="button"]:visible').count();
       await page.setViewportSize({ width: 390, height: 844 });
       await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       if (errors.length) throw new Error([...new Set(errors)].join('\n'));
-      return { text, snapshot, stepsPassed: steps.length, viewports: ['1280x800', '390x844'] };
+      return { text, snapshot, interactiveControls, stepsPassed: steps.length, viewports: ['1280x800', '390x844'] };
     };
     const data = await Promise.race([
       work(),
@@ -103,7 +104,8 @@ async function browserStep(page: Page, step: BrowserStep): Promise<void> {
   if (step.action === 'reload') { await page.reload({ waitUntil: 'networkidle' }); return; }
   if (step.action === 'expect_text') {
     if (!step.value) throw new Error('expect_text requires value');
-    await page.getByText(step.value, { exact: false }).first().waitFor({ state: 'visible' });
+    const scope = step.selector ? page.locator(step.selector) : page;
+    await scope.getByText(step.value, { exact: true }).first().waitFor({ state: 'visible' });
     return;
   }
   if (!step.selector) throw new Error(`${step.action} requires a CSS selector`);

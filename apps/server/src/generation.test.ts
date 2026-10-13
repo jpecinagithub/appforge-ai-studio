@@ -59,6 +59,21 @@ it('automatically installs, repairs a final-turn TypeScript failure and tests th
   expect(result).toBeTruthy();
 });
 
+it('replays successful interactions against changed source, starting from the original test state', { timeout: 90000 }, async () => {
+  const tools = createTools();
+  const persistentApp = goodApp.replace('useState(0)', 'useState(Number(localStorage.getItem("likes") || 0))').replace('setLikes(likes + 1)', '(localStorage.setItem("likes", String(likes + 1)), setLikes(likes + 1))');
+  await tools.write_file(ctx, { path: 'src/App.tsx', content: persistentApp });
+  expect((await tools.test_preview(ctx, { steps: [{ action: 'click', selector: 'button' }, { action: 'expect_text', value: 'Favoritos: 1' }] })).ok).toBe(true);
+  await tools.write_file(ctx, { path: 'src/App.tsx', content: `${persistentApp}\n// harmless edit` });
+  expect((await tools.start_preview(ctx, {})).ok).toBe(true);
+  await tools.write_file(ctx, { path: 'src/App.tsx', content: persistentApp.replaceAll('likes + 1', 'likes + 2') });
+  expect((await tools.start_preview(ctx, {})).ok).toBe(false);
+  ctx.lastBrowserSteps = undefined;
+  ctx.lastBrowserStart = undefined;
+  ctx.browserSession = undefined;
+  await tools.write_file(ctx, { path: 'src/App.tsx', content: goodApp });
+});
+
 it('never publishes a stale successful bundle after source edits fail to compile', { timeout: 90000 }, async () => {
   const tools = createTools();
   expect((await tools.start_preview(ctx, {})).ok).toBe(true);
@@ -86,4 +101,14 @@ it('does not accept unchanged template output as completed work', { timeout: 300
   expect(run.status).toBe('error');
   expect(run.error).toContain('No implementation');
   expect(model.mock.calls.length).toBeLessThanOrEqual(settings.maxIterations + 6);
+});
+
+it('rejects completion of an interactive app without an interaction assertion', { timeout: 90000 }, async () => {
+  model.mockReset().mockImplementationOnce(async () => response('write_files', { files: [{ path: 'src/App.tsx', content: `${goodApp}\n// new implementation` }] }));
+  model.mockResolvedValue({ content: 'Todo listo', toolCalls: [], usage: { promptTokens: 0, completionTokens: 0 } });
+  db.prepare('INSERT INTO runs(id,project_id,prompt,status,created_at) VALUES (?,?,?,?,?)').run('untested-run', projectId, 'Make likes work', 'queued', new Date().toISOString());
+  await runAgentOnce(db, 'untested-run', { dataDir, settings });
+  const run = db.prepare('SELECT status,error FROM runs WHERE id=?').get('untested-run') as { status: string; error: string };
+  expect(run.status).toBe('error');
+  expect(run.error).toContain('Interaction verification missing');
 });

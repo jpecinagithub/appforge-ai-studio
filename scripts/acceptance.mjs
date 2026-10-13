@@ -40,7 +40,11 @@ if (process.argv[2] === 'start') {
     const previous = await api(`/runs/${item.runId}`);
     if (previous.status === 'done') continue;
     const visual = ' No uses URLs de fotografías inventadas ni fotos ajenas al contenido. Utiliza ilustraciones SVG/CSS locales relevantes y etiquetadas como ilustraciones. Comprueba interacciones y recarga con test_preview.';
-    const run = await api(`/projects/${item.projectId}/runs`, { prompt: item.prompt + visual });
+    const prompt = item.prompt + visual;
+    const runs = await api(`/projects/${item.projectId}/runs`);
+    const active = runs.items.find((candidate) => ['queued', 'running'].includes(candidate.status));
+    if (active && active.prompt !== prompt) throw new Error('Another run is active for this project');
+    const run = active || await api(`/projects/${item.projectId}/runs`, { prompt });
     report.push({ ...item, runId: run.id });
     fs.writeFileSync(file, JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ projectId: item.projectId, runId: run.id }));
@@ -57,7 +61,7 @@ if (process.argv[2] === 'start') {
   console.log(JSON.stringify({ projectId, runId: run.id }));
 } else {
   const report = JSON.parse(fs.readFileSync(file, 'utf8'));
-  for (const item of report) {
+  for (const item of new Map(report.map((entry) => [entry.projectId, entry])).values()) {
     const run = await api(`/runs/${item.runId}`);
     const project = await api(`/projects/${item.projectId}`);
     console.log(JSON.stringify({ name: item.name, projectId: item.projectId, runId: item.runId, status: run.status, stats: run.stats, error: run.error, preview: project.previewUrl }));
