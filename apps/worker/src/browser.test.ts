@@ -17,3 +17,14 @@ it('keeps localStorage between browser tool calls despite temporary port changes
     expect(partial.ok).toBe(false);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+it('rejects a bundle with a broken image', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-browser-image-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'index.html'), '<h1>Catalog</h1><img src="./missing.jpg" alt="Missing motorcycle">');
+    const result = await checkBrowser(dir, 'broken-image', [], 30000);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Broken images detected');
+    expect(result.error).toContain('Missing motorcycle');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

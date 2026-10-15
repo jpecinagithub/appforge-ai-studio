@@ -67,17 +67,18 @@ export async function checkBrowser(
     page.setDefaultTimeout(5000);
     page.on('pageerror', (error) => errors.push(error.message));
     page.on('response', (response) => {
-      if (response.status() >= 400 && ['document', 'script', 'stylesheet'].includes(response.request().resourceType())) {
+      if (response.status() >= 400 && ['document', 'script', 'stylesheet', 'image'].includes(response.request().resourceType())) {
         errors.push(`HTTP ${response.status()}: ${response.url()}`);
       }
     });
     page.on('requestfailed', (request) => {
-      if (['document', 'script', 'stylesheet'].includes(request.resourceType())) errors.push(`Resource failed: ${request.url()}`);
+      if (['document', 'script', 'stylesheet', 'image'].includes(request.resourceType())) errors.push(`Resource failed: ${request.url()}`);
     });
     const remaining = Math.max(1, timeoutMs - (Date.now() - t0));
     const work = async () => {
       await page.goto(url, { waitUntil: 'networkidle', timeout: Math.min(remaining, 15_000) });
       await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
+      await assertImagesLoaded(page);
       const screenshot = screenshotPath
         ? await page.screenshot({
           type: 'webp',
@@ -93,6 +94,7 @@ export async function checkBrowser(
       const interactiveControls = await page.locator('button:visible, input:visible, select:visible, textarea:visible, [role="button"]:visible').count();
       await page.setViewportSize({ width: 390, height: 844 });
       await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
+      await assertImagesLoaded(page);
       if (errors.length) throw new Error([...new Set(errors)].join('\n'));
       if (screenshotPath && screenshot) {
         fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
@@ -116,6 +118,17 @@ export async function checkBrowser(
     await browser?.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+async function assertImagesLoaded(page: Page): Promise<void> {
+  const broken = await page.locator('img').evaluateAll((images) => images
+    .map((image) => image as unknown as { complete: boolean; naturalWidth: number; currentSrc: string; src: string; alt: string })
+    .filter((image) => image.complete && image.naturalWidth === 0)
+    .map((image) => ({ src: image.currentSrc || image.src, alt: image.alt })));
+  if (broken.length > 0) {
+    const detail = broken.slice(0, 8).map((image) => `${image.alt || '(no alt)'}: ${image.src}`).join('\n');
+    throw new Error(`Broken images detected:\n${detail}`);
   }
 }
 
