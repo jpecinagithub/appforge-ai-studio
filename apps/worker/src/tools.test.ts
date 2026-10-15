@@ -62,6 +62,39 @@ describe('acquire_image', () => {
     expect(receipt).toMatchObject({ creator: 'Example photographer', license: 'BY-SA 4.0' });
   });
 
+  it('retries a temporarily unavailable Openverse thumbnail', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+        results: [{
+          title: 'Yamaha MT-09', creator: 'Example photographer', license: 'by',
+          url: 'https://images.example.test/yamaha.jpg',
+          thumbnail: 'https://api.openverse.org/v1/images/example/thumb/',
+          foreign_landing_url: 'https://example.test/photo/yamaha',
+          width: 1600, height: 900, mature: false,
+        }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      fetchMock.mockResolvedValueOnce(new Response('{}', { status: 406, headers: { 'content-type': 'application/json' } }));
+      fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg' },
+      }));
+
+      const pending = createTools().acquire_image(ctx, {
+        query: 'Yamaha MT-09 motorcycle',
+        path: 'public/assets/yamaha-mt09',
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('refuses destinations outside public', async () => {
     const result = await createTools().acquire_image(ctx, { query: 'car', path: 'src/car' });
     expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });

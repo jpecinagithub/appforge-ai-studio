@@ -287,6 +287,12 @@ function assetPathWithExtension(requestedPath: string, extension: string): strin
   return requestedPath + extension;
 }
 
+const IMAGE_RETRY_DELAYS_MS = [0, 1_000, 3_000] as const;
+
+function retryableImageStatus(status: number): boolean {
+  return status === 406 || status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
 /**
  * Finds a reusable photograph through Openverse, downloads it into public/
  * and writes a sidecar attribution receipt. Only licenses that permit
@@ -328,28 +334,51 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
     let selected: OpenverseImage | undefined;
     let bytes: Buffer | undefined;
     let extension: string | null = null;
+    const downloadDiagnostics: string[] = [];
     for (const candidate of candidates.slice(0, 6)) {
-      try {
-        // Download through Openverse's thumbnail proxy instead of contacting
-        // arbitrary source hosts returned by the search index (SSRF boundary).
-        const response = await fetch(candidate.thumbnail!, {
-          headers: { Accept: 'image/jpeg,image/png,image/webp', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
-          redirect: 'error',
-          signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
-        });
-        extension = imageExtension(response.headers.get('content-type') ?? '');
-        const announced = Number(response.headers.get('content-length') ?? 0);
-        if (!response.ok || !extension || announced > MAX_IMAGE_BYTES) continue;
-        const downloaded = Buffer.from(await response.arrayBuffer());
-        if (downloaded.length === 0 || downloaded.length > MAX_IMAGE_BYTES) continue;
-        selected = candidate;
-        bytes = downloaded;
-        break;
-      } catch {
-        // Try the next licensed candidate when a source host is unavailable.
+      for (const delayMs of IMAGE_RETRY_DELAYS_MS) {
+        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        try {
+          // Download through Openverse's thumbnail proxy instead of contacting
+          // arbitrary source hosts returned by the search index (SSRF boundary).
+          // A cold proxy entry can answer 406 while Openverse prepares it, so
+          // retry transient responses before abandoning a licensed candidate.
+          const response = await fetch(candidate.thumbnail!, {
+            headers: { Accept: 'image/*', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
+            redirect: 'error',
+            signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+          });
+          extension = imageExtension(response.headers.get('content-type') ?? '');
+          const announced = Number(response.headers.get('content-length') ?? 0);
+          if (!response.ok) {
+            downloadDiagnostics.push(`HTTP ${response.status}`);
+            await response.body?.cancel();
+            if (retryableImageStatus(response.status)) continue;
+            break;
+          }
+          if (!extension || announced > MAX_IMAGE_BYTES) {
+            downloadDiagnostics.push(!extension ? 'unsupported content type' : 'image too large');
+            await response.body?.cancel();
+            break;
+          }
+          const downloaded = Buffer.from(await response.arrayBuffer());
+          if (downloaded.length === 0 || downloaded.length > MAX_IMAGE_BYTES) {
+            downloadDiagnostics.push(downloaded.length === 0 ? 'empty image' : 'image too large');
+            break;
+          }
+          selected = candidate;
+          bytes = downloaded;
+          break;
+        } catch (error) {
+          downloadDiagnostics.push((error as Error).message.slice(0, 120));
+        }
       }
+      if (selected) break;
     }
-    if (!selected || !bytes || !extension) return fail('IMAGE_DOWNLOAD_FAILED', `Reusable images were found for "${query}", but none could be downloaded safely`, Date.now() - t0);
+    if (!selected || !bytes || !extension) {
+      const detail = [...new Set(downloadDiagnostics)].slice(0, 4).join('; ');
+      return fail('IMAGE_DOWNLOAD_FAILED', `Reusable images were found for "${query}", but none could be downloaded safely${detail ? ` (${detail})` : ''}`, Date.now() - t0);
+    }
 
     const relativePath = assetPathWithExtension(requestedPath, extension);
     const absolutePath = resolveIn(ctx.frontendDir, relativePath);
