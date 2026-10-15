@@ -8,7 +8,7 @@ import type Database from 'better-sqlite3';
 import type { LlmMessage, LlmResponse } from 'appforge-shared';
 import { openDb } from './db.js';
 import { createProject } from './projects.js';
-import { createTools, runAgentOnce, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { createTools, LlmError, runAgentOnce, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 const { model } = vi.hoisted(() => ({ model: vi.fn() }));
 vi.mock('../../worker/src/llm.js', async (original) => ({ ...await original<typeof import('../../worker/src/llm.js')>(), isStubMode: () => false, chatLlm: model }));
@@ -92,6 +92,22 @@ it('rejects a build that compiles but throws in the browser', { timeout: 90000 }
   expect(result.code).toBe('BROWSER_FAILED');
   expect(result.error).toContain('runtime regression');
   expect(ctx.browserFingerprint).toBeUndefined();
+});
+
+it('recovers from a provider timeout with compact current-state context', { timeout: 90000 }, async () => {
+  model.mockReset().mockRejectedValueOnce(new LlmError('LLM_TIMEOUT', 'provider stalled'));
+  model.mockImplementationOnce(async (_cfg, history: LlmMessage[]) => {
+    expect(history.at(-1)?.content).toContain('RECOVERY MODE');
+    return response('write_files', { files: [{ path: 'src/App.tsx', content: `${goodApp}\n// timeout recovery` }] });
+  });
+  model.mockImplementationOnce(async () => response('test_preview', { steps: [
+    { action: 'click', selector: 'button' }, { action: 'expect_text', value: 'Favoritos: 1' },
+  ] }));
+  db.prepare('INSERT INTO runs(id,project_id,prompt,status,created_at) VALUES (?,?,?,?,?)').run('timeout-recovery-run', projectId, 'Recover after timeout', 'queued', new Date().toISOString());
+  await runAgentOnce(db, 'timeout-recovery-run', { dataDir, settings });
+  const run = db.prepare('SELECT status,error FROM runs WHERE id=?').get('timeout-recovery-run') as { status: string; error: string | null };
+  expect(run.status).toBe('done');
+  expect(run.error).toBeNull();
 });
 
 it('does not accept unchanged template output as completed work', { timeout: 30000 }, async () => {

@@ -22,6 +22,7 @@ import { createTools, nowIso, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
+import { extractMissingLocalImages, patchImageReferences, repairStateKey } from './recovery.js';
 
 export interface AgentSettings {
   provider: 'groq' | 'openrouter';
@@ -278,7 +279,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     .map((m) => `${m.role}: ${m.content.slice(0, 2000)}`)
     .join('\n---\n');
 
-  const history: LlmMessage[] = [
+  let history: LlmMessage[] = [
     { role: 'system', content: systemPrompt(settings.language, TOOL_DEFS.map((d) => d.name)) },
     {
       role: 'user',
@@ -303,9 +304,10 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   // Installation/build/browser checks do not consume generation turns. A separate,
   // bounded repair phase remains available even when the last generation turn fails.
-  const repairTurns = 6;
+  const maxStagnantRepairs = 6;
   let repairing = false;
-  let repairCalls = 0;
+  let stagnantRepairs = 0;
+  let lastRepairState = '';
   let proposedSummary = '';
   const initialFingerprint = sourceFingerprint(frontendDir);
 
@@ -355,6 +357,50 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     return result;
   };
 
+  const compactRecoveryHistory = (reason: string): LlmMessage[] => [{
+    role: 'system',
+    content: systemPrompt(settings.language, TOOL_DEFS.map((d) => d.name)),
+  }, {
+    role: 'user',
+    content: [
+      'RECOVERY MODE. Continue from the current files; do not restart or rewrite working parts.',
+      `The previous model call failed transiently: ${reason}`,
+      `Original goal:\n${String(run.prompt).slice(0, 3500)}`,
+      `Current diagnostic:\n${(lastError ?? '(none)').slice(0, 8000)}`,
+      ...['src/App.tsx', 'src/index.css', 'package.json'].map((file) => {
+        try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, file.endsWith('.tsx') ? 18000 : 7000)}`; }
+        catch { return `--- ${file}: missing ---`; }
+      }),
+      'Take the smallest concrete next action with tools. After edits, rebuild and verify interactions.',
+    ].join('\n\n'),
+  }];
+
+  const repairMissingImages = async (diagnostic: string): Promise<boolean> => {
+    const issues = extractMissingLocalImages(diagnostic, project.id);
+    if (issues.length === 0) return false;
+    emit(db, runId, 'status', { phase: 'repairing_assets', count: issues.length });
+    let changed = false;
+    for (const issue of issues) {
+      if (cancelledNow() || Date.now() - startedAt >= limits.runTimeoutMs) break;
+      let publicUrl: string | null = null;
+      const requestedAsset = path.join(frontendDir, 'public', ...issue.publicRelativePath.split('/'));
+      if (fs.existsSync(requestedAsset)) {
+        publicUrl = `./${issue.publicRelativePath}`;
+      } else {
+        const acquired = await perform('acquire_image', { query: issue.query, path: issue.acquisitionPath });
+        if (acquired.ok) publicUrl = String((acquired.data as { publicUrl?: string } | undefined)?.publicUrl ?? '') || null;
+      }
+      if (!publicUrl) continue;
+      const patched = patchImageReferences(frontendDir, issue.requestPath, publicUrl);
+      if (patched.length > 0) {
+        modifiedFiles.push(...patched);
+        changed = true;
+        emit(db, runId, 'log', { text: `Recovered missing image ${issue.requestPath} -> ${publicUrl}; updated ${patched.join(', ')}` });
+      }
+    }
+    return changed;
+  };
+
   const complete = () => {
     const summary = proposedSummary || t('verifiedSummary');
     addAssistantMessage(db, project.id, summary);
@@ -367,9 +413,12 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const verify = async (): Promise<boolean> => {
     emit(db, runId, 'status', { phase: 'validating' });
-    const result = modifiedFiles.length === 0 && sourceFingerprint(frontendDir) === initialFingerprint
+    let result: ToolResult = modifiedFiles.length === 0 && sourceFingerprint(frontendDir) === initialFingerprint
       ? { ok: false, error: 'No implementation was made. Complete the requested changes first.', durationMs: 0 }
       : await perform('start_preview', {});
+    if (!result.ok && result.code === 'BROWSER_FAILED' && await repairMissingImages(result.error ?? result.output ?? '')) {
+      result = await perform('start_preview', {});
+    }
     if (!result.ok && modifiedFiles.length === 0) lastError = result.error ?? lastError;
     if (cancelledNow()) return false;
     if (result.ok && (ctx.interactiveControls ?? 0) > 0 && ctx.interactionFingerprint !== ctx.builtFingerprint) {
@@ -383,13 +432,19 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       return true;
     }
     repairing = true;
+    const state = repairStateKey(sourceFingerprint(frontendDir), [...criticalFailures.values()].join('\n') || lastError || 'unknown');
+    if (state === lastRepairState) stagnantRepairs++;
+    else {
+      lastRepairState = state;
+      stagnantRepairs = 0;
+    }
     // Include actual diagnostics, not just "exit code 2", and keep JSON intact.
-    history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. You have ${repairTurns - repairCalls} repair turns left. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
-    emit(db, runId, 'status', { phase: 'repairing', remaining: repairTurns - repairCalls });
+    history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
+    emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, progressAware: true });
     return false;
   };
 
-  for (let iter = 1; iter <= limits.maxIterations + repairTurns; iter++) {
+  for (let iter = 1; ; iter++) {
     if (cancelledNow()) {
       addAssistantMessage(db, project.id, t('cancelled'));
       updateRun(db, runId, { status: 'cancelled', finishedAt: nowIso(), stats, error: null });
@@ -404,8 +459,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
     stats.iterations = iter;
     if (repairing) {
-      if (repairCalls >= repairTurns) break;
-      repairCalls++;
+      if (stagnantRepairs >= maxStagnantRepairs) break;
     }
     emit(db, runId, 'status', { phase: repairing ? 'repairing' : 'thinking', iteration: iter });
 
@@ -422,6 +476,17 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         if (iter >= limits.maxIterations) repairing = true;
         continue;
       }
+      if (e instanceof LlmError && ['LLM_TIMEOUT', 'LLM_RATE_LIMIT', 'LLM_SERVER_ERROR', 'LLM_REQUEST_FAILED'].includes(e.code)) {
+        stats.errors++;
+        stats.llmCalls++;
+        stats.llmMs += Date.now() - llmT0;
+        lastError = e.message;
+        repairing = true;
+        history = compactRecoveryHistory(e.message);
+        emit(db, runId, 'log', { text: `${e.message}. Retrying from a compact recovery context.` });
+        emit(db, runId, 'status', { phase: 'recovering_model', code: e.code });
+        continue;
+      }
       finishError(`${t('llmFailed')}: ${(e as Error).message}`, 'LLM_ERROR');
       return;
     }
@@ -436,7 +501,10 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     if (resp.toolCalls.length === 0) {
       proposedSummary = resp.content ?? '';
       if (sourceFingerprint(frontendDir) === initialFingerprint && modifiedFiles.length === 0 && !ctx.builtFingerprint) {
-        history.push({ role: 'user', content: 'No implementation was made. Execute the requested changes with the file tools; a description alone is not a completed app.' });
+        lastError = 'No implementation was made. Execute the requested changes with the file tools; a description alone is not a completed app.';
+        criticalFailures.set('implementation', lastError);
+        history.push({ role: 'user', content: lastError });
+        if ((repairing || iter >= limits.maxIterations) && await verify()) return;
       } else if (await verify()) return;
     }
 
@@ -455,7 +523,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     // response, not only after spending the entire repair reserve on patches.
     if ((!repairing && iter >= limits.maxIterations) || (repairing && resp.toolCalls.length > 0)) {
       if (await verify()) return;
-      if (repairCalls >= repairTurns) break;
+      if (stagnantRepairs >= maxStagnantRepairs) break;
     }
   }
 
