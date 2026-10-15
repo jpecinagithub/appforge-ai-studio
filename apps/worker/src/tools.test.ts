@@ -95,6 +95,42 @@ describe('acquire_image', () => {
     }
   });
 
+  it('falls back to an allowlisted original CDN when the thumbnail proxy stays unavailable', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+        results: [{
+          title: 'Honda Africa Twin', creator: 'Example photographer', license: 'by-sa',
+          url: 'https://live.staticflickr.com/1234/honda.jpg',
+          thumbnail: 'https://api.openverse.org/v1/images/example/thumb/',
+          foreign_landing_url: 'https://www.flickr.com/photos/example/honda',
+          width: 1600, height: 900, mature: false,
+        }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      for (let attempt = 0; attempt < 3; attempt++) {
+        fetchMock.mockResolvedValueOnce(new Response('{}', { status: 406, headers: { 'content-type': 'application/json' } }));
+      }
+      fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg' },
+      }));
+
+      const pending = createTools().acquire_image(ctx, {
+        query: 'Honda Africa Twin motorcycle',
+        path: 'public/assets/honda-africa-twin',
+      });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+
+      expect(result.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      expect((result.data as { publicUrl: string }).publicUrl).toBe('./assets/honda-africa-twin.jpg');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('refuses destinations outside public', async () => {
     const result = await createTools().acquire_image(ctx, { query: 'car', path: 'src/car' });
     expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });

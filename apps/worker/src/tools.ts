@@ -293,6 +293,20 @@ function retryableImageStatus(status: number): boolean {
   return status === 406 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
 
+function trustedOriginalImageUrl(value: string | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const trusted = host === 'upload.wikimedia.org'
+      || host === 'staticflickr.com'
+      || host.endsWith('.staticflickr.com');
+    return url.protocol === 'https:' && trusted ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Finds a reusable photograph through Openverse, downloads it into public/
  * and writes a sidecar attribution receipt. Only licenses that permit
@@ -371,6 +385,35 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
           break;
         } catch (error) {
           downloadDiagnostics.push((error as Error).message.slice(0, 120));
+        }
+      }
+      if (!selected) {
+        const originalUrl = trustedOriginalImageUrl(candidate.url);
+        if (originalUrl) {
+          try {
+            // Fallback only to tightly allowlisted image CDNs. This preserves
+            // the SSRF boundary while avoiding a hard dependency on the
+            // occasionally cold Openverse thumbnail proxy.
+            const response = await fetch(originalUrl, {
+              headers: { Accept: 'image/*', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
+              redirect: 'error',
+              signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+            });
+            extension = imageExtension(response.headers.get('content-type') ?? '');
+            const announced = Number(response.headers.get('content-length') ?? 0);
+            if (response.ok && extension && announced <= MAX_IMAGE_BYTES) {
+              const downloaded = Buffer.from(await response.arrayBuffer());
+              if (downloaded.length > 0 && downloaded.length <= MAX_IMAGE_BYTES) {
+                selected = candidate;
+                bytes = downloaded;
+              }
+            } else {
+              downloadDiagnostics.push(`trusted original HTTP ${response.status}`);
+              await response.body?.cancel();
+            }
+          } catch (error) {
+            downloadDiagnostics.push(`trusted original: ${(error as Error).message.slice(0, 100)}`);
+          }
         }
       }
       if (selected) break;
