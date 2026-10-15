@@ -66,6 +66,9 @@ describe('stub agent cycle', () => {
 
     // Real production build
     expect(fs.existsSync(path.join(dataDir, 'projects', projectId, 'frontend', 'dist', 'index.html'))).toBe(true);
+  const thumbnail = fs.readFileSync(path.join(dataDir, 'projects', projectId, 'frontend', 'dist', '__appforge', 'thumbnail.webp'));
+  expect(thumbnail.length).toBeGreaterThan(1_000);
+  expect(thumbnail.subarray(0, 4).toString('ascii')).toBe('RIFF');
 
     // Preview marked ready
     const previewUrl = (db.prepare('SELECT preview_url FROM projects WHERE id=?').get(projectId) as { preview_url: string }).preview_url;

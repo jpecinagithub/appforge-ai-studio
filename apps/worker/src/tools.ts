@@ -40,6 +40,7 @@ export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => P
 
 const TRUNC_CHARS = 20_000;
 const MAX_FILE_BYTES = 1_000_000;
+const MAX_IMAGE_BYTES = 12_000_000;
 const IGNORED_DIRS = new Set(['node_modules', 'dist', '.git']);
 
 export const nowIso = () => new Date().toISOString();
@@ -254,6 +255,142 @@ async function createDirectory(ctx: ToolContext, args: Record<string, unknown>):
   }
 }
 
+type OpenverseImage = {
+  title?: string;
+  creator?: string;
+  creator_url?: string;
+  license?: string;
+  license_version?: string;
+  license_url?: string;
+  source?: string;
+  url?: string;
+  thumbnail?: string;
+  foreign_landing_url?: string;
+  width?: number;
+  height?: number;
+  mature?: boolean;
+};
+
+function imageExtension(contentType: string): string | null {
+  const mime = contentType.split(';', 1)[0]?.trim().toLowerCase();
+  if (mime === 'image/jpeg') return '.jpg';
+  if (mime === 'image/png') return '.png';
+  if (mime === 'image/webp') return '.webp';
+  return null;
+}
+
+function assetPathWithExtension(requestedPath: string, extension: string): string {
+  const current = path.extname(requestedPath).toLowerCase();
+  if (['.jpg', '.jpeg', '.png', '.webp'].includes(current)) {
+    return requestedPath.slice(0, -current.length) + extension;
+  }
+  return requestedPath + extension;
+}
+
+/**
+ * Finds a reusable photograph through Openverse, downloads it into public/
+ * and writes a sidecar attribution receipt. Only licenses that permit
+ * commercial reuse are requested; the app must still render the credit.
+ */
+async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
+  const t0 = Date.now();
+  try {
+    const query = strArg(args, 'query').trim();
+    const requestedPath = strArg(args, 'path').replaceAll('\\', '/');
+    if (query.length < 2 || query.length > 160) return fail('INVALID_QUERY', 'query must contain 2 to 160 characters', Date.now() - t0);
+    if (!requestedPath.startsWith('public/')) return fail('INVALID_PATH', 'image assets must be saved below public/', Date.now() - t0);
+
+    const endpoint = new URL('https://api.openverse.org/v1/images/');
+    endpoint.searchParams.set('q', query);
+    endpoint.searchParams.set('license', 'cc0,pdm,by,by-sa');
+    endpoint.searchParams.set('page_size', '20');
+    endpoint.searchParams.set('mature', 'false');
+    const search = await fetch(endpoint, {
+      headers: { Accept: 'application/json', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
+      signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+    });
+    if (!search.ok) return fail('IMAGE_SEARCH_FAILED', `Openverse returned HTTP ${search.status}`, Date.now() - t0);
+    const payload = (await search.json()) as { results?: OpenverseImage[] };
+    const candidates = (payload.results ?? [])
+      .filter((item) => !item.mature
+        && /^https:\/\//.test(item.url ?? '')
+        && /^https:\/\//.test(item.foreign_landing_url ?? '')
+        && /^https:\/\/api\.openverse\.org\//.test(item.thumbnail ?? ''))
+      .sort((a, b) => {
+        const aPixels = (a.width ?? 0) * (a.height ?? 0);
+        const bPixels = (b.width ?? 0) * (b.height ?? 0);
+        const aLandscape = (a.width ?? 0) >= (a.height ?? Infinity) ? 1 : 0;
+        const bLandscape = (b.width ?? 0) >= (b.height ?? Infinity) ? 1 : 0;
+        return bLandscape - aLandscape || bPixels - aPixels;
+      });
+    if (candidates.length === 0) return fail('IMAGE_NOT_FOUND', `No reusable photograph found for "${query}"`, Date.now() - t0);
+
+    let selected: OpenverseImage | undefined;
+    let bytes: Buffer | undefined;
+    let extension: string | null = null;
+    for (const candidate of candidates.slice(0, 6)) {
+      try {
+        // Download through Openverse's thumbnail proxy instead of contacting
+        // arbitrary source hosts returned by the search index (SSRF boundary).
+        const response = await fetch(candidate.thumbnail!, {
+          headers: { Accept: 'image/jpeg,image/png,image/webp', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
+          redirect: 'error',
+          signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+        });
+        extension = imageExtension(response.headers.get('content-type') ?? '');
+        const announced = Number(response.headers.get('content-length') ?? 0);
+        if (!response.ok || !extension || announced > MAX_IMAGE_BYTES) continue;
+        const downloaded = Buffer.from(await response.arrayBuffer());
+        if (downloaded.length === 0 || downloaded.length > MAX_IMAGE_BYTES) continue;
+        selected = candidate;
+        bytes = downloaded;
+        break;
+      } catch {
+        // Try the next licensed candidate when a source host is unavailable.
+      }
+    }
+    if (!selected || !bytes || !extension) return fail('IMAGE_DOWNLOAD_FAILED', `Reusable images were found for "${query}", but none could be downloaded safely`, Date.now() - t0);
+
+    const relativePath = assetPathWithExtension(requestedPath, extension);
+    const absolutePath = resolveIn(ctx.frontendDir, relativePath);
+    const receiptPath = `${absolutePath}.license.json`;
+    if (fs.existsSync(absolutePath) || fs.existsSync(receiptPath)) {
+      return fail('ASSET_EXISTS', `refusing to overwrite existing asset: ${relativePath}`, Date.now() - t0);
+    }
+    const attribution = {
+      title: selected.title ?? query,
+      creator: selected.creator ?? 'Unknown creator',
+      creatorUrl: selected.creator_url ?? null,
+      license: `${(selected.license ?? 'unknown').toUpperCase()}${selected.license_version ? ` ${selected.license_version}` : ''}`,
+      licenseUrl: selected.license_url ?? null,
+      source: selected.source ?? 'Openverse',
+      sourceUrl: selected.foreign_landing_url,
+      originalUrl: selected.url,
+      query,
+      acquiredAt: nowIso(),
+    };
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, bytes);
+    fs.writeFileSync(receiptPath, JSON.stringify(attribution, null, 2) + '\n', 'utf8');
+    return {
+      ok: true,
+      data: {
+        path: relativePath,
+        publicUrl: './' + relativePath.slice('public/'.length),
+        attribution,
+        attributionPath: relPosix(ctx.frontendDir, receiptPath),
+        width: selected.width ?? null,
+        height: selected.height ?? null,
+      },
+      durationMs: Date.now() - t0,
+    };
+  } catch (e) {
+    const name = (e as Error).name;
+    const code = name === 'TimeoutError' || name === 'AbortError' ? 'IMAGE_TIMEOUT' : ((e as { code?: string }).code ?? 'IMAGE_ACQUISITION_FAILED');
+    return fail(code, (e as Error).message, Date.now() - t0);
+  }
+}
+
 function isTextFile(abs: string): boolean {
   const textExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.json', '.css', '.html', '.md', '.txt', '.yml', '.yaml', '.toml', '.svg', '.env']);
   if (textExt.has(path.extname(abs).toLowerCase())) return true;
@@ -414,7 +551,9 @@ async function testPreview(ctx: ToolContext, args: Record<string, unknown>): Pro
   ctx.interactionFingerprint = undefined;
   ctx.browserSession ??= {};
   const startingSession = structuredClone(ctx.browserSession);
-  const result = await checkBrowser(path.join(ctx.frontendDir, 'dist'), ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000), ctx.browserSession);
+  const distDir = path.join(ctx.frontendDir, 'dist');
+  const screenshotPath = path.join(distDir, '__appforge', 'thumbnail.webp');
+  const result = await checkBrowser(distDir, ctx.projectId, steps, Math.min(ctx.cmdTimeoutMs, 45_000), ctx.browserSession, screenshotPath);
   if (result.ok && ctx.builtFingerprint === sourceFingerprint(ctx.frontendDir)) {
     ctx.interactiveControls = (result.data as { interactiveControls: number }).interactiveControls;
     ctx.browserFingerprint = ctx.builtFingerprint;
@@ -496,6 +635,7 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/.', parameters: { type: 'object', properties: { path: S('Path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/.', parameters: { type: 'object', properties: { path: S('Directory path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
+  { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified.', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.') }, required: ['query', 'path'], additionalProperties: false } },
   { name: 'search_code', description: 'Substring search across text files under frontend/ (skips node_modules, dist, .git).', parameters: { type: 'object', properties: { pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
   { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
@@ -514,6 +654,7 @@ export function createTools(): Record<string, ToolHandler> {
     patch_file: patchFile,
     delete_file: deleteFile,
     create_directory: createDirectory,
+    acquire_image: acquireImage,
     search_code: searchCode,
     install_dependencies: installDependencies,
     run_build: runBuild,

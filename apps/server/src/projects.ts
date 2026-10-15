@@ -50,6 +50,9 @@ export function rowToProject(r: Record<string, any>): Project {
     createdAt: r.created_at,
     updatedAt: r.updated_at,
     previewUrl: r.preview_url ?? null,
+    thumbnailUrl: r.preview_url
+      ? `/p/${encodeURIComponent(r.id)}/__appforge/thumbnail.webp?v=${encodeURIComponent(r.updated_at ?? '')}`
+      : null,
     productionUrl: r.production_url ?? null,
     config: r.config_json ? JSON.parse(r.config_json) : {},
   };

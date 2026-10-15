@@ -1,7 +1,7 @@
 /* oxlint-disable react/set-state-in-effect -- async resource loading owns loading/error state */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2 } from 'lucide-react';
+import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2, X } from 'lucide-react';
 import { api, downloadArchive, isDemoMode, openProjectPreview, publicAppUrlFor } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
@@ -79,6 +79,19 @@ export function Library() {
   }, [projects, search, sort, typeFilter, statusFilter, deploymentFilter, demoMode]);
 
   const deployedCount = projects?.filter((p) => !demoMode && p.previewUrl != null).length ?? 0;
+  const filtersActive = search.trim() !== ''
+    || sort !== 'newest'
+    || typeFilter !== 'all'
+    || statusFilter !== 'all'
+    || deploymentFilter !== 'all';
+
+  const clearFilters = () => {
+    setSearch('');
+    setSort('newest');
+    setTypeFilter('all');
+    setStatusFilter('all');
+    setDeploymentFilter('all');
+  };
 
   const onDownload = async (p: Project) => {
     setDownloadingId(p.id);
@@ -131,40 +144,61 @@ export function Library() {
         </div>
       )}
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <div className="relative min-w-[200px] flex-1">
+      <div className="mb-5 flex flex-col gap-2 rounded-xl border border-zinc-200 bg-white/70 p-2 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/60 xl:flex-row xl:items-center">
+        <div className="relative min-w-0 flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
           <TextInput
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={t('library.searchPh')}
-            className="pl-9"
+            className="h-10 border-transparent bg-zinc-100 pl-9 pr-9 shadow-none focus:bg-white dark:bg-zinc-950/70 dark:focus:bg-zinc-950"
           />
+          {filtersActive && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              title={t('library.clearFilters')}
+              aria-label={t('library.clearFilters')}
+              className="absolute right-1.5 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-200 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
-        <Select value={sort} onChange={(e) => setSort(e.target.value as 'newest' | 'oldest')} aria-label={t('library.sortLabel')} className="w-auto">
-          <option value="newest">{t('library.newest')}</option>
-          <option value="oldest">{t('library.oldest')}</option>
-        </Select>
-        <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} aria-label={t('library.filterType')} className="w-auto">
-          <option value="all">{t('common.all')}</option>
-          <option value="static">{t('projects.typeStatic')}</option>
-          <option value="dynamic">{t('projects.typeDynamic')}</option>
-        </Select>
-        <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label={t('library.filterStatus')} className="w-auto">
-          <option value="all">{t('common.all')}</option>
-          <option value="active">{t('projects.statusActive')}</option>
-          <option value="archived">{t('projects.statusArchived')}</option>
-        </Select>
-        <Select
-          value={deploymentFilter}
-          onChange={(e) => setDeploymentFilter(e.target.value as 'all' | 'deployed' | 'notDeployed')}
-          aria-label={t('library.filterDeployment')}
-          className="w-auto"
-        >
-          <option value="all">{t('library.allDeployments')}</option>
-          <option value="deployed">{t('library.deployed')}</option>
-          <option value="notDeployed">{t('library.notDeployed')}</option>
-        </Select>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:flex xl:shrink-0">
+          <div className="min-w-0 xl:w-40">
+            <Select value={sort} onChange={(e) => setSort(e.target.value as 'newest' | 'oldest')} aria-label={t('library.sortLabel')} className="h-10 py-1.5">
+              <option value="newest">{t('library.newest')}</option>
+              <option value="oldest">{t('library.oldest')}</option>
+            </Select>
+          </div>
+          <div className="min-w-0 xl:w-36">
+            <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} aria-label={t('library.filterType')} className="h-10 py-1.5">
+              <option value="all">{t('library.filterType')}: {t('common.all')}</option>
+              <option value="static">{t('projects.typeStatic')}</option>
+              <option value="dynamic">{t('projects.typeDynamic')}</option>
+            </Select>
+          </div>
+          <div className="min-w-0 xl:w-36">
+            <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label={t('library.filterStatus')} className="h-10 py-1.5">
+              <option value="all">{t('library.filterStatus')}: {t('common.all')}</option>
+              <option value="active">{t('projects.statusActive')}</option>
+              <option value="archived">{t('projects.statusArchived')}</option>
+            </Select>
+          </div>
+          <div className="min-w-0 xl:w-48">
+            <Select
+              value={deploymentFilter}
+              onChange={(e) => setDeploymentFilter(e.target.value as 'all' | 'deployed' | 'notDeployed')}
+              aria-label={t('library.filterDeployment')}
+              className="h-10 py-1.5"
+            >
+              <option value="all">{t('library.filterDeployment')}: {t('common.all')}</option>
+              <option value="deployed">{t('library.deployed')}</option>
+              <option value="notDeployed">{t('library.notDeployed')}</option>
+            </Select>
+          </div>
+        </div>
       </div>
 
       {!projects || projects.length === 0 ? (
@@ -182,11 +216,21 @@ export function Library() {
             const appUrl = deployed ? publicAppUrlFor(p.id) : null;
             const domain = appUrl ? new URL(appUrl).host : null;
             return (
-            <Card key={p.id} className="flex flex-col overflow-hidden">
-              <div className="flex aspect-video items-center justify-center bg-gradient-to-br from-zinc-200 via-zinc-100 to-cyan-100 dark:from-zinc-800 dark:via-zinc-900 dark:to-cyan-950">
+            <Card key={p.id} className="group flex flex-col overflow-hidden">
+              <div className="relative flex aspect-video items-center justify-center overflow-hidden bg-gradient-to-br from-zinc-200 via-zinc-100 to-cyan-100 dark:from-zinc-800 dark:via-zinc-900 dark:to-cyan-950">
                 <span className="text-5xl font-bold tracking-tight text-zinc-400/70 dark:text-zinc-600/70">
                   {initialsOf(p.name)}
                 </span>
+                {p.thumbnailUrl && (
+                  <img
+                    src={p.thumbnailUrl}
+                    alt={t('library.screenshotAlt', { name: p.name })}
+                    loading="lazy"
+                    decoding="async"
+                    className="absolute inset-0 h-full w-full object-cover object-top transition-transform duration-300 group-hover:scale-[1.015]"
+                    onError={(event) => { event.currentTarget.style.display = 'none'; }}
+                  />
+                )}
               </div>
               <div className="flex flex-1 flex-col gap-2 p-4">
                 <div className="flex items-start justify-between gap-2">

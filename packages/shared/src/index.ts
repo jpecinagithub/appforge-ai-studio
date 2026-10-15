@@ -19,6 +19,7 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   previewUrl: string | null;
+  thumbnailUrl: string | null;
   productionUrl: string | null;
   config: Record<string, unknown>;
 }

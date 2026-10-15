@@ -10,3 +10,5 @@ export type { AgentSettings, RunAgentOptions } from './agent.js';
 export { startWorker } from './jobs.js';
 export type { WorkerOptions } from './jobs.js';
 export { requestCancel, clearCancel, isCancelRequested } from './cancel.js';
+export { checkBrowser } from './browser.js';
+export type { BrowserSession, BrowserStep } from './browser.js';

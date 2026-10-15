@@ -68,10 +68,15 @@ describe('authentication boundary', () => {
       const distDir = path.join(dataDir, 'projects', projectId, 'frontend', 'dist');
       fs.mkdirSync(distDir, { recursive: true });
       fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><h1>Public app</h1>');
+      fs.mkdirSync(path.join(distDir, '__appforge'), { recursive: true });
+      fs.writeFileSync(path.join(distDir, '__appforge', 'thumbnail.webp'), Buffer.from([0x52, 0x49, 0x46, 0x46]));
 
       const preview = await secured.inject({ method: 'GET', url: `/p/${projectId}/` });
       expect(preview.statusCode).toBe(200);
       expect(preview.body).toContain('Public app');
+      const thumbnail = await secured.inject({ method: 'GET', url: `/p/${projectId}/__appforge/thumbnail.webp` });
+      expect(thumbnail.statusCode).toBe(200);
+      expect(thumbnail.headers['content-type']).toBe('image/webp');
     } finally {
       await secured.close();
     }

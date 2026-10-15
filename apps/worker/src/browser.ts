@@ -22,7 +22,14 @@ const MIME: Record<string, string> = {
 };
 
 /** Serve the actual bundle under the same nested path used in production. */
-export async function checkBrowser(distDir: string, projectId: string, steps: BrowserStep[] = [], timeoutMs = 45_000, session: BrowserSession = {}): Promise<ToolResult> {
+export async function checkBrowser(
+  distDir: string,
+  projectId: string,
+  steps: BrowserStep[] = [],
+  timeoutMs = 45_000,
+  session: BrowserSession = {},
+  screenshotPath?: string,
+): Promise<ToolResult> {
   const t0 = Date.now();
   const prefix = `/p/${projectId}/`;
   const server = http.createServer((req, res) => {
@@ -71,6 +78,14 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
     const work = async () => {
       await page.goto(url, { waitUntil: 'networkidle', timeout: Math.min(remaining, 15_000) });
       await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
+      const screenshot = screenshotPath
+        ? await page.screenshot({
+          type: 'webp',
+          quality: 78,
+          animations: 'disabled',
+          clip: { x: 0, y: 0, width: 1280, height: 720 },
+        })
+        : null;
       for (const step of steps) await browserStep(page, step);
       const text = (await page.locator('body').innerText()).slice(0, 6000);
       // Capture accessible controls as feedback for the agent's next interaction test.
@@ -79,7 +94,11 @@ export async function checkBrowser(distDir: string, projectId: string, steps: Br
       await page.setViewportSize({ width: 390, height: 844 });
       await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       if (errors.length) throw new Error([...new Set(errors)].join('\n'));
-      return { text, snapshot, interactiveControls, stepsPassed: steps.length, viewports: ['1280x800', '390x844'] };
+      if (screenshotPath && screenshot) {
+        fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
+        fs.writeFileSync(screenshotPath, screenshot);
+      }
+      return { text, snapshot, interactiveControls, stepsPassed: steps.length, viewports: ['1280x800', '390x844'], screenshot: screenshotPath ?? null };
     };
     const data = await Promise.race([
       work(),

@@ -107,7 +107,7 @@ build OK y marcar preview lista.
 ```ts
 interface Project { id:string; name:string; description:string; type:'static'|'dynamic';
   status:string; model:string|null; createdAt:string; updatedAt:string;
-  previewUrl:string|null; productionUrl:string|null; config:Record<string,unknown>; }
+  previewUrl:string|null; thumbnailUrl:string|null; productionUrl:string|null; config:Record<string,unknown>; }
 interface ChatMessage { id:string; projectId:string; role:'user'|'assistant'|'system';
   content:string; createdAt:string; tokens:number|null; }
 interface Run { id:string; projectId:string; prompt:string;

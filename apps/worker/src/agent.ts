@@ -73,9 +73,9 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '8. write_file content must ALWAYS be a string with the complete file text. For .json files, write the JSON text — never pass a JSON object/array as content.',
     `9. Your final message to the user must be a SHORT Markdown summary in ${userLang}: what was built, features, test/build results, preview status, limitations.`,
     '10. React uses the automatic JSX runtime: import only hooks you use; use import type for interfaces. Do not give a component and an imported data type the same name (CarCard vs CarData). noUnusedLocals/noUnusedParameters/verbatimModuleSyntax are enabled. Never weaken tsconfig or the build script to hide errors.',
-    '11. Only import packages declared in package.json; prefer native React, CSS and inline SVG for simple apps. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
+    '11. Only import packages declared in package.json; prefer native React and CSS for interface chrome and icons. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
     '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
-    '13. Do not invent external photo URLs or assume an image depicts the named product. Unless the user supplied verified assets, use self-contained inline SVG/CSS illustrations relevant to each sample, clearly labeled as illustrations. A car catalog must not show unrelated restaurant/office photos.',
+    '13. For content-led cards, catalogs, destinations, products, people or hero sections, use acquire_image to obtain relevant real photography instead of drawing the subject with generic SVG/CSS. Search specifically, use the returned local publicUrl, preserve the .license.json receipt, and show a discreet visible creator/source credit. Never invent external photo URLs, hotlink random search results, or imply that a representative photo depicts the exact item for sale. If acquisition fails, use a polished neutral placeholder clearly labeled as illustrative — never a childish drawing of the product.',
   ].join('\n');
 }
 
@@ -324,8 +324,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
     stats.toolCalls++;
     if (name === 'run_build' || name === 'start_preview') stats.buildMs += result.durationMs;
-    const tracked = ['write_file', 'write_files', 'patch_file', 'install_dependencies', 'run_build', 'test_preview', 'start_preview'].includes(name);
-    const fileTool = ['write_file', 'write_files', 'patch_file', 'delete_file'].includes(name);
+    const tracked = ['write_file', 'write_files', 'patch_file', 'acquire_image', 'install_dependencies', 'run_build', 'test_preview', 'start_preview'].includes(name);
+    const fileTool = ['write_file', 'write_files', 'patch_file', 'delete_file', 'acquire_image'].includes(name);
     const filePaths = name === 'write_files'
       ? ((args.files as Array<{ path?: string }> | undefined) ?? []).map((file) => file.path ?? '?')
       : [String(args.path ?? '?')];
@@ -345,6 +345,11 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       }
       if (['write_file', 'patch_file', 'delete_file'].includes(name) && typeof args.path === 'string') modifiedFiles.push(args.path);
       if (name === 'write_files') modifiedFiles.push(...((result.data as { paths?: string[] })?.paths ?? []));
+      if (name === 'acquire_image') {
+        const asset = result.data as { path?: string; attributionPath?: string } | undefined;
+        if (asset?.path) modifiedFiles.push(asset.path);
+        if (asset?.attributionPath) modifiedFiles.push(asset.attributionPath);
+      }
     }
     emit(db, runId, 'tool_result', { id, name, ok: result.ok, code: result.code, error: result.error, output: (result.output ?? '').slice(0, 12000), durationMs: result.durationMs });
     return result;

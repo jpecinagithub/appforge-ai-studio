@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -21,8 +21,51 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   db.close();
   fs.rmSync(projectDir, { recursive: true, force: true });
+});
+
+describe('acquire_image', () => {
+  it('downloads a licensed image and records its attribution', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      results: [{
+        title: '2014 Tesla Model S',
+        creator: 'Example photographer',
+        license: 'by-sa',
+        license_version: '4.0',
+        license_url: 'https://creativecommons.org/licenses/by-sa/4.0/',
+        source: 'flickr',
+        url: 'https://images.example.test/tesla.jpg',
+        thumbnail: 'https://api.openverse.org/v1/images/example/thumb/',
+        foreign_landing_url: 'https://example.test/photo/tesla',
+        width: 1600,
+        height: 900,
+        mature: false,
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    fetchMock.mockResolvedValueOnce(new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), {
+      status: 200,
+      headers: { 'content-type': 'image/jpeg' },
+    }));
+
+    const result = await createTools().acquire_image(ctx, {
+      query: 'Tesla Model S side view',
+      path: 'public/assets/cars/tesla-model-s',
+    });
+
+    expect(result.ok).toBe(true);
+    expect((result.data as { publicUrl: string }).publicUrl).toBe('./assets/cars/tesla-model-s.jpg');
+    expect(fs.readFileSync(path.join(frontendDir, 'public/assets/cars/tesla-model-s.jpg'))).toEqual(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    const receipt = JSON.parse(fs.readFileSync(path.join(frontendDir, 'public/assets/cars/tesla-model-s.jpg.license.json'), 'utf8')) as { creator: string; license: string };
+    expect(receipt).toMatchObject({ creator: 'Example photographer', license: 'BY-SA 4.0' });
+  });
+
+  it('refuses destinations outside public', async () => {
+    const result = await createTools().acquire_image(ctx, { query: 'car', path: 'src/car' });
+    expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });
+  });
 });
 
 describe('path confinement', () => {

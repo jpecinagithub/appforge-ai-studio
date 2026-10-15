@@ -27,7 +27,7 @@ import type {
 } from 'appforge-shared';
 import { openDb } from './db.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { createTools, requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { checkBrowser, createTools, requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -297,6 +297,7 @@ if(r.ok)setTimeout(()=>location.reload(),20000);}catch(e){msg.textContent='Error
 export function buildServer(opts: ServerOptions): FastifyInstance {
   const { db, dataDir, templatesDir, adminToken } = opts;
   const app = Fastify({ logger: false });
+  const thumbnailJobs = new Map<string, ReturnType<typeof checkBrowser>>();
   void app.register(cors, { origin: opts.corsOrigin ?? '*' });
 
   // --- rate limit: 120 req/min/IP on /api ---
@@ -697,6 +698,29 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     }
     db.prepare('UPDATE settings SET data_json=? WHERE id=1').run(JSON.stringify(next));
     return toPublicSettings(next);
+  });
+
+  // Existing projects created before thumbnail support are captured lazily
+  // on the first Library image request. Concurrent requests share one job.
+  app.get('/p/:projectId/__appforge/thumbnail.webp', async (req, reply) => {
+    const { projectId } = req.params as { projectId: string };
+    const project = getProject(db, projectId);
+    if (!project) { reply.code(404); return ''; }
+    const distDir = path.join(frontendDir(dataDir, projectId), 'dist');
+    const thumbnail = path.join(distDir, '__appforge', 'thumbnail.webp');
+    if (!fs.existsSync(thumbnail)) {
+      if (!fs.existsSync(path.join(distDir, 'index.html'))) { reply.code(404); return ''; }
+      let job = thumbnailJobs.get(projectId);
+      if (!job) {
+        job = checkBrowser(distDir, projectId, [], 45_000, {}, thumbnail);
+        thumbnailJobs.set(projectId, job);
+        void job.finally(() => thumbnailJobs.delete(projectId));
+      }
+      const result = await job;
+      if (!result.ok || !fs.existsSync(thumbnail)) { reply.code(404); return ''; }
+    }
+    reply.hijack();
+    sendFile(thumbnail, reply.raw);
   });
 
   // ------------------------------------------------------- static preview /p
