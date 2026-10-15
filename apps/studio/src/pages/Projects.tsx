@@ -1,7 +1,7 @@
 /* oxlint-disable react/set-state-in-effect -- debouncing and async resource loading are intentional */
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ChevronLeft, ChevronRight, Eye, Plus, Search, Trash2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Eye, Plus, Search, Trash2, X } from 'lucide-react';
 import { api } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
@@ -89,6 +89,13 @@ export function Projects() {
   };
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const filtersActive = search.trim() !== '' || typeFilter !== 'all' || statusFilter !== 'all';
+
+  const clearFilters = () => {
+    setSearch('');
+    setTypeFilter('all');
+    setStatusFilter('all');
+  };
 
   const body = () => {
     if (loading) {
@@ -195,26 +202,43 @@ export function Projects() {
         </div>
       )}
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <div className="relative min-w-[200px] flex-1">
+      <div className="mb-4 flex flex-col gap-2 rounded-xl border border-zinc-200 bg-white/70 p-2 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/60 lg:flex-row lg:items-center">
+        <div className="relative min-w-0 flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400" />
           <TextInput
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder={t('projects.searchPh')}
-            className="pl-9"
+            className="h-10 border-transparent bg-zinc-100 pl-9 pr-9 shadow-none focus:bg-white dark:bg-zinc-950/70 dark:focus:bg-zinc-950"
           />
+          {filtersActive && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              title={t('projects.clearFilters')}
+              aria-label={t('projects.clearFilters')}
+              className="absolute right-1.5 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-zinc-200 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
-        <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} aria-label={t('projects.filterType')} className="w-auto">
-          <option value="all">{t('common.all')}</option>
-          <option value="static">{t('projects.typeStatic')}</option>
-          <option value="dynamic">{t('projects.typeDynamic')}</option>
-        </Select>
-        <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label={t('projects.filterStatus')} className="w-auto">
-          <option value="all">{t('common.all')}</option>
-          <option value="active">{t('projects.statusActive')}</option>
-          <option value="archived">{t('projects.statusArchived')}</option>
-        </Select>
+        <div className="grid grid-cols-2 gap-2 lg:flex lg:shrink-0">
+          <div className="min-w-0 lg:w-40">
+            <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} aria-label={t('projects.filterType')} className="h-10 py-1.5">
+              <option value="all">{t('projects.filterType')}: {t('common.all')}</option>
+              <option value="static">{t('projects.typeStatic')}</option>
+              <option value="dynamic">{t('projects.typeDynamic')}</option>
+            </Select>
+          </div>
+          <div className="min-w-0 lg:w-40">
+            <Select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} aria-label={t('projects.filterStatus')} className="h-10 py-1.5">
+              <option value="all">{t('projects.filterStatus')}: {t('common.all')}</option>
+              <option value="active">{t('projects.statusActive')}</option>
+              <option value="archived">{t('projects.statusArchived')}</option>
+            </Select>
+          </div>
+        </div>
       </div>
 
       <Card>{body()}</Card>
