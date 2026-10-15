@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2, X } from 'lucide-react';
-import { api, downloadArchive, isDemoMode, openProjectPreview, publicAppUrlFor } from '../api/client';
+import { api, apiResourceUrl, downloadArchive, isDemoMode, openProjectPreview, publicAppUrlFor } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
 import {
@@ -223,7 +223,7 @@ export function Library() {
                 </span>
                 {p.thumbnailUrl && (
                   <img
-                    src={p.thumbnailUrl}
+                    src={apiResourceUrl(p.thumbnailUrl)}
                     alt={t('library.screenshotAlt', { name: p.name })}
                     loading="lazy"
                     decoding="async"

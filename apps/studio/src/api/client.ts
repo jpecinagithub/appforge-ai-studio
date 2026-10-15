@@ -15,6 +15,13 @@ import type {
 export const API_BASE: string =
   ((import.meta.env.VITE_API_URL as string | undefined) ?? '').replace(/\/$/, '');
 
+/** Resuelve recursos que la API devuelve con ruta relativa contra el backend configurado. */
+export function apiResourceUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  return `${API_BASE}${normalized}`;
+}
+
 const TOKEN_KEY = 'appforge_token';
 const DEMO_KEY = 'appforge_demo';
 
@@ -204,7 +211,7 @@ export const api = {
 
 /** URL pública de la preview estática de un proyecto. */
 export function previewUrlFor(projectId: string): string {
-  return `${API_BASE}/p/${encodeURIComponent(projectId)}/`;
+  return apiResourceUrl(`/p/${encodeURIComponent(projectId)}/`);
 }
 
 /** URL absoluta compartible de una app servida por Oracle. */
