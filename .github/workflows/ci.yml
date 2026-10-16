@@ -37,3 +37,31 @@ jobs:
         run: npm run verify
         env:
           APPFORGE_BROWSER_EXECUTABLE: /usr/bin/google-chrome
+
+  # Piloto dinámico (CONTRACT.md §9): la plantilla debe compilar y sus
+  # 17 pruebas deben pasar en CI, no solo en local.
+  dynamic-template:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            templates/dynamic-react-node/backend/package-lock.json
+            templates/dynamic-react-node/frontend/package-lock.json
+
+      - name: Install template dependencies (reproducible)
+        run: node scripts/install.mjs
+        working-directory: templates/dynamic-react-node
+
+      - name: Build template (frontend + backend)
+        run: npm run build
+        working-directory: templates/dynamic-react-node
+
+      - name: Run template tests
+        run: npm test
+        working-directory: templates/dynamic-react-node

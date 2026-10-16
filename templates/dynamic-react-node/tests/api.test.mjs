@@ -13,8 +13,11 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = new URL('..', import.meta.url).pathname;
+// fileURLToPath (not .pathname): on Windows, .pathname yields /C:/... and
+// join() then produces broken paths like C:\C:\Users\....
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 let base;
 let child;

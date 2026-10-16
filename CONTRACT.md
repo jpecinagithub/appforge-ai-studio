@@ -1,13 +1,15 @@
-# AppForge AI Studio — Contrato técnico (Fases 1–2)
+# AppForge AI Studio — Contrato técnico (Fases 1–4)
 
 Este documento es la única fuente de verdad para la integración entre
 `apps/studio` (frontend), `apps/server` (API) y `apps/worker` (agente).
 Si algo no está aquí, pregúntale al coordinador antes de inventarlo.
 
-> **§9 (Fase 2) es solo especificación: nada de lo descrito allí está
-> implementado.** La puerta de compatibilidad sigue rechazando
-> backend, base de datos y autenticación real hasta que el piloto
-> complete el recorrido E2E 3 veces (§9.16).
+> **§9**: la especificación de la Fase 2 se implementó en la Fase 3
+> (`templates/dynamic-react-node`) y el piloto superó el criterio de
+> §9.16 el 2026-10-16 (3 pasadas E2E en Oracle). La puerta de
+> compatibilidad admite desde entonces el stack dinámico (ver nota en
+> §9.16). Pendientes las Fases 5–7: herramientas del agente, pipeline
+> full-stack y despliegue en Oracle desde el Studio.
 
 ## 1. Puertos y variables de entorno
 
@@ -190,12 +192,13 @@ appforge/
 
 ## 9. Aplicaciones dinámicas (Fase 2 — especificación)
 
-> **Nada de esta sección está implementado.** Es el diseño cerrado contra
-> el que se programarán las Fases 3–5. La puerta de compatibilidad
-> (`apps/server/src/compatibility.ts`) sigue rechazando las capacidades
-> dinámicas (backend, base de datos, autenticación real) hasta que el
-> piloto supere el criterio de §9.16. No habilitar nada de esto en la UI
-> antes de esa validación.
+> **Estado a 2026-10-16**: la Fase 3 implementó esta sección
+> (`templates/dynamic-react-node`) y el piloto superó el criterio de
+> §9.16 (3 pasadas E2E en Oracle), por lo que la puerta de
+> compatibilidad (`apps/server/src/compatibility.ts`) ya admite las
+> capacidades dinámicas. Las Fases 5–7 (herramientas del agente,
+> pipeline y despliegue en Oracle desde el Studio) siguen pendientes;
+> no habilitar nada de eso en la UI antes de su validación.
 
 ### 9.1 Stack fijado del piloto
 
