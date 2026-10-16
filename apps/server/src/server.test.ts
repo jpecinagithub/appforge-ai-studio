@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type Database from 'better-sqlite3';
 import { openDb } from './db.js';
-import { buildServer, reconcileInterruptedRuns } from './index.js';
+import { buildServer, reconcileInterruptedBuilds, reconcileInterruptedRuns } from './index.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
@@ -50,6 +50,24 @@ describe('health', () => {
   });
 });
 
+describe('project scaffold', () => {
+  it('creates a minimal React project with plain CSS and no Tailwind dependency', async () => {
+    const project = await createProject('Plain CSS app');
+    const frontend = path.join(dataDir, 'projects', project.id, 'frontend');
+    const manifest = JSON.parse(fs.readFileSync(path.join(frontend, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const allDependencies = { ...manifest.dependencies, ...manifest.devDependencies };
+
+    expect(allDependencies).not.toHaveProperty('tailwindcss');
+    expect(allDependencies).not.toHaveProperty('@tailwindcss/vite');
+    expect(fs.readFileSync(path.join(frontend, 'vite.config.ts'), 'utf8')).not.toContain('tailwind');
+    expect(fs.readFileSync(path.join(frontend, 'src', 'index.css'), 'utf8')).not.toContain('@import "tailwindcss"');
+    expect(fs.readFileSync(path.join(dataDir, 'projects', project.id, 'PROJECT_CONTEXT.md'), 'utf8')).toContain('plain CSS');
+  });
+});
+
 describe('authentication boundary', () => {
   it('keeps the API private while generated web apps remain public', async () => {
     const secured = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR, adminToken: 'test-admin-token' });
@@ -84,6 +102,35 @@ describe('authentication boundary', () => {
 });
 
 describe('runs: single active run per project', () => {
+  it('turns an unsupported request into a zero-token compatibility response', async () => {
+    const p = await createProject('Compatibility app');
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${p.id}/runs`,
+      payload: { prompt: 'Crea el proyecto con Next.js, Tailwind y PostgreSQL', language: 'es' },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({
+      status: 'done',
+      error: null,
+      stats: { iterations: 0, llmCalls: 0, tokensIn: 0, tokensOut: 0, toolCalls: 0, errors: 0 },
+    });
+
+    const messages = await app.inject({ method: 'GET', url: `/api/projects/${p.id}/messages` });
+    expect(messages.statusCode).toBe(200);
+    expect(messages.json().items).toHaveLength(2);
+    expect(messages.json().items[0]).toMatchObject({ role: 'user' });
+    expect(messages.json().items[1]).toMatchObject({ role: 'assistant', tokens: 0 });
+    expect(messages.json().items[1].content).toContain('Tecnologías permitidas actualmente:');
+    expect(messages.json().items[1].content).toContain('- Next.js');
+    expect(messages.json().items[1].content).toContain('- Tailwind CSS');
+
+    const runs = await app.inject({ method: 'GET', url: `/api/projects/${p.id}/runs` });
+    expect(runs.json().items).toHaveLength(1);
+    expect(runs.json().items[0].status).toBe('done');
+  });
+
   it('returns 409 RUN_ACTIVE when a run is already active', async () => {
     const p = await createProject('Run conflict app');
     const r1 = await app.inject({ method: 'POST', url: `/api/projects/${p.id}/runs`, payload: { prompt: 'do something' } });
@@ -184,6 +231,28 @@ describe('restart reconciliation (Test E)', () => {
     expect(s1.error).toContain('interrupted by restart');
     const s3 = (db.prepare('SELECT status FROM runs WHERE id=?').get('rec-3') as { status: string });
     expect(s3.status).toBe('done');
+  });
+
+  it('marks pending/running builds as failed and preserves finished builds', () => {
+    const project = db.prepare('SELECT id FROM projects LIMIT 1').get() as { id: string };
+    const now = new Date().toISOString();
+    const insert = db.prepare('INSERT INTO builds(id, project_id, status, started_at, logs) VALUES (?,?,?,?,?)');
+    insert.run('build-rec-1', project.id, 'pending', now, 'queued');
+    insert.run('build-rec-2', project.id, 'running', now, 'building');
+    insert.run('build-rec-3', project.id, 'success', now, 'done');
+
+    expect(reconcileInterruptedBuilds(db)).toBe(2);
+    const interrupted = db.prepare('SELECT status, finished_at, error, logs FROM builds WHERE id=?').get('build-rec-2') as {
+      status: string;
+      finished_at: string | null;
+      error: string | null;
+      logs: string;
+    };
+    expect(interrupted.status).toBe('failed');
+    expect(interrupted.finished_at).not.toBeNull();
+    expect(interrupted.error).toContain('interrupted by server restart');
+    expect(interrupted.logs).toContain('Source files were preserved');
+    expect((db.prepare('SELECT status FROM builds WHERE id=?').get('build-rec-3') as { status: string }).status).toBe('success');
   });
 });
 

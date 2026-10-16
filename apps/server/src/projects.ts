@@ -77,7 +77,7 @@ function initialContext(name: string, description: string): string {
     '',
     `- Created: ${nowIso()}`,
     `- Description: ${description || '(none)'}`,
-    '- Stack: Vite + React + TypeScript + Tailwind CSS v4 (static template)',
+    '- Stack: Vite + React + TypeScript + plain CSS (static template)',
     '',
     '## Structure (project root)',
     'dir: frontend/   — the Vite+React app (this is what the agent edits)',

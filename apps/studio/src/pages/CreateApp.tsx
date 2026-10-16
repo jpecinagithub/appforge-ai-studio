@@ -7,7 +7,7 @@ import { Btn, Card, ErrorBox, Field, PageHeader, Select, Spinner, TextArea, Text
 import { apiErrorDetail, apiErrorHintKey, apiErrorKey } from '../utils/errors';
 
 export function CreateApp() {
-  const { t } = useT();
+  const { t, lang } = useT();
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -37,7 +37,7 @@ export function CreateApp() {
         type,
       });
       try {
-        await api.createRun(project.id, prompt.trim());
+        await api.createRun(project.id, prompt.trim(), lang);
       } catch (e) {
         if (!(e instanceof ApiError && e.code === 'RUN_ACTIVE')) throw e;
       }

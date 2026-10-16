@@ -1,1 +1,141 @@
-@import "tailwindcss";
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #f1f5f9;
+  background: #020617;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.app-shell {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, rgb(8 145 178 / 18%), transparent 34rem),
+    #020617;
+}
+
+.welcome {
+  display: flex;
+  width: min(100% - 3rem, 42rem);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 6rem 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2rem;
+  text-align: center;
+}
+
+.eyebrow {
+  padding: 0.3rem 1rem;
+  border: 1px solid rgb(6 182 212 / 30%);
+  border-radius: 999px;
+  color: #67e8f9;
+  background: rgb(6 182 212 / 10%);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0;
+  color: white;
+  font-size: clamp(2.25rem, 8vw, 3rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+}
+
+.intro {
+  max-width: 30rem;
+  margin: 0;
+  color: #94a3b8;
+  line-height: 1.7;
+}
+
+code {
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.3rem;
+  color: #67e8f9;
+  background: #1e293b;
+}
+
+.counter-card {
+  padding: 2rem;
+  border: 1px solid #1e293b;
+  border-radius: 1rem;
+  background: rgb(15 23 42 / 75%);
+}
+
+.counter-value {
+  margin: 0 0 1rem;
+  color: #22d3ee;
+  font-size: 3.75rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.button {
+  padding: 0.65rem 1.5rem;
+  border-radius: 0.5rem;
+  font-weight: 700;
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+
+.button-primary {
+  border: 1px solid #06b6d4;
+  color: #082f49;
+  background: #06b6d4;
+}
+
+.button-primary:hover {
+  background: #22d3ee;
+}
+
+.button-secondary {
+  border: 1px solid #334155;
+  color: #e2e8f0;
+  background: transparent;
+}
+
+.button-secondary:hover {
+  border-color: #64748b;
+}
+
+footer {
+  color: #475569;
+  font-size: 0.75rem;
+}
+
+@media (max-width: 480px) {
+  .welcome {
+    width: min(100% - 2rem, 42rem);
+    padding: 3rem 0;
+  }
+}

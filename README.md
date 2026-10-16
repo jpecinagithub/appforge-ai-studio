@@ -60,7 +60,7 @@ appforge/
   apps/server/              # Fastify API + coordination — other team
   apps/worker/              # agent orchestrator + tool registry — other team
   packages/shared/          # shared TS types — other team
-  templates/static-react/   # ✅ VERIFIED: Vite+React+TS+Tailwind v4 base template
+  templates/static-react/   # ✅ VERIFIED: Vite+React+TS+plain CSS base template
   templates/dynamic-react-node/ # Phase 2 placeholder (intentionally empty)
   infra/                    # Dockerfile, docker-compose.yml, Caddyfile, scripts/
   docs/ARCHITECTURE.md      # design decisions, run flow, limits, security

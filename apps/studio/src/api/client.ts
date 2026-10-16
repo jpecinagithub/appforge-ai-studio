@@ -157,8 +157,8 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  createRun: (id: string, prompt: string) =>
-    request<Run>(`/api/projects/${id}/runs`, { method: 'POST', body: JSON.stringify({ prompt }) }),
+  createRun: (id: string, prompt: string, language?: 'es' | 'en') =>
+    request<Run>(`/api/projects/${id}/runs`, { method: 'POST', body: JSON.stringify({ prompt, language }) }),
 
   listRuns: (id: string) => request<{ items: Run[] }>(`/api/projects/${id}/runs`),
 

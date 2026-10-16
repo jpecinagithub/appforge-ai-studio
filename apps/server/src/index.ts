@@ -26,6 +26,7 @@ import type {
   Settings,
 } from 'appforge-shared';
 import { openDb } from './db.js';
+import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
 import { checkBrowser, createTools, requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings, type ToolContext } from 'appforge-worker';
 
@@ -123,6 +124,15 @@ export function reconcileInterruptedRuns(db: Database.Database): number {
   return Number(r.changes);
 }
 
+/** Builds cannot survive a process restart; close stale UI state coherently. */
+export function reconcileInterruptedBuilds(db: Database.Database): number {
+  const finishedAt = nowIso();
+  const r = db
+    .prepare("UPDATE builds SET status='failed', finished_at=?, error=?, logs=COALESCE(logs,'') || ? WHERE status IN ('pending','running')")
+    .run(finishedAt, 'interrupted by server restart', '\nBuild interrupted by server restart. Source files were preserved.');
+  return Number(r.changes);
+}
+
 // ---------------------------------------------------------------------------
 // Row mappers
 // ---------------------------------------------------------------------------
@@ -194,7 +204,10 @@ const ProjectPatch = z.object({
   config: z.record(z.unknown()).optional(),
 });
 const MessageCreate = z.object({ role: z.enum(['user', 'assistant', 'system']), content: z.string().min(1).max(200_000) });
-const RunCreate = z.object({ prompt: z.string().min(1).max(20_000) });
+const RunCreate = z.object({
+  prompt: z.string().min(1).max(20_000),
+  language: z.enum(['es', 'en']).optional(),
+});
 const FileWrite = z.object({ path: z.string().min(1).max(500), content: z.string().max(5_000_000) });
 const ContentQuery = z.object({ path: z.string().min(1).max(500) });
 const RevisionCreate = z.object({ label: z.string().max(200).optional() });
@@ -438,6 +451,21 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     }
     const runId = randomUUID();
     const created = nowIso();
+    const compatibility = assessTechnologyCompatibility(body.prompt, body.language ?? ensureSettingsRow(db).language);
+    if (!compatibility.compatible) {
+      const stats: RunStats = { iterations: 0, llmCalls: 0, llmMs: 0, buildMs: 0, tokensIn: 0, tokensOut: 0, toolCalls: 0, errors: 0 };
+      db.transaction(() => {
+        db.prepare('INSERT INTO runs(id, project_id, prompt, status, created_at, started_at, finished_at, stats_json, error) VALUES (?,?,?,?,?,?,?,?,?)').run(
+          runId, id, body.prompt, 'done', created, created, created, JSON.stringify(stats), null,
+        );
+        db.prepare('INSERT INTO messages(id, project_id, role, content, created_at, tokens) VALUES (?,?,?,?,?,?)').run(randomUUID(), id, 'user', body.prompt, created, null);
+        db.prepare('INSERT INTO messages(id, project_id, role, content, created_at, tokens) VALUES (?,?,?,?,?,?)').run(randomUUID(), id, 'assistant', compatibility.message, created, 0);
+        db.prepare('UPDATE projects SET updated_at=? WHERE id=?').run(created, id);
+      })();
+      const row = db.prepare('SELECT * FROM runs WHERE id=?').get(runId) as Record<string, any>;
+      reply.code(201);
+      return rowToRun(row);
+    }
     db.prepare('INSERT INTO runs(id, project_id, prompt, status, created_at, started_at, finished_at, stats_json, error) VALUES (?,?,?,?,?,?,?,?,?)').run(
       runId, id, body.prompt, 'queued', created, null, null, null, null,
     );
@@ -815,6 +843,8 @@ async function main(): Promise<void> {
   ensureSettingsRow(db);
   const interrupted = reconcileInterruptedRuns(db);
   if (interrupted > 0) console.log(`[server] marked ${interrupted} interrupted run(s) as error`);
+  const interruptedBuilds = reconcileInterruptedBuilds(db);
+  if (interruptedBuilds > 0) console.log(`[server] marked ${interruptedBuilds} interrupted build(s) as failed`);
 
   const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db) });
   const app = buildServer({

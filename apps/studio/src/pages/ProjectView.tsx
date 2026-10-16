@@ -117,17 +117,17 @@ export function ProjectView() {
       }
       setSending(true);
       try {
-        const run = await api.createRun(id, prompt);
+        const run = await api.createRun(id, prompt, lang);
         setChatDraft('');
         await reloadMessages();
         setActiveRun(run);
         setRunStatus(id, run.status);
-        subscribe(run);
+        if (run.status === 'queued' || run.status === 'running') subscribe(run);
       } finally {
         setSending(false);
       }
     },
-    [id, activeRun, reloadMessages, subscribe, setRunStatus],
+    [id, activeRun, lang, reloadMessages, subscribe, setRunStatus],
   );
 
   const cancelRun = useCallback(async () => {

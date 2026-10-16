@@ -176,7 +176,7 @@ appforge/
   apps/server/            (Fastify; importa apps/worker y packages/shared)
   apps/worker/
   packages/shared/
-  templates/static-react/ (plantilla Vite+React+TS+Tailwind v4)
+  templates/static-react/ (plantilla Vite+React+TS+CSS convencional)
   infra/                  (docker-compose.yml, Caddyfile, scripts/, .env.example)
   docs/ARCHITECTURE.md
   README.md
