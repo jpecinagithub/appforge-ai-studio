@@ -324,8 +324,8 @@ describe('dynamic tools — fase 5A', () => {
     const rows = migrationRows(db);
     expect(rows).toHaveLength(2); // one row set per pass (apply + idempotency)
     for (const row of rows) expect(row).toMatchObject({ name: '001_init.sql', status: 'success' });
-    // temp verification DB cleaned up
-    const after = readdirSync(tmpdir()).filter((f) => f.startsWith('af-migrate-') && !before.has(f));
+    // temp verification DB cleaned up (pid-scoped: parallel test workers share tmpdir())
+    const after = readdirSync(tmpdir()).filter((f) => f.startsWith(`af-migrate-${process.pid}-`) && !before.has(f));
     expect(after).toEqual([]);
     expect(ctx.dynamicChecks?.migrations).toBeTruthy();
     db.close();
