@@ -535,6 +535,17 @@ sin intervención**:
 9. ZIP del proyecto excluye `node_modules/`, `dist/`, `.git/`, `*.db*`,
    `.env`, `backups/`, `*.log`
 
+**Puerta abierta el 2026-10-16**: el recorrido completo pasó 3 veces
+seguidas en Oracle (build ARM64 → contenedor verify con migraciones y
+`healthz` → flujo autenticado 8/8 → rollback con migración rota). La
+puerta de compatibilidad admite desde entonces el stack dinámico
+(`apps/server/src/compatibility.ts`): backend/API genéricos, SQLite y
+autenticación email + contraseña se enrutan a la plantilla fija
+`templates/dynamic-react-node`. Siguen rechazados: frameworks distintos
+de React 19, Tailwind/shadcn/Sass/CSS-in-JS, backends Python/PHP/Ruby/
+Java/.NET/Express/Nest, PostgreSQL/MySQL/MongoDB/Prisma, Supabase/
+Firebase y OAuth/login social.
+
 ### 9.17 Herramientas del agente reservadas (Fase 5, no implementar aún)
 
 Nombres y firma fijados ahora para que la Fase 5 programe contra el

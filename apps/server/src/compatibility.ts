@@ -18,6 +18,13 @@ export const SUPPORTED_TECHNOLOGIES = [
   'CSS convencional',
   'Aplicaciones web SPA estáticas y responsive',
   'APIs del navegador y localStorage',
+  // Puerta dinámica abierta el 2026-10-16: el piloto full-stack superó el
+  // criterio de §9.16 (3 pasadas E2E en Oracle). Solo la plantilla fija
+  // templates/dynamic-react-node; nada de backends o BBDD arbitrarias.
+  'Aplicaciones full-stack dinámicas (piloto)',
+  'Backend Node.js + Fastify (plantilla fija)',
+  'SQLite por proyecto (migraciones versionadas)',
+  'Autenticación email + contraseña (Argon2, cookie HttpOnly)',
 ] as const;
 
 const UNSUPPORTED_TECHNOLOGIES: TechnologyRule[] = [
@@ -31,16 +38,15 @@ const UNSUPPORTED_TECHNOLOGIES: TechnologyRule[] = [
   { label: 'Bootstrap', patterns: [/\bbootstrap\b/] },
   { label: 'Material UI / MUI / Chakra UI', patterns: [/\bmaterial\s*ui\b/, /\bmui\b/, /\bchakra(?:\s*ui)?\b/] },
   { label: 'Sass / SCSS / styled-components', patterns: [/\bsass\b/, /\bscss\b/, /\bstyled[ -]components\b/] },
-  { label: 'Backend / API de servidor', patterns: [/\bbackend\b/, /\bserver[ -]side\b/, /\bapi\s+(?:rest|de\s+servidor|server|backend)\b/] },
-  { label: 'Backend Node.js / Express / NestJS', patterns: [/\bnode(?:\s*\.\s*js|js)\b/, /\bexpress(?:js)?\b/, /\bnest(?:js)?\b/] },
+  { label: 'Backend Express / NestJS', patterns: [/\bexpress(?:js)?\b/, /\bnest(?:js)?\b/] },
   { label: 'Backend Python', patterns: [/\bpython\b/, /\bdjango\b/, /\bflask\b/, /\bfastapi\b/] },
   { label: 'Backend PHP / Laravel', patterns: [/\bphp\b/, /\blaravel\b/] },
   { label: 'Backend Ruby / Rails', patterns: [/\bruby\b/, /\bruby\s+on\s+rails\b/] },
   { label: 'Backend Java / Spring', patterns: [/\bjava\b/, /\bspring\s*boot\b/] },
   { label: 'Backend .NET / C#', patterns: [/\b\.net\b/, /\bdotnet\b/, /\bc\s*#\b/] },
-  { label: 'Base de datos', patterns: [/\bbase\s+de\s+datos\b/, /\bbbdd\b/, /\bdatabase\b/, /\bpostgres(?:ql)?\b/, /\bmysql\b/, /\bmaria\s*db\b/, /\bmongodb\b/, /\bsqlite\b/, /\bprisma\b/] },
+  { label: 'Base de datos externa', patterns: [/\bpostgres(?:ql)?\b/, /\bmysql\b/, /\bmaria\s*db\b/, /\bmongodb\b/, /\bprisma\b/] },
   { label: 'Supabase / Firebase', patterns: [/\bsupabase\b/, /\bfirebase\b/] },
-  { label: 'Autenticación real', patterns: [/\bautenticacion\b/, /\bauthentication\b/, /\buser\s+auth\b/, /\bauth\b/, /\binicio\s+de\s+sesion\b/, /\blogin\s+de\s+usuarios\b/] },
+  { label: 'OAuth / login social', patterns: [/\boauth\b/, /\boidc\b/, /\bsaml\b/, /\bsocial\s+login\b/, /\binicio\s+de\s+sesion\s+con\s+google\b/, /\blogin\s+with\s+google\b/] },
   { label: 'Aplicación móvil o de escritorio', patterns: [/\breact\s+native\b/, /\bflutter\b/, /\belectron\b/] },
 ];
 

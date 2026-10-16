@@ -12,11 +12,11 @@ describe('technology compatibility', () => {
 
   it('reports every incompatible technology without presenting a technical error', () => {
     const result = assessTechnologyCompatibility(
-      'Quiero Next.js con Tailwind, autenticación real y PostgreSQL',
+      'Quiero Next.js con Tailwind y PostgreSQL',
     );
 
     expect(result.compatible).toBe(false);
-    expect(result.incompatible).toEqual(['Next.js', 'Tailwind CSS', 'Base de datos', 'Autenticación real']);
+    expect(result.incompatible).toEqual(['Next.js', 'Tailwind CSS', 'Base de datos externa']);
     expect(result.message).toContain('Tecnologías o capacidades incompatibles detectadas:');
     expect(result.message).toContain('No se ha iniciado el agente ni ningún build');
     for (const technology of SUPPORTED_TECHNOLOGIES) expect(result.message).toContain(`- ${technology}`);
@@ -37,15 +37,23 @@ describe('technology compatibility', () => {
     expect(result.message).toContain('Technologies currently supported:');
   });
 
-  it('blocks unsupported backend capabilities even when no framework is named', () => {
+  it('accepts the dynamic pilot stack (gate opened 2026-10-16)', () => {
     const result = assessTechnologyCompatibility(
-      'Necesito un backend con API REST, autenticación y base de datos',
+      'Necesito una app de tareas con backend, API REST, autenticación con login y base de datos SQLite',
+    );
+
+    expect(result).toEqual({ compatible: true, incompatible: [], message: null });
+  });
+
+  it('still blocks backends, databases and auth outside the fixed template', () => {
+    const result = assessTechnologyCompatibility(
+      'Necesito un backend con Express, OAuth con Google y PostgreSQL',
     );
 
     expect(result.incompatible).toEqual([
-      'Backend / API de servidor',
-      'Base de datos',
-      'Autenticación real',
+      'Backend Express / NestJS',
+      'Base de datos externa',
+      'OAuth / login social',
     ]);
   });
 });
