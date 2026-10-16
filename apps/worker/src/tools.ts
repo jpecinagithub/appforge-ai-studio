@@ -44,6 +44,12 @@ export interface ToolContext {
     migrations?: string;
     apiTests?: string;
   };
+  /**
+   * Canonical completion order of the currently-valid dynamic checks
+   * (a prefix of DYNAMIC_CHECK_ORDER). The completion gate requires all
+   * four in exact canonical order.
+   */
+  dynamicChecksOrder?: Array<'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests'>;
   browserSession?: BrowserSession;
   lastBrowserSteps?: BrowserStep[];
   lastBrowserStart?: BrowserSession;

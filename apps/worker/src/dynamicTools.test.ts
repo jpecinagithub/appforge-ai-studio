@@ -22,14 +22,39 @@ import { describe, expect, test, afterEach } from 'vitest';
 import {
   createDynamicTools,
   sanitizeSecrets,
+  buildChildEnv,
   invalidateDynamicChecks,
-  dynamicChecksStatus,
+  dynamicGateStatus,
+  DYNAMIC_CHECK_ORDER,
   ensureMigrationsTable,
 } from './dynamicTools.js';
 import type { ToolContext } from './tools.js';
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitPidGone(pid: number, timeoutMs = 10000): Promise<boolean> {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (!pidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return !pidAlive(pid);
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
+/** Set the fixture mode for a subdirectory root (frontend/backend/migrations). */
+function setFixtureMode(root: string, mode: string): void {
+  writeFileSync(path.join(root, 'fake-mode.txt'), mode);
+}
+
 // ---------------------------------------------------------------------------
 
 const BUILD_SCRIPT = `
@@ -38,13 +63,26 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const out = process.env.FAKE_BUILD_OUT ?? 'index.html';
-const mode = process.env.FAKE_BUILD_MODE ?? 'ok';
+import { existsSync as __exists, readFileSync as __read } from 'node:fs';
+const mode = __exists(join(root, 'fake-mode.txt')) ? __read(join(root, 'fake-mode.txt'), 'utf8').trim() : (process.env.FAKE_BUILD_MODE ?? 'ok');
 if (mode === 'fail') {
   console.error("error TS2322: Type 'string' is not assignable to type 'number'.");
   process.exit(1);
 }
 if (mode === 'slow') {
+  // Write our pid first so tests can prove the whole process tree is dead
+  // after timeout/cancellation (no orphaned grandchildren, no locked files).
+  mkdirSync(join(root, 'dist'), { recursive: true });
+  writeFileSync(join(root, 'dist', 'slow.pid'), String(process.pid));
   await new Promise((r) => setTimeout(r, 30000));
+}
+if (mode === 'env-dump') {
+  // Proves the child environment is allowlisted: secrets must be absent.
+  for (const k of ['GROQ_API_KEY', 'OPENROUTER_API_KEY', 'APPFORGE_ADMIN_TOKEN', 'AF_TEST_SECRET']) {
+    console.log('ENVCHECK ' + k + '=' + (k in process.env ? 'VISIBLE' : 'hidden'));
+  }
+  console.log('ENVCHECK PATH=' + ('PATH' in process.env ? 'present' : 'missing'));
+  console.log('ENVCHECK DB_PATH=' + (process.env.DB_PATH || 'unset'));
 }
 if (mode === 'secrets') {
   console.log('connecting to db with password=hunter2-secret-value');
@@ -67,7 +105,9 @@ const dbPath = process.env.DB_PATH;
 if (!dbPath) { console.error('DB_PATH is required'); process.exit(1); }
 const db = new DatabaseSync(dbPath);
 db.exec('CREATE TABLE IF NOT EXISTS migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)');
-if ((process.env.FAKE_MIGRATE_MODE ?? 'ok') === 'checksum-mismatch') {
+import { existsSync as __mexists, readFileSync as __mread } from 'node:fs';
+const __mmode = __mexists(join(root, 'fake-mode.txt')) ? __mread(join(root, 'fake-mode.txt'), 'utf8').trim() : (process.env.FAKE_MIGRATE_MODE ?? 'ok');
+if (__mmode === 'checksum-mismatch') {
   console.error('MIGRATION_CHECKSUM_MISMATCH: 001_init.sql changed after being applied');
   process.exit(1);
 }
@@ -105,7 +145,11 @@ db.close();
 `;
 
 const FAKE_TESTS = `
-const mode = process.env.FAKE_TESTS_MODE ?? 'ok';
+import { existsSync as __texists, readFileSync as __tread } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const mode = __texists(join(root, 'fake-mode.txt')) ? __tread(join(root, 'fake-mode.txt'), 'utf8').trim() : (process.env.FAKE_TESTS_MODE ?? 'ok');
 if (mode === 'fail') {
   console.log('\\u2139 tests 4');
   console.log('\\u2139 pass 3');
@@ -223,6 +267,10 @@ afterEach(() => {
   delete process.env.FAKE_BUILD_MODE;
   delete process.env.FAKE_TESTS_MODE;
   delete process.env.FAKE_MIGRATE_MODE;
+  delete process.env.GROQ_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.APPFORGE_ADMIN_TOKEN;
+  delete process.env.AF_TEST_SECRET;
 });
 
 function track(dir: string): string {
@@ -349,7 +397,7 @@ describe('dynamic tools — fase 5A', () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
-    process.env.FAKE_BUILD_MODE = 'fail';
+    setFixtureMode(path.join(dir, 'frontend'), 'fail');
     const tools = createDynamicTools();
     const r = await tools.run_frontend_build(ctx, {});
     expect(r.ok).toBe(false);
@@ -367,7 +415,7 @@ describe('dynamic tools — fase 5A', () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
-    process.env.FAKE_BUILD_MODE = 'fail';
+    setFixtureMode(path.join(dir, 'backend'), 'fail');
     const tools = createDynamicTools();
     const r = await tools.run_backend_build(ctx, {});
     expect(r.ok).toBe(false);
@@ -401,7 +449,7 @@ describe('dynamic tools — fase 5A', () => {
     const ctx = makeCtx(db, dir);
     const tools = createDynamicTools();
     // the fixture emulates the template's observable checksum error
-    process.env.FAKE_MIGRATE_MODE = 'checksum-mismatch';
+    setFixtureMode(dir, 'checksum-mismatch');
     const r = await tools.run_migrations(ctx, {});
     expect(r.ok).toBe(false);
     expect(r.code).toBe('MIGRATION_CHECKSUM_MISMATCH');
@@ -417,7 +465,7 @@ describe('dynamic tools — fase 5A', () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
-    process.env.FAKE_TESTS_MODE = 'fail';
+    setFixtureMode(dir, 'fail');
     const tools = createDynamicTools();
     const r = await tools.run_api_tests(ctx, {});
     expect(r.ok).toBe(false);
@@ -431,12 +479,49 @@ describe('dynamic tools — fase 5A', () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir, { buildTimeoutMs: 2000 });
-    process.env.FAKE_BUILD_MODE = 'slow';
+    setFixtureMode(path.join(dir, 'frontend'), 'slow');
     const tools = createDynamicTools();
     const r = await tools.run_frontend_build(ctx, {});
     expect(r.ok).toBe(false);
     expect(r.code).toBe('BUILD_TIMEOUT');
     expect(runningBuilds(db)).toBe(0);
+    db.close();
+  }, 30000);
+
+  test('timeout kills the whole process tree: no orphaned grandchildren', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir, { buildTimeoutMs: 3000 });
+    setFixtureMode(path.join(dir, 'frontend'), 'slow');
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_TIMEOUT');
+    // the slow fixture wrote its (grandchild) pid before sleeping
+    const pidFile = path.join(dir, 'frontend', 'dist', 'slow.pid');
+    expect(existsSync(pidFile)).toBe(true);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    expect(Number.isFinite(pid)).toBe(true);
+    // the tree must actually be gone when the tool returns (not just signalled)
+    expect(await waitPidGone(pid)).toBe(true);
+    db.close();
+  }, 30000);
+
+  test('cancellation kills the whole process tree: no orphaned grandchildren', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const t0 = Date.now();
+    const ctx = makeCtx(db, dir, { isCancelled: () => Date.now() - t0 > 1500 });
+    setFixtureMode(path.join(dir, 'frontend'), 'slow');
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_CANCELLED');
+    expect(runningBuilds(db)).toBe(0);
+    const pidFile = path.join(dir, 'frontend', 'dist', 'slow.pid');
+    expect(existsSync(pidFile)).toBe(true);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    expect(await waitPidGone(pid)).toBe(true);
     db.close();
   }, 30000);
 
@@ -476,7 +561,7 @@ describe('dynamic tools — fase 5A', () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
-    process.env.FAKE_BUILD_MODE = 'secrets';
+    setFixtureMode(path.join(dir, 'frontend'), 'secrets');
     const tools = createDynamicTools();
     const r = await tools.run_frontend_build(ctx, {});
     expect(r.ok).toBe(true);
@@ -505,20 +590,171 @@ describe('dynamic tools — fase 5A', () => {
     realDb.close();
   });
 
-  test('changing sources invalidates the verification receipt', async () => {
+  test('changing sources invalidates the verification receipt and its followers', async () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
     const tools = createDynamicTools();
     expect((await tools.run_frontend_build(ctx, {})).ok).toBe(true);
-    expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
-    expect(dynamicChecksStatus(ctx).missing).not.toContain('frontendBuild');
-    // later source change
+    expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
+    expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
+    expect((await tools.run_api_tests(ctx, {})).ok).toBe(true);
+    expect(dynamicGateStatus(ctx).complete).toBe(true);
+    // later frontend change invalidates frontendBuild AND its followers
     writeFileSync(path.join(dir, 'frontend', 'src-marker.txt'), 'changed');
     invalidateDynamicChecks(ctx);
     expect(ctx.dynamicChecks?.frontendBuild).toBeUndefined();
-    expect(dynamicChecksStatus(ctx).missing).toContain('frontendBuild');
-    expect(dynamicChecksStatus(ctx).complete).toBe(false);
+    expect(ctx.dynamicChecks?.backendBuild).toBeUndefined();
+    expect(ctx.dynamicChecksOrder).toEqual([]);
+    const gate = dynamicGateStatus(ctx);
+    expect(gate.complete).toBe(false);
+    expect(gate.missing).toEqual(['frontendBuild', 'backendBuild', 'migrations', 'apiTests']);
+    db.close();
+  });
+
+  test('backend change keeps the earlier frontend check (prefix invariant)', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    expect((await tools.run_frontend_build(ctx, {})).ok).toBe(true);
+    expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
+    // backend change: earliest affected check is backendBuild
+    writeFileSync(path.join(dir, 'backend', 'src-marker.txt'), 'changed');
+    invalidateDynamicChecks(ctx);
+    expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
+    expect(ctx.dynamicChecks?.backendBuild).toBeUndefined();
+    expect(ctx.dynamicChecksOrder).toEqual(['frontendBuild']);
+    expect(dynamicGateStatus(ctx).missing).toEqual(['backendBuild', 'migrations', 'apiTests']);
+    db.close();
+  });
+
+  test('out-of-order execution cannot accumulate: each check clears its followers', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    // deliberately backwards: api_tests first, then migrations, backend, frontend
+    expect((await tools.run_api_tests(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual(['apiTests']);
+    expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual(['migrations']);
+    expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual(['backendBuild']);
+    expect((await tools.run_frontend_build(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual(['frontendBuild']);
+    // only the last-run check survived; the gate forces the correct order
+    const gate = dynamicGateStatus(ctx);
+    expect(gate.complete).toBe(false);
+    expect(gate.missing).toEqual(['backendBuild', 'migrations', 'apiTests']);
+    db.close();
+  });
+
+  test('in-order execution completes the gate', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    expect((await tools.run_frontend_build(ctx, {})).ok).toBe(true);
+    expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
+    expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
+    expect((await tools.run_api_tests(ctx, {})).ok).toBe(true);
+    const gate = dynamicGateStatus(ctx);
+    expect(gate.complete).toBe(true);
+    expect(gate.missing).toEqual([]);
+    expect(gate.orderValid).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual([...DYNAMIC_CHECK_ORDER]);
+    db.close();
+  });
+
+  test('migrations receipt covers backend/ and the root package.json', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    // changing backend/ (not migrations/) must stale the migrations receipt
+    writeFileSync(path.join(dir, 'backend', 'src-marker.txt'), 'changed');
+    invalidateDynamicChecks(ctx);
+    expect(ctx.dynamicChecks?.migrations).toBeUndefined();
+    db.close();
+  });
+
+  test('buildChildEnv drops secrets and keeps only allowlisted variables', () => {
+    process.env.GROQ_API_KEY = 'secret-groq';
+    process.env.OPENROUTER_API_KEY = 'secret-openrouter';
+    process.env.APPFORGE_ADMIN_TOKEN = 'secret-admin';
+    process.env.AF_TEST_SECRET = 'secret-custom';
+    const env = buildChildEnv();
+    expect(env.GROQ_API_KEY).toBeUndefined();
+    expect(env.OPENROUTER_API_KEY).toBeUndefined();
+    expect(env.APPFORGE_ADMIN_TOKEN).toBeUndefined();
+    expect(env.AF_TEST_SECRET).toBeUndefined();
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(env.HOME).toBe(process.env.HOME);
+    delete process.env.GROQ_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.APPFORGE_ADMIN_TOKEN;
+    delete process.env.AF_TEST_SECRET;
+  });
+
+  test('buildChildEnv allows explicit DB_PATH and rejects unknown extra keys', () => {
+    const env = buildChildEnv({ DB_PATH: '/tmp/x.db' });
+    expect(env.DB_PATH).toBe('/tmp/x.db');
+    expect(() => buildChildEnv({ EVIL_KEY: 'x' })).toThrow(/not allowlisted/);
+  });
+
+  test('generated code cannot see Studio secrets through the child environment', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    process.env.GROQ_API_KEY = 'secret-groq';
+    process.env.OPENROUTER_API_KEY = 'secret-openrouter';
+    process.env.APPFORGE_ADMIN_TOKEN = 'secret-admin';
+    process.env.AF_TEST_SECRET = 'secret-custom';
+    setFixtureMode(path.join(dir, 'frontend'), 'env-dump');
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(true);
+    // the fixture ran (marker lines present) and no secret was visible.
+    // NOTE: sanitizeSecrets redacts the "=hidden" values themselves
+    // (api[_-]key= pattern), so assert absence of VISIBLE instead.
+    expect(r.output).toMatch(/ENVCHECK GROQ_API_KEY=/);
+    expect(r.output).toMatch(/ENVCHECK OPENROUTER_API_KEY=/);
+    expect(r.output).toMatch(/ENVCHECK APPFORGE_ADMIN_TOKEN=/);
+    expect(r.output).toMatch(/ENVCHECK AF_TEST_SECRET=/);
+    expect(r.output).toMatch(/ENVCHECK PATH=present/);
+    expect(r.output).not.toMatch(/VISIBLE/);
+    expect(r.output).not.toContain('secret-groq');
+    expect(r.output).not.toContain('secret-openrouter');
+    expect(r.output).not.toContain('secret-admin');
+    expect(r.output).not.toContain('secret-custom');
+    delete process.env.GROQ_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.APPFORGE_ADMIN_TOKEN;
+    delete process.env.AF_TEST_SECRET;
+    db.close();
+  });
+
+  test('error fields are sanitized too, not just output', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    // force a build exception whose message carries a secret-like value
+    const evilDb = {
+      prepare: (sql: string) => {
+        if (/INSERT INTO builds/.test(sql)) throw new Error('connection failed with password=hunter2-secret');
+        return db.prepare(sql);
+      },
+      exec: (sql: string) => db.exec(sql),
+    };
+    const evilCtx = makeCtx(evilDb as unknown as Database.Database, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(evilCtx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_EXCEPTION');
+    expect(r.error).not.toContain('hunter2-secret');
+    expect(r.error).toMatch(/\[redacted\]/);
     db.close();
   });
 

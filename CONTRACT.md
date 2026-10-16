@@ -558,17 +558,26 @@ proyecto activo, sin shell y sin entrada arbitraria del modelo
 `run_migrations` y `run_api_tests`.
 `run_migrations` corre siempre contra una SQLite **temporal** de
 verificación (nunca live): ejecuta `npm run migrate` dos veces contra la
-misma base temporal (pasada de aplicación + pasada de idempotencia); el
-`target:'live'` llega en la Fase 5B.
+misma base temporal (pasada de aplicación + pasada de idempotencia).
 Cada herramienta registra estado terminal en `builds`/`migrations`
 (§9.14), emite `tool_call`/`tool_result`, sanitiza secretos de los logs
-y deja un receipt de verificación que se invalida si las fuentes cambian.
+(también en los campos `error`) y deja un receipt de verificación que se
+invalida si las fuentes cambian. Los procesos hijo reciben un entorno
+mínimo permitido (nunca `process.env` completo) y el timeout/cancelación
+termina el árbol de procesos completo antes de informar.
 
-Reservadas para la Fase 5B (no implementar aún):
-`start_fullstack_preview`, `test_authenticated_flow`
-(register→login→me→CRUD→logout→401),
-`deploy_project{target:'oracle'}`, `health_check_project`,
-`rollback_project`, `backup_project_database`.
+La finalización de una aplicación dinámica está bloqueada **en código**:
+`verify()` consulta `dynamicGateStatus()` y no permite `complete()` si
+falta alguna comprobación o si no se completaron en el orden canónico
+`run_frontend_build → run_backend_build → run_migrations → run_api_tests`;
+registrar una comprobación invalida sus seguidoras canónicas, de modo que
+una ejecución desordenada nunca puede acumular receipts. Las definiciones
+`DYNAMIC_TOOL_DEFS` solo se exponen a proyectos dinámicos.
+
+Fase 5B (alcance acotado): `start_fullstack_preview` y
+`test_authenticated_flow` (register→login→me→CRUD→logout→401) contra el
+preview efímero. El despliegue live, `health_check_project`,
+`rollback_project` y `backup_project_database` pertenecen a las Fases 6–7.
 Todas confinadas al proyecto; ninguna ejecuta shell/Docker/SQL
 arbitrario: delegan en el módulo de orquestación (§9.10).
 

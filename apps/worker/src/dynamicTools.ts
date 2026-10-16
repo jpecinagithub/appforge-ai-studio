@@ -18,8 +18,8 @@
  *   running by a process restart are reconciled to failed by the server.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -27,6 +27,92 @@ import type { ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { nowIso, type ToolContext, type ToolHandler } from './tools.js';
+
+// ---------------------------------------------------------------------------
+// Minimal allowlisted child environment.
+//
+// Generated code must never see the Studio's secrets: the child gets only
+// the variables npm/node need to run, plus an explicit per-call allowlist
+// (currently just DB_PATH). Everything else (GROQ_API_KEY,
+// OPENROUTER_API_KEY, APPFORGE_ADMIN_TOKEN, …) is dropped.
+// ---------------------------------------------------------------------------
+
+/** Environment variables npm/node need to function (cross-platform). */
+const ALLOWED_ENV_KEYS = new Set([
+  'PATH',
+  'PATHEXT',
+  'SYSTEMROOT',
+  'SYSTEMDRIVE',
+  'WINDIR',
+  'COMSPEC',
+  'OS',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'PROGRAMDATA',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'USERPROFILE',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LANGUAGE',
+  'TERM',
+  'CI',
+  'NODE_ENV',
+  'NPM_CONFIG_CACHE',
+  'NPM_CONFIG_PREFIX',
+]);
+
+/** Extra per-call variables the tools may inject (auditable, closed list). */
+const ALLOWED_EXTRA_ENV_KEYS = new Set(['DB_PATH']);
+
+export function buildChildEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const k of ALLOWED_ENV_KEYS) {
+    const v = process.env[k];
+    if (v !== undefined) env[k] = v;
+  }
+  for (const [k, v] of Object.entries(extra)) {
+    if (!ALLOWED_EXTRA_ENV_KEYS.has(k)) throw new Error(`env key not allowlisted: ${k}`);
+    env[k] = v;
+  }
+  return env;
+}
+
+// ---------------------------------------------------------------------------
+// Process tree teardown.
+//
+// child.kill() only terminates the direct child: npm spawns grandchildren
+// (sh → node) that would survive on every OS, and especially on Windows.
+// Kill the whole tree, then wait for it to actually exit.
+// ---------------------------------------------------------------------------
+
+function killTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  try {
+    if (process.platform === 'win32') {
+      // /T terminates the tree rooted at pid.
+      spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      // Negative pid = the whole process group (spawned detached below).
+      process.kill(-pid, 'SIGKILL');
+    }
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Process runner: spawn without a shell, timeout, cancellation, capped output
@@ -59,7 +145,8 @@ export async function runLive(
   opts: {
     cwd: string;
     timeoutMs: number;
-    env?: NodeJS.ProcessEnv;
+    /** Extra variables for the child (closed allowlist: DB_PATH). */
+    extraEnv?: Record<string, string>;
     isCancelled?: () => boolean;
   },
 ): Promise<ProcResult> {
@@ -81,8 +168,11 @@ export async function runLive(
     try {
       child = spawn(executable, executableArgs, {
         cwd: opts.cwd,
-        env: opts.env ?? process.env,
+        env: buildChildEnv(opts.extraEnv),
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Detached on POSIX so the timeout/cancel path can SIGKILL the whole
+        // process group (npm → sh → node). On Windows killTree uses taskkill.
+        detached: process.platform !== 'win32',
       });
     } catch (e) {
       resolve({
@@ -112,25 +202,36 @@ export async function runLive(
     child.stdout?.on('data', (d) => feed('out', d));
     child.stderr?.on('data', (d) => feed('err', d));
     let settled = false;
-    const done = (code: number, timedOut: boolean, cancelled: boolean) => {
+    // Set by terminate() before killing, so the 'close' handler below reports
+    // the right reason even though it was registered first.
+    let endTimedOut = false;
+    let endCancelled = false;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    const done = (code: number) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearInterval(cancelPoll);
+      if (grace) clearTimeout(grace);
       if (stdoutCut) stdout += `\n…[stdout truncated at ${MAX_STREAM_BYTES} bytes]`;
       if (stderrCut) stderr += `\n…[stderr truncated at ${MAX_STREAM_BYTES} bytes]`;
-      resolve({ code, stdout, stderr, durationMs: Date.now() - t0, timedOut, cancelled });
+      resolve({ code, stdout, stderr, durationMs: Date.now() - t0, timedOut: endTimedOut, cancelled: endCancelled });
     };
-    const kill = () => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
+    /**
+     * Terminate the whole process tree, then wait until it is actually gone
+     * (or a grace period elapses) before reporting. This guarantees no
+     * orphaned grandchildren and no locked SQLite files after
+     * timeout/cancellation.
+     */
+    const terminate = (timedOut: boolean, cancelled: boolean) => {
+      if (settled) return;
+      endTimedOut = timedOut;
+      endCancelled = cancelled;
+      killTree(child);
+      grace = setTimeout(() => done(1), 5000);
     };
     const timer = setTimeout(() => {
-      kill();
-      done(1, true, false);
+      terminate(true, false);
     }, Math.max(1000, opts.timeoutMs));
     const cancelPoll = setInterval(() => {
       let cancel = false;
@@ -140,15 +241,14 @@ export async function runLive(
         cancel = false;
       }
       if (cancel) {
-        kill();
-        done(1, false, true);
+        terminate(false, true);
       }
     }, CANCEL_POLL_MS);
     child.on('error', (e) => {
       stderr += `spawn error: ${(e as Error)?.message ?? String(e)}`;
-      done(1, false, false);
+      done(1);
     });
-    child.on('close', (code) => done(code ?? 1, false, false));
+    child.on('close', (code) => done(code ?? 1));
   });
 }
 
@@ -180,7 +280,7 @@ export function sanitizeSecrets(s: string): string {
 // ---------------------------------------------------------------------------
 
 function fail(code: string, error: string, durationMs = 0, output?: string): ToolResult {
-  const r: ToolResult = { ok: false, code, error, durationMs };
+  const r: ToolResult = { ok: false, code, error: sanitizeSecrets(error), durationMs };
   if (output !== undefined) r.output = output;
   return r;
 }
@@ -218,10 +318,6 @@ function dirSize(dir: string): number {
     else if (e.isFile()) total += fs.statSync(p).size;
   }
   return total;
-}
-
-function setCheck(ctx: ToolContext, key: 'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests', fingerprint: string): void {
-  ctx.dynamicChecks = { ...ctx.dynamicChecks, [key]: fingerprint };
 }
 
 // ---------------------------------------------------------------------------
@@ -377,8 +473,7 @@ async function runStackBuild(
       return fail('BUILD_SOURCE_CHANGED', 'source files changed during build; rebuild required', Date.now() - t0, clean);
     }
     const size = dirSize(path.join(cwd, path.dirname(opts.expectedOutput)));
-    const fingerprint = sourceFingerprint(cwd);
-    setCheck(ctx, opts.checkKey, fingerprint);
+    recordDynamicCheck(ctx, opts.checkKey);
     const durationMs = Date.now() - t0;
     const clean = sanitizeSecrets(trunc(output));
     finish('success', clean, { kind: opts.stack, distSize: size }, null, durationMs);
@@ -509,7 +604,7 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
         cwd: projectRoot,
         timeoutMs: ctx.buildTimeoutMs,
         isCancelled: ctx.isCancelled,
-        env: { ...process.env, DB_PATH: dbPath },
+        extraEnv: { DB_PATH: dbPath },
       });
       const durationMs = Date.now() - passT0;
       const totalMs = Date.now() - t0;
@@ -606,7 +701,7 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
         pass2.result.output,
       );
     }
-    setCheck(ctx, 'migrations', sourceFingerprint(migrationsDir));
+    recordDynamicCheck(ctx, 'migrations');
     cleanupTemp();
     const durationMs = Date.now() - t0;
     return {
@@ -679,7 +774,7 @@ async function runApiTests(ctx: ToolContext, args: Record<string, unknown>): Pro
       if (counts) res.data = counts;
       return res;
     }
-    setCheck(ctx, 'apiTests', sourceFingerprint(projectRoot));
+    recordDynamicCheck(ctx, 'apiTests');
     return { ok: true, data: counts ?? { tests: 0, pass: 0, fail: 0 }, durationMs, output };
   } catch (e) {
     const durationMs = Date.now() - t0;
@@ -690,51 +785,129 @@ async function runApiTests(ctx: ToolContext, args: Record<string, unknown>): Pro
 }
 
 // ---------------------------------------------------------------------------
-// Verification receipts: invalidate checks when sources change afterwards.
+// Verification receipts (invalidated on source change)
+//
+// The four tools leave receipts in ctx.dynamicChecks: one fingerprint per
+// check. A later source edit invalidates the earliest affected check AND
+// every check that canonically follows it — the valid checks always form a
+// PREFIX of DYNAMIC_CHECK_ORDER. Recording a check clears its canonical
+// followers, so out-of-order execution can never accumulate: the agent is
+// forced through frontend → backend → migrations → api_tests in order.
+// dynamicGateStatus() is the code-level completion gate (the agent loop
+// consults it, never just the prompt).
 // ---------------------------------------------------------------------------
 
 export type DynamicCheckKey = 'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests';
 
-function checkScopes(projectDir: string): Record<DynamicCheckKey, string> {
+/** Canonical pipeline order. The completion gate requires exactly this. */
+export const DYNAMIC_CHECK_ORDER: readonly DynamicCheckKey[] = [
+  'frontendBuild',
+  'backendBuild',
+  'migrations',
+  'apiTests',
+];
+
+/**
+ * Source scopes each receipt covers. The migrations receipt covers
+ * migrations/ + backend/ + the root package.json (whose scripts drive
+ * `npm run migrate`), so a change to any of them forces re-verification.
+ */
+function checkScopes(projectDir: string): Record<DynamicCheckKey, string[]> {
   return {
-    frontendBuild: path.join(projectDir, 'frontend'),
-    backendBuild: path.join(projectDir, 'backend'),
-    migrations: path.join(projectDir, 'migrations'),
-    apiTests: projectDir,
+    frontendBuild: [path.join(projectDir, 'frontend')],
+    backendBuild: [path.join(projectDir, 'backend')],
+    migrations: [
+      path.join(projectDir, 'migrations'),
+      path.join(projectDir, 'backend'),
+      path.join(projectDir, 'package.json'),
+    ],
+    apiTests: [projectDir],
   };
 }
 
-function currentFingerprint(dir: string): string | null {
+/** Combined fingerprint over files and/or directories (missing = distinct marker). */
+function scopeFingerprint(paths: string[]): string | null {
   try {
-    return sourceFingerprint(dir);
+    const hash = createHash('sha256');
+    for (const p of paths) {
+      let st: fs.Stats | null = null;
+      try {
+        st = fs.statSync(p);
+      } catch {
+        st = null;
+      }
+      if (st === null) hash.update(`missing:${p}`);
+      else if (st.isDirectory()) hash.update(sourceFingerprint(p));
+      else if (st.isFile()) hash.update(fs.readFileSync(p));
+      else hash.update(`other:${p}`);
+    }
+    return hash.digest('hex');
   } catch {
     return null;
   }
 }
 
 /**
- * Drop every stored receipt whose sources changed since the check ran.
- * Called by the agent loop after any file modification on a dynamic project.
+ * Record a successful check: store its fingerprint and drop the check itself
+ * plus its canonical followers from the order (they must be re-run after it).
+ */
+function recordDynamicCheck(ctx: ToolContext, key: DynamicCheckKey): void {
+  const idx = DYNAMIC_CHECK_ORDER.indexOf(key);
+  const followers = new Set(DYNAMIC_CHECK_ORDER.slice(idx + 1));
+  ctx.dynamicChecksOrder = (ctx.dynamicChecksOrder ?? []).filter((k) => k !== key && !followers.has(k));
+  ctx.dynamicChecksOrder.push(key);
+  const checks = { ...(ctx.dynamicChecks ?? {}) };
+  delete checks[key];
+  for (const f of followers) delete checks[f];
+  const fp = scopeFingerprint(checkScopes(ctx.projectDir)[key]);
+  if (fp !== null) checks[key] = fp;
+  ctx.dynamicChecks = checks;
+}
+
+/**
+ * Drop the earliest check whose sources changed (canonical order), plus all
+ * its followers. Call after any file mutation.
  */
 export function invalidateDynamicChecks(ctx: ToolContext): void {
   if (!ctx.dynamicChecks) return;
   const scopes = checkScopes(ctx.projectDir);
-  for (const [key, dir] of Object.entries(scopes) as Array<[DynamicCheckKey, string]>) {
+  let firstBad = -1;
+  for (let i = 0; i < DYNAMIC_CHECK_ORDER.length; i++) {
+    const key = DYNAMIC_CHECK_ORDER[i]!;
     const stored = ctx.dynamicChecks[key];
     if (stored === undefined) continue;
-    if (currentFingerprint(dir) !== stored) delete ctx.dynamicChecks[key];
+    if (scopeFingerprint(scopes[key]) !== stored) {
+      firstBad = i;
+      break;
+    }
   }
+  if (firstBad === -1) return;
+  const doomed = new Set(DYNAMIC_CHECK_ORDER.slice(firstBad));
+  for (const k of doomed) delete ctx.dynamicChecks[k];
+  ctx.dynamicChecksOrder = (ctx.dynamicChecksOrder ?? []).filter((k) => !doomed.has(k));
 }
 
-/** Which of the four checks are currently valid on the current sources. */
-export function dynamicChecksStatus(ctx: ToolContext): { complete: boolean; missing: DynamicCheckKey[] } {
+/**
+ * Code-level completion gate for dynamic projects. The agent loop blocks
+ * finish unless every check is valid on the CURRENT sources AND the checks
+ * were completed in canonical order. Never rely on the prompt for this.
+ */
+export function dynamicGateStatus(ctx: ToolContext): {
+  complete: boolean;
+  missing: DynamicCheckKey[];
+  orderValid: boolean;
+} {
   const scopes = checkScopes(ctx.projectDir);
   const missing: DynamicCheckKey[] = [];
-  for (const [key, dir] of Object.entries(scopes) as Array<[DynamicCheckKey, string]>) {
+  for (const key of DYNAMIC_CHECK_ORDER) {
     const stored = ctx.dynamicChecks?.[key];
-    if (stored === undefined || currentFingerprint(dir) !== stored) missing.push(key);
+    if (stored === undefined || scopeFingerprint(scopes[key]) !== stored) missing.push(key);
   }
-  return { complete: missing.length === 0, missing };
+  const order = ctx.dynamicChecksOrder ?? [];
+  const orderValid =
+    order.length === DYNAMIC_CHECK_ORDER.length &&
+    DYNAMIC_CHECK_ORDER.every((k, i) => order[i] === k);
+  return { complete: missing.length === 0 && orderValid, missing, orderValid };
 }
 
 // ---------------------------------------------------------------------------

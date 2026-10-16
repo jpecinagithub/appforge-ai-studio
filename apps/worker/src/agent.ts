@@ -21,7 +21,7 @@ import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js
 import { createTools, nowIso, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
-import { DYNAMIC_TOOL_DEFS, createDynamicTools, invalidateDynamicChecks } from './dynamicTools.js';
+import { DYNAMIC_TOOL_DEFS, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks } from './dynamicTools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
 import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairStateKey } from './recovery.js';
 
@@ -261,8 +261,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   }
 
   const tools = { ...createTools(), ...createDynamicTools() };
-  const ALL_TOOL_DEFS = [...TOOL_DEFS, ...DYNAMIC_TOOL_DEFS];
   const isDynamicProject = project?.type === 'dynamic';
+  // Dynamic tool definitions are exposed ONLY to dynamic projects.
+  const ALL_TOOL_DEFS = isDynamicProject ? [...TOOL_DEFS, ...DYNAMIC_TOOL_DEFS] : TOOL_DEFS;
   const ctx: ToolContext = {
     db,
     projectId: project.id,
@@ -442,6 +443,36 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const verify = async (): Promise<boolean> => {
     emit(db, runId, 'status', { phase: 'validating' });
+    if (isDynamicProject) {
+      // Code-level completion gate: the model cannot finish a dynamic app
+      // unless all four checks are valid on the CURRENT sources and were
+      // completed in canonical order. This never depends on the prompt.
+      const gate = dynamicGateStatus(ctx);
+      if (!gate.complete) {
+        const reasons: string[] = [];
+        if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
+        if (!gate.orderValid) reasons.push('checks were not completed in the required order');
+        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests. Do not declare the app finished until all four succeed on the current sources.`;
+        criticalFailures.set('dynamicChecks', lastError);
+        repairing = true;
+        const state = repairStateKey(sourceFingerprint(projectDir), lastError);
+        if (state === lastRepairState) stagnantRepairs++;
+        else {
+          lastRepairState = state;
+          stagnantRepairs = 0;
+          lastProgressAt = Date.now();
+        }
+        history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. ${lastError} repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled.` });
+        emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, progressAware: true });
+        return false;
+      }
+      criticalFailures.delete('dynamicChecks');
+      // The four dynamic tools ARE the verification for dynamic projects
+      // (the static preview flow does not apply: the frontend is served by
+      // the project backend, covered by run_api_tests).
+      complete();
+      return true;
+    }
     let result: ToolResult = modifiedFiles.length === 0 && sourceFingerprint(frontendDir) === initialFingerprint
       ? { ok: false, error: 'No implementation was made. Complete the requested changes first.', durationMs: 0 }
       : await perform('start_preview', {});

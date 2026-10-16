@@ -8,11 +8,13 @@ export type { ToolContext, ToolHandler } from './tools.js';
 export {
   createDynamicTools,
   DYNAMIC_TOOL_DEFS,
+  DYNAMIC_CHECK_ORDER,
   ensureMigrationsTable,
   sanitizeSecrets,
+  buildChildEnv,
   runLive,
   invalidateDynamicChecks,
-  dynamicChecksStatus,
+  dynamicGateStatus,
 } from './dynamicTools.js';
 export type { DynamicCheckKey, ProcResult } from './dynamicTools.js';
 export { runAgentOnce } from './agent.js';
