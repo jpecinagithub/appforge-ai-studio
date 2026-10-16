@@ -565,7 +565,8 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
   }
   if (files.length === 0) return fail('NO_MIGRATIONS', 'no migration files found in migrations/', Date.now() - t0);
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-migrate-'));
+  // Pid-unique prefix: test files run in parallel workers sharing tmpdir().
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `af-migrate-${process.pid}-`));
   const dbPath = path.join(tmpDir, 'verify.db');
   const cleanupTemp = () => {
     try {
