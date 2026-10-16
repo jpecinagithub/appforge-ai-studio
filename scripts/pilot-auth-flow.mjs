@@ -2,9 +2,13 @@
  * Pilot auth-flow check (contract §9.16 step 7).
  * Runs against a live app container over the app network.
  * Usage: APP_URL=http://<container>:8080 node scripts/pilot-auth-flow.mjs
+ * Emails are unique per run (Date.now) so it is re-runnable.
  * Exits 0 only if every check passes.
  */
 const BASE = process.env.APP_URL || 'http://appforge-pilot-verify:8080';
+const SUF = Date.now();
+const EMAIL1 = `oracle-${SUF}@test.local`;
+const EMAIL2 = `otro-${SUF}@test.local`;
 let cookie = '';
 
 async function req(path, { method = 'GET', body } = {}) {
@@ -35,11 +39,12 @@ function check(name, cond, detail = '') {
   if (!cond) process.exitCode = 1;
 }
 
+// 1. Register user 1.
 let r = await req('/api/auth/register', {
   method: 'POST',
-  body: { email: 'oracle@test.local', password: 'TestPassword123' },
+  body: { email: EMAIL1, password: 'TestPassword123' },
 });
-check('register 201', r.status === 201);
+check('register 201', r.status === 201, `status=${r.status}`);
 check(
   'cookie HttpOnly+Secure+SameSite=Lax',
   /httponly/i.test(r.setCookie || '') &&
@@ -49,35 +54,42 @@ check(
 );
 const userCookie = cookie;
 
+// 2. Session recovery.
 r = await req('/api/auth/me');
 check(
   'me 200 + email',
-  r.status === 200 && r.json.user.email === 'oracle@test.local',
+  r.status === 200 && r.json && r.json.user && r.json.user.email === EMAIL1,
+  `status=${r.status}`,
 );
 
+// 3. CRUD.
 r = await req('/api/todos', {
   method: 'POST',
   body: { title: 'Probar Oracle' },
 });
-check('create todo 201', r.status === 201);
-const id = r.json.id;
-
+check('create todo 201', r.status === 201, `status=${r.status}`);
+const id = r.json && r.json.id;
 r = await req('/api/todos');
-check('list 1 item', r.status === 200 && r.json.items.length === 1);
+check(
+  'list 1 item',
+  r.status === 200 && r.json && r.json.items && r.json.items.length === 1,
+  `status=${r.status}`,
+);
 
-// Second user asks for the first user's todo -> 404 (isolation).
+// 4. Isolation: user 2 asks for user 1's todo -> 404.
 cookie = '';
 r = await req('/api/auth/register', {
   method: 'POST',
-  body: { email: 'otro@test.local', password: 'TestPassword123' },
+  body: { email: EMAIL2, password: 'TestPassword123' },
 });
-r = await req('/api/todos/' + id, { method: 'GET' });
+check('register user2 201', r.status === 201, `status=${r.status}`);
+r = await req(`/api/todos/${id}`, { method: 'GET' });
 check('aislamiento: otro usuario -> 404', r.status === 404, `status=${r.status}`);
 
-// Logout of the first user's session -> revoked.
+// 5. Logout revokes user 1's session.
 cookie = userCookie;
 r = await req('/api/auth/logout', { method: 'POST' });
-check('logout 200', r.status === 200);
+check('logout 200', r.status === 200, `status=${r.status}`);
 r = await req('/api/auth/me');
 check('me tras logout -> 401', r.status === 401, `status=${r.status}`);
 
