@@ -177,7 +177,7 @@ Cancellation: a flag in the DB checked between loop iterations.
 | Capability | Phase 1 (this repo) | Phase 2 | Phase 3 |
 |---|---|---|---|
 | Static apps (Vite+React+TS) | ✅ generate → build → preview → ZIP | ✅ | ✅ |
-| Dynamic apps (Node backend + SQLite) | ❌ template is a placeholder | 📝 spec closed (CONTRACT §9); build in Phases 3–4 | ✅ |
+| Dynamic apps (Node backend + SQLite) | ✅ template implemented + verified (3 Oracle E2E passes 2026-10-16; gate open) | ✅ | ✅ |
 | LLM agent (single orchestrator) | ✅ Groq / OpenRouter | ✅ + better context/diffs | ✅ |
 | Preview | ✅ served from `dist/` at `/p/:id/` | ✅ full-stack | ✅ |
 | Revisions (git checkpoints) | ✅ | ✅ | ✅ |
@@ -203,9 +203,12 @@ $DATA_DIR/
     PROJECT_CONTEXT.md        # agent's persistent technical summary
 ```
 
-## 9. Dynamic apps — Phase 2 design rationale (spec only)
+## 9. Dynamic apps — design rationale (implemented 2026-10-16)
 
 CONTRACT.md §9 is the closed spec; this section explains the *why*.
+The template (`templates/dynamic-react-node`) was built in Fase 3 and
+verified with 3 E2E passes on Oracle; the compatibility gate admits the
+dynamic stack since 2026-10-16.
 
 ### Why the Studio proxies project containers (no nginx changes)
 

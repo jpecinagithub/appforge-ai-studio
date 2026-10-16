@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
@@ -113,7 +115,14 @@ async function main() {
   console.log(`ready port=${actualPort} env=${config.nodeEnv}`);
 }
 
-if (process.argv[1] === new URL(import.meta.url).pathname) {
+// Entrypoint detection that works on Windows too: .pathname yields /C:/...
+// there, which never equals process.argv[1]. Compare normalized paths.
+const isMainModule =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) ===
+    path.resolve(fileURLToPath(import.meta.url));
+
+if (isMainModule) {
   main().catch((err) => {
     console.error(err);
     process.exit(1);

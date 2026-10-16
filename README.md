@@ -61,7 +61,7 @@ appforge/
   apps/worker/              # agent orchestrator + tool registry — other team
   packages/shared/          # shared TS types — other team
   templates/static-react/   # ✅ VERIFIED: Vite+React+TS+plain CSS base template
-  templates/dynamic-react-node/ # Phase 2 placeholder (intentionally empty)
+  templates/dynamic-react-node/ # ✅ VERIFIED: dynamic pilot — Fastify+SQLite backend, Argon2 auth, migrations, Dockerfile (3 E2E passes on Oracle, 2026-10-16)
   infra/                    # Dockerfile, docker-compose.yml, Caddyfile, scripts/
   docs/ARCHITECTURE.md      # design decisions, run flow, limits, security
   .env.example              # all environment variables, documented
@@ -98,8 +98,9 @@ is untested until Oracle.
 - **Phase 1** — Studio UI, agent with Groq/OpenRouter, static-app
   generation, builds, previews, library, ZIP download, SQLite persistence.
 - **Phase 2** — Dynamic apps: per-project Node backend + SQLite, isolated
-  execution, full-stack preview. (`templates/dynamic-react-node` is the
-  placeholder.)
+  execution, full-stack preview. (`templates/dynamic-react-node` is
+  implemented and verified: 3 E2E passes on Oracle, 2026-10-16; the
+  compatibility gate admits the dynamic stack since then.)
 - **Phase 3** — Deployments: Vercel for frontends, Oracle containers for
   backends, deployment states and history.
 - **Phase 4** — Agent improvements: smarter context, diffs, restores,
