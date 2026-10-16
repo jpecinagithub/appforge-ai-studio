@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type Database from 'better-sqlite3';
 import { openDb } from './db.js';
-import { buildServer, reconcileInterruptedBuilds, reconcileInterruptedRuns } from './index.js';
+import { buildServer, reconcileInterruptedBuilds, reconcileInterruptedMigrations, reconcileInterruptedRuns } from './index.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
@@ -253,6 +253,27 @@ describe('restart reconciliation (Test E)', () => {
     expect(interrupted.error).toContain('interrupted by server restart');
     expect(interrupted.logs).toContain('Source files were preserved');
     expect((db.prepare('SELECT status FROM builds WHERE id=?').get('build-rec-3') as { status: string }).status).toBe('success');
+  });
+
+  it('marks pending/running migrations as failed and preserves finished ones (§9.14)', () => {
+    const now = new Date().toISOString();
+    const insert = db.prepare(
+      'INSERT INTO migrations(id, project_id, version, name, status, started_at) VALUES (?,?,?,?,?,?)',
+    );
+    insert.run('mig-rec-1', 'p-x', 1, '001_init.sql', 'pending', now);
+    insert.run('mig-rec-2', 'p-x', 2, '002_add.sql', 'running', now);
+    insert.run('mig-rec-3', 'p-x', 1, '001_init.sql', 'success', now);
+
+    expect(reconcileInterruptedMigrations(db)).toBe(2);
+    const interrupted = db.prepare('SELECT status, finished_at, error FROM migrations WHERE id=?').get('mig-rec-2') as {
+      status: string;
+      finished_at: string | null;
+      error: string | null;
+    };
+    expect(interrupted.status).toBe('failed');
+    expect(interrupted.finished_at).not.toBeNull();
+    expect(interrupted.error).toContain('interrupted by server restart');
+    expect((db.prepare('SELECT status FROM migrations WHERE id=?').get('mig-rec-3') as { status: string }).status).toBe('success');
   });
 });
 

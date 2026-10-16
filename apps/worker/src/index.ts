@@ -5,6 +5,18 @@ export { chatLlm, StubLlm, isStubMode, LlmError } from './llm.js';
 export type { LlmConfig, ToolDef } from './llm.js';
 export { createTools, TOOL_DEFS, resolveIn, runCmd, nowIso } from './tools.js';
 export type { ToolContext, ToolHandler } from './tools.js';
+export {
+  createDynamicTools,
+  DYNAMIC_TOOL_DEFS,
+  DYNAMIC_CHECK_ORDER,
+  ensureMigrationsTable,
+  sanitizeSecrets,
+  buildChildEnv,
+  runLive,
+  invalidateDynamicChecks,
+  dynamicGateStatus,
+} from './dynamicTools.js';
+export type { DynamicCheckKey, ProcResult } from './dynamicTools.js';
 export { runAgentOnce } from './agent.js';
 export type { AgentSettings, RunAgentOptions } from './agent.js';
 export { startWorker } from './jobs.js';

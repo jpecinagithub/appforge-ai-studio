@@ -133,6 +133,15 @@ export function reconcileInterruptedBuilds(db: Database.Database): number {
   return Number(r.changes);
 }
 
+/** CONTRACT.md §9.14: migrations left pending/running across a restart become coherent errors. */
+export function reconcileInterruptedMigrations(db: Database.Database): number {
+  const finishedAt = nowIso();
+  const r = db
+    .prepare("UPDATE migrations SET status='failed', finished_at=?, error=? WHERE status IN ('pending','running')")
+    .run(finishedAt, 'interrupted by server restart');
+  return Number(r.changes);
+}
+
 // ---------------------------------------------------------------------------
 // Row mappers
 // ---------------------------------------------------------------------------
@@ -845,6 +854,8 @@ async function main(): Promise<void> {
   if (interrupted > 0) console.log(`[server] marked ${interrupted} interrupted run(s) as error`);
   const interruptedBuilds = reconcileInterruptedBuilds(db);
   if (interruptedBuilds > 0) console.log(`[server] marked ${interruptedBuilds} interrupted build(s) as failed`);
+  const interruptedMigrations = reconcileInterruptedMigrations(db);
+  if (interruptedMigrations > 0) console.log(`[server] marked ${interruptedMigrations} interrupted migration(s) as failed`);
 
   const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db) });
   const app = buildServer({

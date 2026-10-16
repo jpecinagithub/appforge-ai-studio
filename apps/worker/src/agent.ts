@@ -21,6 +21,7 @@ import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js
 import { createTools, nowIso, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
+import { DYNAMIC_TOOL_DEFS, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks } from './dynamicTools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
 import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairStateKey } from './recovery.js';
 
@@ -50,8 +51,16 @@ const DEFAULT_LIMITS: AgentLimits = {
   runTimeoutMs: 900_000,
 };
 
-function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
+function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean): string {
   const userLang = lang === 'es' ? 'Spanish' : 'English';
+  const dynamicSection = isDynamic ? [
+    '',
+    'DYNAMIC PROJECT (type=dynamic): this project uses the dynamic full-stack template.',
+    '- Project root layout: frontend/ (Vite+React app), backend/ (Fastify+SQLite API), migrations/ (SQL files). File tools still work relative to frontend/; backend and migration sources are verified through the dynamic tools below.',
+    '- MANDATORY ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests. These four tools take no arguments: paths and commands are fixed and confined to the active project.',
+    '- Do NOT declare a dynamic app finished until all four succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
+    '- run_migrations always runs against a temporary verification database; it never touches a live database.',
+  ] : [];
   return [
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
     '',
@@ -78,6 +87,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[]): string {
     '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
     '13. For content-led cards, catalogs, destinations, products, people or hero sections, use acquire_image to obtain relevant real photography instead of drawing the subject with generic SVG/CSS. Search specifically, use the returned local publicUrl, preserve the .license.json receipt, and show a discreet visible creator/source credit. Never invent external photo URLs, hotlink random search results, or imply that a representative photo depicts the exact item for sale. If acquisition fails, use a polished neutral placeholder clearly labeled as illustrative — never a childish drawing of the product.',
     '14. This template uses plain CSS only. Do not install or use Tailwind, shadcn, CSS-in-JS, Sass, PostCSS plugins, UI frameworks, or utility-class libraries. Write semantic className values in React and define every class in src/index.css (or imported .css files). Prefer a small design-token block with CSS custom properties and ordinary responsive CSS.',
+    ...dynamicSection,
   ].join('\n');
 }
 
@@ -250,7 +260,10 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     };
   }
 
-  const tools = createTools();
+  const tools = { ...createTools(), ...createDynamicTools() };
+  const isDynamicProject = project?.type === 'dynamic';
+  // Dynamic tool definitions are exposed ONLY to dynamic projects.
+  const ALL_TOOL_DEFS = isDynamicProject ? [...TOOL_DEFS, ...DYNAMIC_TOOL_DEFS] : TOOL_DEFS;
   const ctx: ToolContext = {
     db,
     projectId: project.id,
@@ -281,7 +294,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     .join('\n---\n');
 
   let history: LlmMessage[] = [
-    { role: 'system', content: systemPrompt(settings.language, TOOL_DEFS.map((d) => d.name)) },
+    { role: 'system', content: systemPrompt(settings.language, ALL_TOOL_DEFS.map((d) => d.name), isDynamicProject) },
     {
       role: 'user',
       content: [
@@ -323,6 +336,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     if (remaining <= 0) return { ok: false, code: 'RUN_TIMEOUT', error: t('runTimeout'), durationMs: 0 };
     ctx.cmdTimeoutMs = Math.min(limits.cmdTimeoutMs, remaining);
     ctx.buildTimeoutMs = Math.min(600_000, remaining);
+    ctx.isCancelled = cancelledNow;
     emit(db, runId, 'tool_call', { id, name, arguments: args });
     let result: ToolResult;
     try {
@@ -359,6 +373,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         if (asset?.attributionPath) modifiedFiles.push(asset.attributionPath);
       }
       if (fileTool && sourceFingerprint(frontendDir) !== beforeFingerprint) lastProgressAt = Date.now();
+      // A later source change invalidates dynamic verification receipts;
+      // the agent must re-run the affected checks in order.
+      if (isDynamicProject && fileTool) invalidateDynamicChecks(ctx);
     }
     emit(db, runId, 'tool_result', { id, name, ok: result.ok, code: result.code, error: result.error, output: (result.output ?? '').slice(0, 12000), durationMs: result.durationMs });
     return result;
@@ -366,7 +383,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const compactRecoveryHistory = (reason: string): LlmMessage[] => [{
     role: 'system',
-    content: systemPrompt(settings.language, TOOL_DEFS.map((d) => d.name)),
+    content: systemPrompt(settings.language, ALL_TOOL_DEFS.map((d) => d.name), isDynamicProject),
   }, {
     role: 'user',
     content: [
@@ -426,6 +443,36 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const verify = async (): Promise<boolean> => {
     emit(db, runId, 'status', { phase: 'validating' });
+    if (isDynamicProject) {
+      // Code-level completion gate: the model cannot finish a dynamic app
+      // unless all four checks are valid on the CURRENT sources and were
+      // completed in canonical order. This never depends on the prompt.
+      const gate = dynamicGateStatus(ctx);
+      if (!gate.complete) {
+        const reasons: string[] = [];
+        if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
+        if (!gate.orderValid) reasons.push('checks were not completed in the required order');
+        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests. Do not declare the app finished until all four succeed on the current sources.`;
+        criticalFailures.set('dynamicChecks', lastError);
+        repairing = true;
+        const state = repairStateKey(sourceFingerprint(projectDir), lastError);
+        if (state === lastRepairState) stagnantRepairs++;
+        else {
+          lastRepairState = state;
+          stagnantRepairs = 0;
+          lastProgressAt = Date.now();
+        }
+        history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. ${lastError} repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled.` });
+        emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, progressAware: true });
+        return false;
+      }
+      criticalFailures.delete('dynamicChecks');
+      // The four dynamic tools ARE the verification for dynamic projects
+      // (the static preview flow does not apply: the frontend is served by
+      // the project backend, covered by run_api_tests).
+      complete();
+      return true;
+    }
     let result: ToolResult = modifiedFiles.length === 0 && sourceFingerprint(frontendDir) === initialFingerprint
       ? { ok: false, error: 'No implementation was made. Complete the requested changes first.', durationMs: 0 }
       : await perform('start_preview', {});
@@ -480,7 +527,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     let resp;
     const llmT0 = Date.now();
     try {
-      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs }, history, TOOL_DEFS);
+      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs }, history, ALL_TOOL_DEFS);
     } catch (e) {
       if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
         stats.errors++;

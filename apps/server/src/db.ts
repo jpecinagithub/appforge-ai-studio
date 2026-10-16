@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS builds(
   id TEXT PRIMARY KEY, project_id TEXT, status TEXT,
   started_at TEXT, finished_at TEXT, duration_ms INTEGER,
   logs TEXT, artifacts_json TEXT, error TEXT);
+CREATE TABLE IF NOT EXISTS migrations(
+  id TEXT PRIMARY KEY, project_id TEXT, version INTEGER, name TEXT,
+  status TEXT, started_at TEXT, finished_at TEXT,
+  duration_ms INTEGER, logs TEXT, error TEXT);
 CREATE TABLE IF NOT EXISTS revisions(
   id TEXT PRIMARY KEY, project_id TEXT, label TEXT,
   git_sha TEXT, created_at TEXT);
@@ -39,6 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run ON run_events(run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_builds_project ON builds(project_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_migrations_project ON migrations(project_id, started_at);
 `;
 
 export function openDb(dataDir: string): Database.Database {
