@@ -549,11 +549,22 @@ de React 19, Tailwind/shadcn/Sass/CSS-in-JS, backends Python/PHP/Ruby/
 Java/.NET/Express/Nest, PostgreSQL/MySQL/MongoDB/Prisma, Supabase/
 Firebase y OAuth/login social.
 
-### 9.17 Herramientas del agente reservadas (Fase 5, no implementar aún)
+### 9.17 Herramientas del agente (Fase 5A: locales implementadas)
 
-Nombres y firma fijados ahora para que la Fase 5 programe contra el
-contrato: `run_frontend_build`, `run_backend_build`,
-`run_migrations{target:'verify'|'live'}`, `run_api_tests`,
+Fase 5A implementa las cuatro operaciones **locales**, confinadas al
+proyecto activo, sin shell y sin entrada arbitraria del modelo
+(`apps/worker/src/dynamicTools.ts`):
+`run_frontend_build`, `run_backend_build`,
+`run_migrations` y `run_api_tests`.
+`run_migrations` corre siempre contra una SQLite **temporal** de
+verificación (nunca live): ejecuta `npm run migrate` dos veces contra la
+misma base temporal (pasada de aplicación + pasada de idempotencia); el
+`target:'live'` llega en la Fase 5B.
+Cada herramienta registra estado terminal en `builds`/`migrations`
+(§9.14), emite `tool_call`/`tool_result`, sanitiza secretos de los logs
+y deja un receipt de verificación que se invalida si las fuentes cambian.
+
+Reservadas para la Fase 5B (no implementar aún):
 `start_fullstack_preview`, `test_authenticated_flow`
 (register→login→me→CRUD→logout→401),
 `deploy_project{target:'oracle'}`, `health_check_project`,

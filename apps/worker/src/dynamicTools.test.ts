@@ -1,0 +1,537 @@
+/**
+ * Fase 5A tests: the four deterministic dynamic tools.
+ *
+ * Fixture-based (no network, no real template install): each fixture mimics
+ * the observable behaviour of templates/dynamic-react-node
+ * (fixed scripts, log lines, exit codes, real SQLite semantics via
+ * node:sqlite in the fake migrate script).
+ */
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { describe, expect, test, afterEach } from 'vitest';
+import {
+  createDynamicTools,
+  sanitizeSecrets,
+  invalidateDynamicChecks,
+  dynamicChecksStatus,
+  ensureMigrationsTable,
+} from './dynamicTools.js';
+import type { ToolContext } from './tools.js';
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+const BUILD_SCRIPT = `
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const out = process.env.FAKE_BUILD_OUT ?? 'index.html';
+const mode = process.env.FAKE_BUILD_MODE ?? 'ok';
+if (mode === 'fail') {
+  console.error("error TS2322: Type 'string' is not assignable to type 'number'.");
+  process.exit(1);
+}
+if (mode === 'slow') {
+  await new Promise((r) => setTimeout(r, 30000));
+}
+if (mode === 'secrets') {
+  console.log('connecting to db with password=hunter2-secret-value');
+  console.log('received header: cookie: af_session=abc123token456; Path=/');
+}
+mkdirSync(join(root, 'dist'), { recursive: true });
+writeFileSync(join(root, 'dist', out), '<html></html>');
+console.log('build ok');
+`;
+
+const FAKE_MIGRATE = `
+import { createHash } from 'node:crypto';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const dir = join(root, 'migrations');
+const dbPath = process.env.DB_PATH;
+if (!dbPath) { console.error('DB_PATH is required'); process.exit(1); }
+const db = new DatabaseSync(dbPath);
+db.exec('CREATE TABLE IF NOT EXISTS migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL)');
+if ((process.env.FAKE_MIGRATE_MODE ?? 'ok') === 'checksum-mismatch') {
+  console.error('MIGRATION_CHECKSUM_MISMATCH: 001_init.sql changed after being applied');
+  process.exit(1);
+}
+const files = readdirSync(dir).filter((f) => /^\\d+_.+\\.sql$/.test(f)).sort();
+let fresh = 0;
+for (const file of files) {
+  const version = parseInt(file.split('_')[0], 10);
+  const sql = readFileSync(join(dir, file), 'utf8');
+  const checksum = createHash('sha256').update(sql).digest('hex');
+  const row = db.prepare('SELECT checksum FROM migrations WHERE version = ?').get(version);
+  if (row) {
+    if (row.checksum !== checksum) {
+      console.error('MIGRATION_CHECKSUM_MISMATCH: ' + file + ' changed after being applied');
+      process.exit(1);
+    }
+    console.log('already applied: ' + file);
+    continue;
+  }
+  console.log('applying migration ' + file);
+  db.exec('BEGIN;');
+  try {
+    db.exec(sql);
+    db.prepare('INSERT INTO migrations(version, name, checksum, applied_at) VALUES(?, ?, ?, ?)').run(version, file, checksum, new Date().toISOString());
+    db.exec('COMMIT;');
+  } catch (err) {
+    try { db.exec('ROLLBACK;'); } catch {}
+    console.error('migration ' + file + ' failed: ' + err.message);
+    process.exit(1);
+  }
+  console.log('applied: ' + file);
+  fresh++;
+}
+console.log('done: ' + fresh + ' new migration(s)');
+db.close();
+`;
+
+const FAKE_TESTS = `
+const mode = process.env.FAKE_TESTS_MODE ?? 'ok';
+if (mode === 'fail') {
+  console.log('\\u2139 tests 4');
+  console.log('\\u2139 pass 3');
+  console.log('\\u2139 fail 1');
+  console.log('\\u2716 auth > login rejects wrong password');
+  process.exit(1);
+}
+console.log('\\u2139 tests 4');
+console.log('\\u2139 pass 4');
+console.log('\\u2139 fail 0');
+`;
+
+function lockfile(name: string): string {
+  return JSON.stringify({
+    name,
+    version: '0.1.0',
+    lockfileVersion: 3,
+    requires: true,
+    packages: { '': { name, version: '0.1.0' } },
+  });
+}
+
+/** Minimal dynamic project fixture. Options tweak one failure mode at a time. */
+function makeProject(opts: { withPackageJson?: boolean; withLockfile?: boolean; withTests?: boolean } = {}): string {
+  const { withPackageJson = true, withLockfile = true, withTests = true } = opts;
+  const dir = mkdtempSync(path.join(tmpdir(), 'af-dyn-test-'));
+  const frontend = path.join(dir, 'frontend');
+  const backend = path.join(dir, 'backend');
+  mkdirSync(path.join(frontend, 'scripts'), { recursive: true });
+  mkdirSync(path.join(backend, 'scripts'), { recursive: true });
+  mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+  mkdirSync(path.join(dir, 'migrations'), { recursive: true });
+  if (withTests) mkdirSync(path.join(dir, 'tests'), { recursive: true });
+
+  if (withPackageJson) {
+    writeFileSync(
+      path.join(frontend, 'package.json'),
+      JSON.stringify({ name: 'fx-frontend', version: '0.1.0', private: true, scripts: { build: 'node scripts/build.mjs' } }),
+    );
+    writeFileSync(
+      path.join(backend, 'package.json'),
+      JSON.stringify({ name: 'fx-backend', version: '0.1.0', private: true, scripts: { build: 'node scripts/build.mjs' } }),
+    );
+    writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({
+        name: 'fx-dynamic',
+        version: '0.1.0',
+        private: true,
+        scripts: { migrate: 'node scripts/fake-migrate.mjs', test: 'node scripts/fake-tests.mjs' },
+      }),
+    );
+  }
+  if (withLockfile) {
+    writeFileSync(path.join(frontend, 'package-lock.json'), lockfile('fx-frontend'));
+    writeFileSync(path.join(backend, 'package-lock.json'), lockfile('fx-backend'));
+  }
+  writeFileSync(path.join(frontend, 'scripts', 'build.mjs'), BUILD_SCRIPT);
+  writeFileSync(
+    path.join(backend, 'scripts', 'build.mjs'),
+    'process.env.FAKE_BUILD_OUT = \'server.js\';\n' + BUILD_SCRIPT,
+  );
+  writeFileSync(path.join(dir, 'scripts', 'fake-migrate.mjs'), FAKE_MIGRATE);
+  writeFileSync(path.join(dir, 'scripts', 'fake-tests.mjs'), FAKE_TESTS);
+  writeFileSync(path.join(dir, 'migrations', '001_init.sql'), 'CREATE TABLE notes(id TEXT PRIMARY KEY, body TEXT);');
+  return dir;
+}
+
+function makeStudioDb(): Database.Database {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE projects(id TEXT PRIMARY KEY, type TEXT);
+    CREATE TABLE builds(id TEXT PRIMARY KEY, project_id TEXT, status TEXT,
+      started_at TEXT, finished_at TEXT, duration_ms INTEGER,
+      logs TEXT, artifacts_json TEXT, error TEXT);`);
+  ensureMigrationsTable(db);
+  return db;
+}
+
+function makeCtx(
+  db: Database.Database,
+  projectDir: string,
+  opts: { type?: string; projectId?: string; buildTimeoutMs?: number; isCancelled?: () => boolean } = {},
+): ToolContext {
+  const projectId = opts.projectId ?? 'p1';
+  db.prepare('INSERT OR REPLACE INTO projects(id, type) VALUES (?,?)').run(projectId, opts.type ?? 'dynamic');
+  return {
+    db,
+    projectId,
+    projectDir,
+    frontendDir: path.join(projectDir, 'frontend'),
+    cmdTimeoutMs: 30000,
+    buildTimeoutMs: opts.buildTimeoutMs ?? 120000,
+    isCancelled: opts.isCancelled,
+  };
+}
+
+function migrationRows(db: Database.Database): Array<Record<string, unknown>> {
+  return db.prepare('SELECT name, status, error FROM migrations ORDER BY name').all() as Array<Record<string, unknown>>;
+}
+
+function runningBuilds(db: Database.Database): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM builds WHERE status IN ('pending','running')").get() as { n: number }).n;
+}
+
+const tmpDirs: string[] = [];
+afterEach(() => {
+  for (const d of tmpDirs.splice(0)) {
+    try {
+      rmSync(d, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  delete process.env.FAKE_BUILD_MODE;
+  delete process.env.FAKE_TESTS_MODE;
+  delete process.env.FAKE_MIGRATE_MODE;
+});
+
+function track(dir: string): string {
+  tmpDirs.push(dir);
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('dynamic tools — fase 5A', () => {
+  test('run_frontend_build succeeds on a dynamic project', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(true);
+    expect(r.code).toBeUndefined();
+    expect(existsSync(path.join(dir, 'frontend', 'dist', 'index.html'))).toBe(true);
+    expect((r.data as { distSize: number }).distSize).toBeGreaterThan(0);
+    const row = db.prepare('SELECT status FROM builds').get() as { status: string };
+    expect(row.status).toBe('success');
+    expect(runningBuilds(db)).toBe(0);
+    expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
+    db.close();
+  });
+
+  test('run_backend_build succeeds on a dynamic project', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_backend_build(ctx, {});
+    expect(r.ok).toBe(true);
+    expect(existsSync(path.join(dir, 'backend', 'dist', 'server.js'))).toBe(true);
+    expect(ctx.dynamicChecks?.backendBuild).toBeTruthy();
+    db.close();
+  });
+
+  test('run_migrations applies to a temp DB and records per-file rows', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const before = new Set(readdirSync(tmpdir()));
+    const r = await tools.run_migrations(ctx, {});
+    expect(r.ok).toBe(true);
+    expect((r.data as { files: string[] }).files).toEqual(['001_init.sql']);
+    const rows = migrationRows(db);
+    expect(rows).toHaveLength(2); // one row set per pass (apply + idempotency)
+    for (const row of rows) expect(row).toMatchObject({ name: '001_init.sql', status: 'success' });
+    // temp verification DB cleaned up
+    const after = readdirSync(tmpdir()).filter((f) => f.startsWith('af-migrate-') && !before.has(f));
+    expect(after).toEqual([]);
+    expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    db.close();
+  });
+
+  test('run_migrations applies on empty DB and verifies idempotency on a second pass', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_migrations(ctx, {});
+    expect(r.ok).toBe(true);
+    expect((r.data as { files: string[] }).files).toEqual(['001_init.sql']);
+    expect((r.data as { idempotent: boolean }).idempotent).toBe(true);
+    // second pass ran against the same temp DB: already applied, nothing new
+    expect(r.output).toMatch(/already applied: 001_init\.sql/);
+    const rows = migrationRows(db);
+    expect(rows).toHaveLength(2); // one row set per pass
+    for (const row of rows) expect(row.status).toBe('success');
+    db.close();
+  });
+
+  test('run_api_tests returns pass/fail counts', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_api_tests(ctx, {});
+    expect(r.ok).toBe(true);
+    expect(r.data).toEqual({ tests: 4, pass: 4, fail: 0 });
+    expect(ctx.dynamicChecks?.apiTests).toBeTruthy();
+    db.close();
+  });
+
+  test('static projects are rejected with NOT_DYNAMIC_PROJECT', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir, { type: 'static' });
+    const tools = createDynamicTools();
+    for (const name of ['run_frontend_build', 'run_backend_build', 'run_migrations', 'run_api_tests'] as const) {
+      const r = await tools[name](ctx, {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('NOT_DYNAMIC_PROJECT');
+    }
+    db.close();
+  });
+
+  test('missing package.json / lockfile are structured errors', async () => {
+    const tools = createDynamicTools();
+    {
+      const dir = track(makeProject({ withPackageJson: false }));
+      const db = makeStudioDb();
+      const r = await tools.run_frontend_build(makeCtx(db, dir), {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('MISSING_PACKAGE_JSON');
+      db.close();
+    }
+    {
+      const dir = track(makeProject({ withLockfile: false }));
+      const db = makeStudioDb();
+      const r = await tools.run_backend_build(makeCtx(db, dir), {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('MISSING_LOCKFILE');
+      db.close();
+    }
+  });
+
+  test('broken frontend build keeps sources and reports diagnostics', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    process.env.FAKE_BUILD_MODE = 'fail';
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('FRONTEND_BUILD_FAILED');
+    expect(r.output).toMatch(/TS2322/);
+    // sources preserved
+    expect(existsSync(path.join(dir, 'frontend', 'package.json'))).toBe(true);
+    const row = db.prepare('SELECT status FROM builds').get() as { status: string };
+    expect(row.status).toBe('failed');
+    expect(runningBuilds(db)).toBe(0);
+    db.close();
+  });
+
+  test('broken backend build reports BACKEND_BUILD_FAILED', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    process.env.FAKE_BUILD_MODE = 'fail';
+    const tools = createDynamicTools();
+    const r = await tools.run_backend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BACKEND_BUILD_FAILED');
+    db.close();
+  });
+
+  test('broken migration rolls back and records per-file terminal states', async () => {
+    const dir = track(makeProject());
+    writeFileSync(path.join(dir, 'migrations', '002_broken.sql'), 'CREATE TABLE oops oops oops;');
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_migrations(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('MIGRATIONS_FAILED');
+    expect(r.error).toMatch(/002_broken\.sql/);
+    const rows = migrationRows(db);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ name: '001_init.sql', status: 'success' });
+    expect(rows[1]).toMatchObject({ name: '002_broken.sql', status: 'failed' });
+    // no dangling non-terminal rows
+    const open = db.prepare("SELECT COUNT(*) AS n FROM migrations WHERE status IN ('pending','running')").get() as { n: number };
+    expect(open.n).toBe(0);
+    db.close();
+  });
+
+  test('modified migration checksum is a hard MIGRATION_CHECKSUM_MISMATCH', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    // the fixture emulates the template's observable checksum error
+    process.env.FAKE_MIGRATE_MODE = 'checksum-mismatch';
+    const r = await tools.run_migrations(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('MIGRATION_CHECKSUM_MISMATCH');
+    expect(r.error).toMatch(/001_init\.sql/);
+    const rows = migrationRows(db);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ name: '001_init.sql', status: 'failed' });
+    expect(String(rows[0]!.error)).toMatch(/MIGRATION_CHECKSUM_MISMATCH/);
+    db.close();
+  });
+
+  test('failing API tests return counts and diagnostics', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    process.env.FAKE_TESTS_MODE = 'fail';
+    const tools = createDynamicTools();
+    const r = await tools.run_api_tests(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('API_TESTS_FAILED');
+    expect(r.data).toEqual({ tests: 4, pass: 3, fail: 1 });
+    expect(r.output).toMatch(/login rejects wrong password/);
+    db.close();
+  });
+
+  test('build timeout produces BUILD_TIMEOUT with terminal state', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir, { buildTimeoutMs: 2000 });
+    process.env.FAKE_BUILD_MODE = 'slow';
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_TIMEOUT');
+    expect(runningBuilds(db)).toBe(0);
+    db.close();
+  }, 30000);
+
+  test('cancellation produces BUILD_CANCELLED', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir, { isCancelled: () => true });
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_CANCELLED');
+    expect(runningBuilds(db)).toBe(0);
+    db.close();
+  });
+
+  test('LLM-provided paths/commands are ignored (confinement)', async () => {
+    const dir = track(makeProject());
+    const sentinel = path.join(tmpdir(), `af-dyn-sentinel-${Date.now()}.txt`);
+    writeFileSync(sentinel, 'untouched');
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {
+      cwd: '/tmp/evil',
+      path: '../../../etc',
+      cmd: 'rm',
+      args: ['-rf', '/'],
+    } as unknown as Record<string, unknown>);
+    expect(r.ok).toBe(true); // args ignored, fixed pipeline ran
+    expect(existsSync(path.join(dir, 'frontend', 'dist', 'index.html'))).toBe(true);
+    expect(readFileSync(sentinel, 'utf8')).toBe('untouched');
+    rmSync(sentinel, { force: true });
+    db.close();
+  });
+
+  test('logs are sanitized of secrets', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    process.env.FAKE_BUILD_MODE = 'secrets';
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(true);
+    expect(r.output).toMatch(/\[redacted\]/);
+    expect(r.output).not.toMatch(/hunter2-secret-value/);
+    expect(r.output).not.toMatch(/abc123token456/);
+    db.close();
+  });
+
+  test('exception inside the tool leaves terminal state, not a dangling row', async () => {
+    const dir = track(makeProject());
+    const realDb = makeStudioDb();
+    const flakyDb = {
+      prepare: (sql: string) => {
+        if (/INSERT INTO builds/.test(sql)) throw new Error('simulated db failure');
+        return realDb.prepare(sql);
+      },
+      exec: (sql: string) => realDb.exec(sql),
+    };
+    const ctx = makeCtx(flakyDb as unknown as Database.Database, dir);
+    const tools = createDynamicTools();
+    const r = await tools.run_frontend_build(ctx, {});
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('BUILD_EXCEPTION');
+    expect(runningBuilds(realDb)).toBe(0);
+    realDb.close();
+  });
+
+  test('changing sources invalidates the verification receipt', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    expect((await tools.run_frontend_build(ctx, {})).ok).toBe(true);
+    expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
+    expect(dynamicChecksStatus(ctx).missing).not.toContain('frontendBuild');
+    // later source change
+    writeFileSync(path.join(dir, 'frontend', 'src-marker.txt'), 'changed');
+    invalidateDynamicChecks(ctx);
+    expect(ctx.dynamicChecks?.frontendBuild).toBeUndefined();
+    expect(dynamicChecksStatus(ctx).missing).toContain('frontendBuild');
+    expect(dynamicChecksStatus(ctx).complete).toBe(false);
+    db.close();
+  });
+
+  test('sanitizeSecrets redacts passwords, tokens and cookies', () => {
+    const out = sanitizeSecrets(
+      'login with password=s3cr3t-ok\n' +
+        'authorization: Bearer abcdef123456\n' +
+        'cookie: af_session=tokengoeshere123; Path=/\n' +
+        'plain text stays',
+    );
+    expect(out).not.toMatch(/s3cr3t-ok/);
+    expect(out).not.toMatch(/abcdef123456/);
+    expect(out).not.toMatch(/tokengoeshere123/);
+    expect(out).toMatch(/plain text stays/);
+  });
+});

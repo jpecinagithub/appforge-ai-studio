@@ -31,6 +31,19 @@ export interface ToolContext {
   interactiveControls?: number;
   /** Server-created build record; the manual Rebuild uses the same pipeline. */
   buildId?: string;
+  /** Cancellation hook set by the agent loop before each tool call. */
+  isCancelled?: () => boolean;
+  /**
+   * Verification receipts for dynamic projects (Fase 5A): source fingerprint
+   * recorded when each check last succeeded. A later source change
+   * invalidates the receipt (see invalidateDynamicChecks).
+   */
+  dynamicChecks?: {
+    frontendBuild?: string;
+    backendBuild?: string;
+    migrations?: string;
+    apiTests?: string;
+  };
   browserSession?: BrowserSession;
   lastBrowserSteps?: BrowserStep[];
   lastBrowserStart?: BrowserSession;
