@@ -108,7 +108,7 @@ export async function buildServer() {
 
 async function main() {
   const { app, config } = await buildServer();
-  await app.listen({ port: config.port, host: '0.0.0.0' });
+  await app.listen({ port: config.port, host: config.host });
   const address = app.server.address();
   const actualPort =
     typeof address === 'object' && address ? address.port : config.port;

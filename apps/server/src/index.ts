@@ -28,7 +28,7 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { checkBrowser, createTools, requestCancel, runAgentOnce, runCmd, startWorker, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -314,6 +314,21 @@ try{const r=await fetch('/api/projects/${projectId}/builds',{method:'POST',heade
 msg.textContent='Build: '+r.status+(r.ok?' — recargando en 20 s…':'');
 if(r.ok)setTimeout(()=>location.reload(),20000);}catch(e){msg.textContent='Error: '+e;}}</script>
 </body></html>`;
+}
+
+function dynamicPreviewDiagnosticHtml(projectId: string, projectName: string, status: string): string {
+  const reason =
+    status === 'unreachable'
+      ? 'The preview process is not responding. It may have crashed; start a new one with the <code>start_fullstack_preview</code> agent tool.'
+      : 'This dynamic project has no active full-stack preview. Launch one with the <code>start_fullstack_preview</code> agent tool (requires the four verification checks in order).';
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sin preview dinámico — ${projectName}</title>
+<style>body{background:#0b0f14;color:#e6edf3;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:560px;padding:32px;border:1px solid #1f2937;border-radius:12px;background:#111827;text-align:center}
+h1{font-size:20px;margin:0 0 8px}p{color:#9ca3af;font-size:14px}code{color:#06b6d4}</style></head><body>
+<div class="card"><h1>Preview dinámico no disponible</h1>
+<p>El proyecto <b>${projectName}</b> (${projectId}) no tiene un preview full-stack activo${status !== 'none' ? ` (estado: ${status})` : ''}.</p>
+<p>${reason}</p></div></body></html>`;
 }
 
 export function buildServer(opts: ServerOptions): FastifyInstance {
@@ -793,6 +808,100 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     sendFile(abs, reply.raw);
   });
 
+  // --------------------------------------- dynamic preview proxy /a (Fase 5B)
+  // The proxy forwards the RAW request body. A dedicated passthrough parser
+  // keeps the bytes untouched; the preParsing hook reroutes /a/* bodies to
+  // it (with a 10 MiB cap) so Fastify's JSON parser never touches them.
+  // Every other route is completely untouched.
+  app.addContentTypeParser(
+    'application/x-appforge-passthrough',
+    { parseAs: 'buffer', bodyLimit: 10 * 1024 * 1024 },
+    (_req, body, done) => done(null, body),
+  );
+  app.addHook('preParsing', (req, _reply, payload, done) => {
+    if (!req.url?.startsWith('/a/')) return done(null, payload);
+    const r = req as unknown as { proxyContentType?: string };
+    r.proxyContentType = req.headers['content-type'] as string | undefined;
+    req.headers['content-type'] = 'application/x-appforge-passthrough';
+    done(null, payload);
+  });
+
+  // Proxies to the ephemeral full-stack preview registered for a dynamic
+  // project. The target URL ALWAYS comes from the internal preview registry
+  // (never from user input): this is not an open proxy.
+  app.all('/a/:projectId/*', async (req, reply) => {
+    const { projectId } = req.params as { projectId: string; '*': string };
+    const p = getProject(db, projectId);
+    if (!p || (p as { type?: string }).type !== 'dynamic') {
+      reply.code(404).type('text/html; charset=utf-8');
+      return '<h1>Project not found</h1>';
+    }
+    const preview = getPreview(db, projectId);
+    if (!preview || preview.status !== 'ready' || !preview.port) {
+      reply.code(503).type('text/html; charset=utf-8');
+      return dynamicPreviewDiagnosticHtml(projectId, p.name, preview?.status ?? 'none');
+    }
+    // Strip the /a/:projectId prefix; the remainder goes to the preview.
+    const rest = ((req.params as Record<string, string>)['*'] ?? '').split('?')[0];
+    const rawUrl = req.raw.url ?? '/';
+    const qIndex = rawUrl.indexOf('?');
+    const query = qIndex >= 0 ? rawUrl.slice(qIndex) : '';
+    const target = `http://127.0.0.1:${preview.port}/${rest}${query}`;
+
+    // Forward headers minus hop-by-hop and minus the Studio Authorization.
+    const HOP_BY_HOP = new Set([
+      'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+      'te', 'trailer', 'transfer-encoding', 'upgrade',
+    ]);
+    const fwdHeaders = new Headers();
+    for (const [k, v] of Object.entries(req.headers)) {
+      const lk = k.toLowerCase();
+      if (lk === 'host' || lk === 'authorization' || HOP_BY_HOP.has(lk)) continue;
+      if (Array.isArray(v)) { for (const vv of v) fwdHeaders.append(k, vv); }
+      else if (v !== undefined) fwdHeaders.set(k, v);
+    }
+    // Restore the content-type stashed by the preParsing hook.
+    const stashedCt = (req as unknown as { proxyContentType?: string }).proxyContentType;
+    if (stashedCt) fwdHeaders.set('content-type', stashedCt);
+
+    // Raw body via the passthrough parser (10 MiB cap enforced there -> 413).
+    let body: Buffer | undefined;
+    const method = req.method.toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD') {
+      const b = req.body as Buffer | undefined;
+      body = Buffer.isBuffer(b) ? b : undefined;
+    }
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(target, {
+        method,
+        headers: fwdHeaders,
+        body: body ?? undefined,
+        signal: AbortSignal.timeout(30_000),
+        duplex: body ? 'half' : undefined,
+      });
+    } catch (e) {
+      reply.code(502).type('text/html; charset=utf-8');
+      return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
+    }
+
+    const outHeaders: Record<string, string | string[]> = {};
+    upstream.headers.forEach((v, k) => {
+      const lk = k.toLowerCase();
+      if (HOP_BY_HOP.has(lk)) return;
+      outHeaders[k] = v;
+    });
+    // getSetCookie preserves multiple Set-Cookie headers.
+    const setCookies = (upstream.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
+    if (setCookies.length > 0) outHeaders['set-cookie'] = setCookies;
+
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    reply.code(upstream.status);
+    for (const [k, v] of Object.entries(outHeaders)) reply.header(k, v);
+    return reply.send(buf);
+  });
+
   // --------------------------------------- studio SPA (single-server mode, if built)
   const studioDist = opts.studioDistDir ?? path.resolve(SRC_DIR, '..', '..', 'studio', 'dist');
   if (fs.existsSync(path.join(studioDist, 'index.html'))) {
@@ -856,6 +965,9 @@ async function main(): Promise<void> {
   if (interruptedBuilds > 0) console.log(`[server] marked ${interruptedBuilds} interrupted build(s) as failed`);
   const interruptedMigrations = reconcileInterruptedMigrations(db);
   if (interruptedMigrations > 0) console.log(`[server] marked ${interruptedMigrations} interrupted migration(s) as failed`);
+  // Fase 5B: ephemeral previews never survive a restart.
+  const stalePreviews = reconcilePreviews(db);
+  if (stalePreviews > 0) console.log(`[server] discarded ${stalePreviews} stale preview(s)`);
 
   const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db) });
   const app = buildServer({

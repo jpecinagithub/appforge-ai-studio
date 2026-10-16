@@ -25,7 +25,9 @@ import {
   buildChildEnv,
   invalidateDynamicChecks,
   dynamicGateStatus,
+  previewGateStatus,
   DYNAMIC_CHECK_ORDER,
+  DYNAMIC_CHECK_ORDER_5A,
   ensureMigrationsTable,
 } from './dynamicTools.js';
 import type { ToolContext } from './tools.js';
@@ -599,7 +601,10 @@ describe('dynamic tools — fase 5A', () => {
     expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
     expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
     expect((await tools.run_api_tests(ctx, {})).ok).toBe(true);
-    expect(dynamicGateStatus(ctx).complete).toBe(true);
+    // 5A subset complete (preview precondition met), 5B checks still missing.
+    expect(previewGateStatus(ctx).ok).toBe(true);
+    expect(dynamicGateStatus(ctx).complete).toBe(false);
+    expect(dynamicGateStatus(ctx).missing).toEqual(['fullstackPreview', 'authenticatedFlow']);
     // later frontend change invalidates frontendBuild AND its followers
     writeFileSync(path.join(dir, 'frontend', 'src-marker.txt'), 'changed');
     invalidateDynamicChecks(ctx);
@@ -608,7 +613,7 @@ describe('dynamic tools — fase 5A', () => {
     expect(ctx.dynamicChecksOrder).toEqual([]);
     const gate = dynamicGateStatus(ctx);
     expect(gate.complete).toBe(false);
-    expect(gate.missing).toEqual(['frontendBuild', 'backendBuild', 'migrations', 'apiTests']);
+    expect(gate.missing).toEqual([...DYNAMIC_CHECK_ORDER]);
     db.close();
   });
 
@@ -625,7 +630,7 @@ describe('dynamic tools — fase 5A', () => {
     expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
     expect(ctx.dynamicChecks?.backendBuild).toBeUndefined();
     expect(ctx.dynamicChecksOrder).toEqual(['frontendBuild']);
-    expect(dynamicGateStatus(ctx).missing).toEqual(['backendBuild', 'migrations', 'apiTests']);
+    expect(dynamicGateStatus(ctx).missing).toEqual(['backendBuild', 'migrations', 'apiTests', 'fullstackPreview', 'authenticatedFlow']);
     db.close();
   });
 
@@ -646,11 +651,11 @@ describe('dynamic tools — fase 5A', () => {
     // only the last-run check survived; the gate forces the correct order
     const gate = dynamicGateStatus(ctx);
     expect(gate.complete).toBe(false);
-    expect(gate.missing).toEqual(['backendBuild', 'migrations', 'apiTests']);
+    expect(gate.missing).toEqual(['backendBuild', 'migrations', 'apiTests', 'fullstackPreview', 'authenticatedFlow']);
     db.close();
   });
 
-  test('in-order execution completes the gate', async () => {
+  test('in-order execution completes the 5A subset but not the 5B gate', async () => {
     const dir = track(makeProject());
     const db = makeStudioDb();
     const ctx = makeCtx(db, dir);
@@ -659,11 +664,14 @@ describe('dynamic tools — fase 5A', () => {
     expect((await tools.run_backend_build(ctx, {})).ok).toBe(true);
     expect((await tools.run_migrations(ctx, {})).ok).toBe(true);
     expect((await tools.run_api_tests(ctx, {})).ok).toBe(true);
+    // The four 5A checks satisfy the preview precondition…
+    expect(previewGateStatus(ctx).ok).toBe(true);
+    expect(ctx.dynamicChecksOrder).toEqual([...DYNAMIC_CHECK_ORDER_5A]);
+    // …but the full gate needs the two 5B checks as well.
     const gate = dynamicGateStatus(ctx);
-    expect(gate.complete).toBe(true);
-    expect(gate.missing).toEqual([]);
-    expect(gate.orderValid).toBe(true);
-    expect(ctx.dynamicChecksOrder).toEqual([...DYNAMIC_CHECK_ORDER]);
+    expect(gate.complete).toBe(false);
+    expect(gate.missing).toEqual(['fullstackPreview', 'authenticatedFlow']);
+    expect(gate.orderValid).toBe(false);
     db.close();
   });
 

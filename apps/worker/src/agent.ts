@@ -56,10 +56,12 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
   const dynamicSection = isDynamic ? [
     '',
     'DYNAMIC PROJECT (type=dynamic): this project uses the dynamic full-stack template.',
-    '- Project root layout: frontend/ (Vite+React app), backend/ (Fastify+SQLite API), migrations/ (SQL files). File tools still work relative to frontend/; backend and migration sources are verified through the dynamic tools below.',
-    '- MANDATORY ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests. These four tools take no arguments: paths and commands are fixed and confined to the active project.',
-    '- Do NOT declare a dynamic app finished until all four succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
+    '- Project root layout: frontend/ (Vite+React app), backend/ (Fastify+SQLite API), migrations/ (SQL files), tests/ (*.test.mjs API tests).',
+    '- File tools accept an explicit "area" on this project: {"area":"backend","path":"src/routes/items.ts"}. Areas: frontend (frontend/**/*), backend (backend/src/**/*), migrations (migrations/*.sql), tests (tests/*.test.mjs). Default area is frontend. Never invent paths outside an area: package.json, lockfiles, Dockerfile, docker-compose.yml, scripts/, .env, data/, dist/ and node_modules/ are AppForge-controlled and rejected.',
+    '- MANDATORY ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. The dynamic tools take no arguments: paths and commands are fixed and confined to the active project.',
+    '- Do NOT declare a dynamic app finished until all six succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
     '- run_migrations always runs against a temporary verification database; it never touches a live database.',
+    '- start_fullstack_preview launches an ephemeral local preview (temporary SQLite, loopback only) published at /a/:projectId/ through the Studio proxy. test_authenticated_flow verifies it via API calls and real Chromium using stable data-testid selectors. Previews are provisional, never deployments.',
   ] : [];
   return [
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
@@ -271,6 +273,10 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     frontendDir,
     cmdTimeoutMs: limits.cmdTimeoutMs,
     buildTimeoutMs: 600_000,
+    // Fase 5B: the Studio proxy publishes dynamic previews at /a/:projectId/.
+    // Same-host loopback is preferred; override with APPFORGE_STUDIO_URL.
+    studioBaseUrl:
+      process.env.APPFORGE_STUDIO_URL ?? `http://127.0.0.1:${process.env.PORT ?? 3001}`,
   };
 
   // Optional checkpoint before touching files
@@ -445,14 +451,14 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     emit(db, runId, 'status', { phase: 'validating' });
     if (isDynamicProject) {
       // Code-level completion gate: the model cannot finish a dynamic app
-      // unless all four checks are valid on the CURRENT sources and were
+      // unless all six checks are valid on the CURRENT sources and were
       // completed in canonical order. This never depends on the prompt.
       const gate = dynamicGateStatus(ctx);
       if (!gate.complete) {
         const reasons: string[] = [];
         if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
         if (!gate.orderValid) reasons.push('checks were not completed in the required order');
-        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests. Do not declare the app finished until all four succeed on the current sources.`;
+        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.`;
         criticalFailures.set('dynamicChecks', lastError);
         repairing = true;
         const state = repairStateKey(sourceFingerprint(projectDir), lastError);
