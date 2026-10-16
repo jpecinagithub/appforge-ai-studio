@@ -1,3 +1,5 @@
+import { resolveApiUrl } from './api-url';
+
 export interface User {
   id: string;
   email: string;
@@ -28,12 +30,15 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  // Relative API path: same origin as the frontend (no CORS).
+  // API paths are resolved against the document base (see api-url.ts):
+  // under the Studio proxy the app lives at /a/:projectId/ and absolute
+  // /api/... paths would hit the Studio's own API instead of the project's.
   // Content-Type only when there is a body: Fastify rejects
   // application/json with an empty body (400).
+  const url = resolveApiUrl(path, document.baseURI);
   const headers: Record<string, string> =
     init?.body !== undefined ? { 'Content-Type': 'application/json' } : {};
-  const res = await fetch(path, {
+  const res = await fetch(url, {
     credentials: 'include',
     headers,
     ...init,
