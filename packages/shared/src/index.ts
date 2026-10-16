@@ -89,14 +89,67 @@ export interface RevisionInfo {
   createdAt: string;
 }
 
+export type DeploymentStatus =
+  | 'pending'
+  | 'building'
+  | 'migrating'
+  | 'verifying'
+  | 'promoting'
+  | 'live'
+  | 'failed'
+  | 'rolled_back'
+  | 'cancelled';
+
 export interface DeploymentInfo {
   id: string;
   projectId: string;
   target: string;
-  status: string;
+  status: DeploymentStatus;
   url: string | null;
   createdAt: string;
   logs: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Fase 2 — Tipos dinámicos (CONTRACT.md §9). Sin implementar aún.
+// ---------------------------------------------------------------------------
+
+export type MigrationStatus = 'pending' | 'running' | 'success' | 'failed';
+
+export interface MigrationRecord {
+  id: string;
+  projectId: string;
+  version: number;
+  name: string;
+  status: MigrationStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  logs: string;
+  error: string | null;
+}
+
+export type ProjectRuntimeStatus = 'running' | 'stopped' | 'missing';
+
+export interface ProjectRuntime {
+  projectId: string;
+  containerName: string;
+  liveImage: string;
+  previousImage: string | null;
+  status: ProjectRuntimeStatus;
+  updatedAt: string;
+}
+
+export interface AppHealth {
+  ok: boolean;
+  version: string;
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  displayName: string | null;
+  createdAt: string;
 }
 
 export interface FileNode {

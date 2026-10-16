@@ -177,7 +177,7 @@ Cancellation: a flag in the DB checked between loop iterations.
 | Capability | Phase 1 (this repo) | Phase 2 | Phase 3 |
 |---|---|---|---|
 | Static apps (Vite+React+TS) | ✅ generate → build → preview → ZIP | ✅ | ✅ |
-| Dynamic apps (Node backend + SQLite) | ❌ template is a placeholder | ✅ | ✅ |
+| Dynamic apps (Node backend + SQLite) | ❌ template is a placeholder | 📝 spec closed (CONTRACT §9); build in Phases 3–4 | ✅ |
 | LLM agent (single orchestrator) | ✅ Groq / OpenRouter | ✅ + better context/diffs | ✅ |
 | Preview | ✅ served from `dist/` at `/p/:id/` | ✅ full-stack | ✅ |
 | Revisions (git checkpoints) | ✅ | ✅ | ✅ |
@@ -202,3 +202,63 @@ $DATA_DIR/
     logs/
     PROJECT_CONTEXT.md        # agent's persistent technical summary
 ```
+
+## 9. Dynamic apps — Phase 2 design rationale (spec only)
+
+CONTRACT.md §9 is the closed spec; this section explains the *why*.
+
+### Why the Studio proxies project containers (no nginx changes)
+
+Each dynamic project gets its own container, but exposing it does NOT
+require touching nginx, DNS, or certificates: the Studio reverse-proxies
+`/a/:projectId/*` → `http://appforge-app-<id8>:8080/*` over the internal
+Docker network. Rationale: one fewer moving part per deploy, no reload
+of the host reverse proxy, no wildcard certs. Trade-off: the Studio is
+in the request path — acceptable for a single-user studio with a
+handful of apps; revisit if traffic ever justifies it.
+
+### Why one live slot + an ephemeral verify container (not blue-green)
+
+Blue-green with a shared database breaks on schema changes (new code
+migrates the DB, then a rollback serves old code against a new schema).
+The spec instead uses: build → migrate a scratch DB → boot an ephemeral
+`-verify` container → health + API + authenticated-flow tests → destroy
+it → back up the live DB → migrate live → swap the single live slot.
+Rollback = restore the pre-migration backup + boot the previous image.
+Simple, auditable, and every step leaves the system in a known state.
+
+### Why `node:sqlite` and `hash-wasm` in the generated template
+
+`better-sqlite3` needs node-gyp (python/make/g++) and prebuilt binaries
+often don't exist for linux/arm64 — the exact failure hit on this
+server before. `node:sqlite` is built into Node 22.5+: zero native
+deps, zero build tools in the generated image. Same logic for
+`hash-wasm` (pure-WASM Argon2id) instead of the native `argon2`
+package. The generated template must `npm ci` cleanly on a slim image.
+
+### Why the Studio needs Docker access but project containers must not
+
+Someone has to build images and manage containers; that someone is the
+Studio's audited Docker module (fixed arg vectors, no shell, validated
+ids — never the LLM). On Oracle the Studio deployment therefore mounts
+the Docker socket: a deliberate, single, documented point of access.
+Project containers get the opposite treatment: no socket, no Studio
+keys, no cloud credentials, no metadata endpoint, no egress
+(`internal: true` network).
+
+### Why migrations run at container startup AND as an explicit operation
+
+Running pending migrations in the entrypoint makes every boot
+self-healing (a restarted container converges to the right schema).
+The explicit `run_migrations` operation exists for the agent's
+development loop and for observability (the Studio's `migrations`
+table). Both use the same runner and the same checksum discipline, so
+they can't disagree.
+
+### Why the compatibility gate stays closed until 3× clean E2E
+
+Opening "backend + database + auth" in the UI is a promise the system
+must keep. The spec therefore requires the full pipeline (scaffold →
+migrate → build → test → verify → promote → rollback drill) to pass
+three times from zero, unattended, before the gate admits dynamic
+capabilities. Until then §9 is ink, not behavior.
