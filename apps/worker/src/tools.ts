@@ -42,6 +42,14 @@ const TRUNC_CHARS = 20_000;
 const MAX_FILE_BYTES = 1_000_000;
 const MAX_IMAGE_BYTES = 12_000_000;
 const IGNORED_DIRS = new Set(['node_modules', 'dist', '.git']);
+const RASTER_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif']);
+
+function assertTextDestination(filePath: string): void {
+  if (!RASTER_EXTENSIONS.has(path.extname(filePath).toLowerCase())) return;
+  const error = new Error(`cannot write text into raster image ${filePath}; use acquire_image`) as Error & { code: string };
+  error.code = 'BINARY_FILE_REQUIRED';
+  throw error;
+}
 
 export const nowIso = () => new Date().toISOString();
 
@@ -183,6 +191,7 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
   try {
     const p = strArg(args, 'path');
     const content = contentArg(args);
+    assertTextDestination(p);
     const abs = resolveIn(ctx.frontendDir, p);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
@@ -200,6 +209,7 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
     const files = args.files.map((file) => {
       const p = strArg(file, 'path');
       const content = contentArg(file);
+      assertTextDestination(p);
       return { path: p, abs: resolveIn(ctx.frontendDir, p), content };
     });
     for (const file of files) {
@@ -703,7 +713,7 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'write_files', description: 'Write a complete set of related files in ONE call. Preferred when implementing a new app; paths relative to frontend/.', parameters: { type: 'object', properties: { files: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { path: S('Relative path'), content: S('Complete file text') }, required: ['path', 'content'], additionalProperties: false } } }, required: ['files'], additionalProperties: false } },
   { name: 'list_files', description: 'List the project file tree (frontend/ as root).', parameters: { type: 'object', properties: { path: S('Subdirectory relative to frontend/, default ".".') }, additionalProperties: false } },
   { name: 'read_file', description: 'Read a text file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
-  { name: 'write_file', description: 'Write (create or overwrite) a file relative to frontend/. Creates parent dirs. content MUST be a string with the full file text (for .json files, pass the JSON text, not an object).', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), content: S('Full file content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
+  { name: 'write_file', description: 'Write (create or overwrite) a TEXT file relative to frontend/. Creates parent dirs. For photos/raster images use acquire_image; never write SVG/XML text into .jpg/.png/.webp. content MUST be a string with the full file text.', parameters: { type: 'object', properties: { path: S('Text file path relative to frontend/.'), content: S('Full text content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
   { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/.', parameters: { type: 'object', properties: { path: S('Path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/.', parameters: { type: 'object', properties: { path: S('Directory path relative to frontend/.') }, required: ['path'], additionalProperties: false } },

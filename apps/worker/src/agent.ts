@@ -22,7 +22,7 @@ import { createTools, nowIso, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
-import { extractMissingLocalImages, patchImageReferences, repairStateKey } from './recovery.js';
+import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairStateKey } from './recovery.js';
 
 export interface AgentSettings {
   provider: 'groq' | 'openrouter';
@@ -297,6 +297,10 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const criticalFailures = new Map<string, string>();
   const startedAt = Date.now();
+  // The run timeout is an inactivity watchdog. A repair may legitimately take
+  // longer than one window as long as verified source/diagnostic progress is
+  // still being made; stagnant repair attempts remain independently bounded.
+  let lastProgressAt = startedAt;
 
   const dbStatus = () => (db.prepare('SELECT status FROM runs WHERE id=?').get(runId) as { status: string } | undefined)?.status;
 
@@ -313,7 +317,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const perform = async (name: string, args: Record<string, unknown>, id: string = randomUUID()): Promise<ToolResult> => {
     if (cancelledNow()) return { ok: false, code: 'CANCELLED', error: t('cancelled'), durationMs: 0 };
-    const remaining = limits.runTimeoutMs - (Date.now() - startedAt);
+    const beforeFingerprint = sourceFingerprint(frontendDir);
+    const remaining = limits.runTimeoutMs - (Date.now() - lastProgressAt);
     if (remaining <= 0) return { ok: false, code: 'RUN_TIMEOUT', error: t('runTimeout'), durationMs: 0 };
     ctx.cmdTimeoutMs = Math.min(limits.cmdTimeoutMs, remaining);
     ctx.buildTimeoutMs = Math.min(600_000, remaining);
@@ -352,6 +357,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         if (asset?.path) modifiedFiles.push(asset.path);
         if (asset?.attributionPath) modifiedFiles.push(asset.attributionPath);
       }
+      if (fileTool && sourceFingerprint(frontendDir) !== beforeFingerprint) lastProgressAt = Date.now();
     }
     emit(db, runId, 'tool_result', { id, name, ok: result.ok, code: result.code, error: result.error, output: (result.output ?? '').slice(0, 12000), durationMs: result.durationMs });
     return result;
@@ -381,14 +387,20 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     emit(db, runId, 'status', { phase: 'repairing_assets', count: issues.length });
     let changed = false;
     for (const issue of issues) {
-      if (cancelledNow() || Date.now() - startedAt >= limits.runTimeoutMs) break;
+      if (cancelledNow() || Date.now() - lastProgressAt >= limits.runTimeoutMs) break;
       let publicUrl: string | null = null;
       const requestedAsset = path.join(frontendDir, 'public', ...issue.publicRelativePath.split('/'));
-      if (fs.existsSync(requestedAsset)) {
+      if (fs.existsSync(requestedAsset) && isUsableRasterAsset(requestedAsset)) {
         publicUrl = `./${issue.publicRelativePath}`;
       } else {
-        const acquired = await perform('acquire_image', { query: issue.query, path: issue.acquisitionPath });
-        if (acquired.ok) publicUrl = String((acquired.data as { publicUrl?: string } | undefined)?.publicUrl ?? '') || null;
+        if (fs.existsSync(requestedAsset)) await perform('delete_file', { path: `public/${issue.publicRelativePath}` });
+        for (const query of imageQueryVariants(issue)) {
+          const acquired = await perform('acquire_image', { query, path: issue.acquisitionPath });
+          if (acquired.ok) {
+            publicUrl = String((acquired.data as { publicUrl?: string } | undefined)?.publicUrl ?? '') || null;
+            break;
+          }
+        }
       }
       if (!publicUrl) continue;
       const patched = patchImageReferences(frontendDir, issue.requestPath, publicUrl);
@@ -427,7 +439,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     } else if (result.ok) {
       criticalFailures.delete('interactions');
     }
-    if (result.ok && criticalFailures.size === 0 && Date.now() - startedAt < limits.runTimeoutMs) {
+    if (result.ok && criticalFailures.size === 0 && Date.now() - lastProgressAt < limits.runTimeoutMs) {
       complete();
       return true;
     }
@@ -437,6 +449,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     else {
       lastRepairState = state;
       stagnantRepairs = 0;
+      lastProgressAt = Date.now();
     }
     // Include actual diagnostics, not just "exit code 2", and keep JSON intact.
     history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
@@ -452,7 +465,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       clearCancel(runId);
       return;
     }
-    if (Date.now() - startedAt > limits.runTimeoutMs) {
+    if (Date.now() - lastProgressAt > limits.runTimeoutMs) {
       finishError(t('runTimeout'));
       return;
     }
@@ -466,7 +479,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     let resp;
     const llmT0 = Date.now();
     try {
-      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: startedAt + limits.runTimeoutMs }, history, TOOL_DEFS);
+      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs }, history, TOOL_DEFS);
     } catch (e) {
       if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
         stats.errors++;

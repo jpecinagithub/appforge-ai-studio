@@ -138,6 +138,12 @@ describe('acquire_image', () => {
 });
 
 describe('path confinement', () => {
+  it('rejects text disguised as a raster image', async () => {
+    const result = await createTools().write_file(ctx, { path: 'public/images/fake.jpg', content: '<svg></svg>' });
+    expect(result).toMatchObject({ ok: false, code: 'BINARY_FILE_REQUIRED' });
+    expect(fs.existsSync(path.join(frontendDir, 'public/images/fake.jpg'))).toBe(false);
+  });
+
   it('rejects .. traversal on read', async () => {
     const tools = createTools();
     const r = await tools.read_file(ctx, { path: '../outside.txt' });
