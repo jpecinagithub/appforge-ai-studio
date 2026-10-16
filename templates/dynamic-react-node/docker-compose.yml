@@ -1,0 +1,18 @@
+# Reference / manual use. The Studio does NOT use this file for deploys
+# (it orchestrates containers directly — contract §9.10).
+services:
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      - PORT=8080
+      - DB_PATH=/data/app.db
+    volumes:
+      - app-data:/data
+    restart: unless-stopped
+
+volumes:
+  app-data:
