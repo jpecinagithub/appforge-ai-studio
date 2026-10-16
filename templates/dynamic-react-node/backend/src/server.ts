@@ -33,6 +33,26 @@ export async function buildServer() {
   const app = Fastify({ logger: false });
   await app.register(cookie);
 
+  // Tolerate `Content-Type: application/json` with an empty body
+  // (some clients send the header on bodyless requests): treat as no
+  // body instead of 400. Malformed JSON still 400s.
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string' },
+    (req, body, done) => {
+      const text = typeof body === 'string' ? body : '';
+      if (text.trim().length === 0) {
+        done(null, undefined);
+        return;
+      }
+      try {
+        done(null, JSON.parse(text));
+      } catch (err) {
+        done(err as Error);
+      }
+    },
+  );
+
   // Rate limit on the credential endpoints (contract §9.5).
   const authLimit = rateLimit(10);
   app.addHook('onRequest', async (req, reply) => {

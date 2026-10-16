@@ -19,11 +19,12 @@ const ROOT = new URL('..', import.meta.url).pathname;
 let base;
 let child;
 
-function req(path, { method = 'GET', body, cookie } = {}) {
+function req(path, { method = 'GET', body, cookie, contentType = false } = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(path, base);
     const headers = {};
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (body !== undefined || contentType)
+      headers['Content-Type'] = 'application/json';
     if (cookie) headers['Cookie'] = cookie;
     import('node:http').then(({ request }) => {
       const r = request(
@@ -235,8 +236,7 @@ describe('todos CRUD + isolation', () => {
   });
 });
 
-describe('logout', () => {
-  test('logout revokes the session immediately', async () => {
+describe('logout', () => {  test('logout revokes the session immediately', async () => {
     const reg = await req('/api/auth/register', {
       method: 'POST',
       body: { email: 'bye@example.com', password: 'supersecret123' },
@@ -251,5 +251,35 @@ describe('logout', () => {
     const afterLogout = await req('/api/auth/me', { cookie });
     assert.equal(afterLogout.status, 401);
     assert.equal(afterLogout.json.error.code, 'UNAUTHORIZED');
+  });
+});
+
+describe('bodyless requests with Content-Type', () => {
+  test('DELETE and POST logout do not 400 on empty JSON body', async () => {
+    // Regression: browsers may send Content-Type: application/json with no
+    // body (fetch default in the template). Fastify must not 400.
+    const reg = await req('/api/auth/register', {
+      method: 'POST',
+      body: { email: 'ct@example.com', password: 'supersecret123' },
+    });
+    const cookie = reg.cookie;
+    const created = await req('/api/todos', {
+      method: 'POST',
+      body: { title: 'temp' },
+      cookie,
+    });
+    const del = await req(`/api/todos/${created.json.id}`, {
+      method: 'DELETE',
+      cookie,
+      contentType: true,
+    });
+    assert.equal(del.status, 200);
+
+    const out = await req('/api/auth/logout', {
+      method: 'POST',
+      cookie,
+      contentType: true,
+    });
+    assert.equal(out.status, 200);
   });
 });

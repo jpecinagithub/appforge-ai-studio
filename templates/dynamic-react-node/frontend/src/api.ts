@@ -29,9 +29,13 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // Relative API path: same origin as the frontend (no CORS).
+  // Content-Type only when there is a body: Fastify rejects
+  // application/json with an empty body (400).
+  const headers: Record<string, string> =
+    init?.body !== undefined ? { 'Content-Type': 'application/json' } : {};
   const res = await fetch(path, {
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...init,
   });
   if (!res.ok) {
