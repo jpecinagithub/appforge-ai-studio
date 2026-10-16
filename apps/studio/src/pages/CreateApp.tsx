@@ -105,6 +105,14 @@ export function CreateApp() {
             />
           )}
 
+          <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/5 px-3.5 py-2.5">
+            <p className="text-xs font-semibold uppercase tracking-wide text-cyan-700 dark:text-cyan-300">
+              {t('create.stackTitle')}
+            </p>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{t('create.stackList')}</p>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{t('create.stackHint')}</p>
+          </div>
+
           <Btn variant="primary" onClick={() => void submit()} disabled={creating}>
             {creating ? <Spinner className="h-4 w-4" /> : <Wand2 className="h-4 w-4" />}
             {creating ? t('create.generating') : t('create.generate')}

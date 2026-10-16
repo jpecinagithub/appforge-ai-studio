@@ -1,5 +1,10 @@
 /** Live acceptance cases, using the same authenticated API as Studio.
- * Run inside the AppForge container: node /tmp/acceptance.mjs start|status
+ * Run inside the AppForge container:
+ *   node /tmp/acceptance.mjs start|status|cancel|retry|repair|compat|verify
+ * - start:  create the generation cases and launch the agent runs (consumes LLM tokens).
+ * - compat: deterministic compatibility-gate check (no LLM calls, cleans up after itself).
+ * - verify: deterministic checks over finished runs (no Tailwind in output, build ok,
+ *           preview 200, thumbnail 200, real Chromium test_preview in the event log).
  * Credentials are read from its environment, never written to the report.
  */
 import fs from 'node:fs';
@@ -10,6 +15,52 @@ const api = async (route, body) => {
   const data = await response.json();
   if (!response.ok) throw new Error(`${response.status}: ${JSON.stringify(data)}`);
   return data;
+};
+const check = (name, ok, detail) => {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
+  if (!ok) process.exitCode = 1;
+};
+/** Replay the SSE event log of a run. The server closes the stream after a
+ * terminal event; runs that never emitted events (e.g. compatibility
+ * rejections) keep the stream open, so the timeout resolves with whatever
+ * was collected instead of hanging forever. */
+const collectRunEvents = async (runId, timeoutMs = 15000) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const events = [];
+  try {
+    const res = await fetch(`${base}/api/runs/${runId}/events`, {
+      headers: { Authorization: `Bearer ${process.env.APPFORGE_ADMIN_TOKEN}`, Accept: 'text/event-stream' },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`events HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let terminalSeen = false;
+    while (!terminalSeen) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const kind = (block.match(/^event: ([^\s:][^:]*)$/m) || [])[1];
+        if (!kind) continue; // :ping and other comments
+        const data = (block.match(/^data: (.+)$/m) || [])[1];
+        events.push({ kind, data: data ? JSON.parse(data) : null });
+        if (kind === 'done' || kind === 'error') terminalSeen = true;
+      }
+    }
+    try { await reader.cancel(); } catch { /* already closed */ }
+  } catch (e) {
+    if (!e || e.name !== 'AbortError') throw e;
+    // Timeout: return what was collected (empty when the run emitted nothing).
+  } finally {
+    clearTimeout(timer);
+  }
+  return events;
 };
 if (process.argv[2] === 'start') {
   if (fs.existsSync(file)) throw new Error('Report already exists; use status to inspect the existing cases.');
@@ -61,6 +112,77 @@ if (process.argv[2] === 'start') {
   report.push({ name: project.name, projectId, runId: run.id, prompt });
   fs.writeFileSync(file, JSON.stringify(report, null, 2));
   console.log(JSON.stringify({ projectId, runId: run.id }));
+} else if (process.argv[2] === 'compat') {
+  // Compatibility gate: an unsupported request must finish immediately with
+  // zero LLM/token consumption and a friendly message. No agent run is started.
+  const project = await api('/projects', { name: `Aceptación · Compatibilidad ${Date.now()}`, description: 'Prueba automática de la puerta de compatibilidad', type: 'static' });
+  try {
+    const run = await api(`/projects/${project.id}/runs`, { prompt: 'Crea el proyecto con Next.js, Tailwind y PostgreSQL', language: 'es' });
+    check('compat: run finishes immediately as done', run.status === 'done', `status=${run.status}`);
+    const stats = run.stats || {};
+    check('compat: zero LLM calls', stats.llmCalls === 0, `llmCalls=${stats.llmCalls}`);
+    check('compat: zero tool calls', stats.toolCalls === 0, `toolCalls=${stats.toolCalls}`);
+    check('compat: zero iterations', stats.iterations === 0, `iterations=${stats.iterations}`);
+    const messages = await api(`/projects/${project.id}/messages`);
+    const assistant = messages.items.find((m) => m.role === 'assistant');
+    check('compat: friendly message lists allowed technologies', !!assistant && assistant.content.includes('Tecnologías permitidas actualmente'), assistant ? `${assistant.content.length} chars` : 'no assistant message');
+    check('compat: message names the rejected technologies', !!assistant && assistant.content.includes('Next.js') && assistant.content.includes('Tailwind'), 'Next.js + Tailwind mentioned');
+  } finally {
+    // api() defaults to GET when body is undefined, so DELETE goes through raw fetch.
+    const del = await fetch(`${base}/api/projects/${project.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${process.env.APPFORGE_ADMIN_TOKEN}` } });
+    if (!del.ok) throw new Error(`cleanup DELETE failed: HTTP ${del.status}`);
+    console.log('compat: temporary project removed');
+  }
+} else if (process.argv[2] === 'verify') {
+  // Deterministic verification of finished generation runs from the report file.
+  const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const latest = [...new Map(report.map((entry) => [entry.projectId, entry])).values()];
+  if (latest.length === 0) throw new Error('Report is empty; run `start` first.');
+  for (const item of latest) {
+    console.log(`--- ${item.name} (${item.projectId})`);
+    const run = await api(`/runs/${item.runId}`);
+    check('run finished as done', run.status === 'done', `status=${run.status}`);
+    check('run has no error', !run.error, run.error || 'ok');
+    if (run.status !== 'done') continue;
+    const project = await api(`/projects/${item.projectId}`);
+    // 1. Generated app uses plain CSS: no Tailwind in its package.json.
+    try {
+      const pkg = await api(`/projects/${item.projectId}/files/content?path=${encodeURIComponent('package.json')}`);
+      const manifest = JSON.parse(pkg.content);
+      const deps = { ...(manifest.dependencies || {}), ...(manifest.devDependencies || {}) };
+      check('generated package.json has no tailwindcss', !('tailwindcss' in deps));
+      check('generated package.json has no @tailwindcss/vite', !('@tailwindcss/vite' in deps));
+    } catch (e) {
+      check('generated package.json readable and Tailwind-free', false, String(e && e.message || e));
+    }
+    // 2. Latest build succeeded.
+    const builds = await api(`/projects/${item.projectId}/builds`);
+    const latestBuild = builds.items[0];
+    check('latest build succeeded', !!latestBuild && latestBuild.status === 'success', latestBuild ? `${latestBuild.status}` : 'no builds');
+    // 3. Preview is publicly reachable.
+    if (project.previewUrl) {
+      const preview = await fetch(`${base}${project.previewUrl}`, { redirect: 'manual' });
+      check('preview returns HTTP 200', preview.status === 200, `HTTP ${preview.status}`);
+    } else {
+      check('preview URL published', false, 'previewUrl is null');
+    }
+    // 4. Library thumbnail exists.
+    if (project.thumbnailUrl) {
+      const thumb = await fetch(`${base}${project.thumbnailUrl}`, { redirect: 'manual' });
+      check('library thumbnail returns HTTP 200', thumb.status === 200, `HTTP ${thumb.status}`);
+    } else {
+      check('library thumbnail published', false, 'thumbnailUrl is null');
+    }
+    // 5. The agent really tested in Chromium (test_preview tool call in the event log).
+    try {
+      const events = await collectRunEvents(item.runId);
+      const toolCalls = events.filter((e) => e.kind === 'tool_call').map((e) => e.data && e.data.name).filter(Boolean);
+      check('agent ran test_preview in real Chromium', toolCalls.includes('test_preview'), `${toolCalls.length} tool calls recorded`);
+    } catch (e) {
+      check('run event log readable', false, String(e && e.message || e));
+    }
+  }
+  console.log(process.exitCode ? 'VERIFY: FAILURES PRESENT' : 'VERIFY: ALL CHECKS PASSED');
 } else {
   const report = JSON.parse(fs.readFileSync(file, 'utf8'));
   for (const item of new Map(report.map((entry) => [entry.projectId, entry])).values()) {

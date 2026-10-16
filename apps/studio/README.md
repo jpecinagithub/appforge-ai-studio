@@ -1,7 +1,11 @@
 # AppForge AI Studio — Frontend (`apps/studio`)
 
 Estudio de desarrollo asistido por IA. React 19 + Vite + TypeScript strict + Tailwind CSS v4
-+ React Router + Monaco Editor + PWA + Vercel Analytics. Bilingüe ES/EN, dark/light.
++ React Router + Monaco Editor + Vercel Analytics. Bilingüe ES/EN, dark/light.
+
+> La PWA del Studio se retiró: un service worker antiguo servía chunks obsoletos
+> tras los despliegues. `public/sw.js` es un worker de retirada que limpia cachés,
+> se desregistra y recarga los clientes. No reactivar PWA en esta fase.
 
 **Contrato de integración:** `../CONTRACT.md` (única fuente de verdad de la API, SSE y settings).
 El frontend no inventa endpoints: todo lo que llama existe en el contrato.

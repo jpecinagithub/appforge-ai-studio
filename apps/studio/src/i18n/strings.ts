@@ -120,6 +120,9 @@ const es = {
   'create.step3': 'Se compila y se verifica la aplicación.',
   'create.step4': 'Se abre la preview funcional en el workspace.',
   'create.note': 'El trabajo continúa en segundo plano aunque cierres el navegador.',
+  'create.stackTitle': 'Stack admitido en esta fase',
+  'create.stackList': 'Vite · React 19 · TypeScript · CSS convencional · SPA estática responsive · APIs del navegador y localStorage',
+  'create.stackHint': 'Si pides otra tecnología (Next.js, Tailwind, backend, base de datos…), el agente te lo indicará sin consumir tokens de generación.',
 
   'chat.inputPh': 'Describe la app o pide un cambio… (Enter para enviar)',
   'chat.send': 'Enviar',
@@ -440,6 +443,9 @@ const en: Record<EsKey, string> = {
   'create.step3': 'The application is compiled and verified.',
   'create.step4': 'The working preview opens in the workspace.',
   'create.note': 'The job keeps running in the background even if you close the browser.',
+  'create.stackTitle': 'Stack supported in this phase',
+  'create.stackList': 'Vite · React 19 · TypeScript · plain CSS · responsive static SPA · browser APIs and localStorage',
+  'create.stackHint': 'If you request another technology (Next.js, Tailwind, backend, database…), the agent will tell you without consuming generation tokens.',
 
   'chat.inputPh': 'Describe the app or request a change… (Enter to send)',
   'chat.send': 'Send',

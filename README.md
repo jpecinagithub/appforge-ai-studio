@@ -69,14 +69,21 @@ appforge/
 
 ## Phase 1 acceptance tests — status
 
+The backend + agent exist and run on Oracle (see `AUDIT_2026-10-13.md`).
+Live re-runs use `scripts/acceptance.mjs`: `start` launches the generation
+cases, `status` inspects them, `compat` checks the technology gate without
+consuming LLM tokens, `verify` asserts no-Tailwind output, successful build,
+reachable preview and thumbnail, and a real Chromium `test_preview` in the
+run's event log.
+
 | Test | Scenario | Status |
 |---|---|---|
-| A | Static app (tic-tac-toe vs AI): prompt → code → build → preview, playable | ⏳ pending (needs backend+agent) |
+| A | Static app (tic-tac-toe vs AI): prompt → code → build → preview, playable | ✅ verified on Oracle 2026-10-13 (audit); re-run with `acceptance.mjs start` + `verify` |
 | B | Dynamic app (task manager + persistent DB) | ⏳ Phase 2 |
-| C | Incremental change ("add completed filter") without full regen | ⏳ pending (needs backend+agent) |
-| D | Controlled build error → limited repair → rebuild → report | ⏳ pending (needs backend+agent) |
-| E | Server restart: projects, chats, builds, interrupted runs recovered | ⏳ pending (needs backend) |
-| F | ZIP download: complete code, lockfile, README, no secrets/artifacts | ⏳ pending (needs backend) |
+| C | Incremental change ("add completed filter") without full regen | ⏳ pending live re-run (agent supports `patch_file`) |
+| D | Controlled build error → limited repair → rebuild → report | ⏳ pending live re-run |
+| E | Server restart: interrupted runs and builds recovered, files preserved | ✅ implemented (`reconcileInterruptedRuns`/`reconcileInterruptedBuilds`) + unit-tested |
+| F | ZIP download: complete code, lockfile, README, no secrets/artifacts | ✅ verified on Oracle 2026-10-13 (audit, 22 KB ZIP) |
 | G | Deploy static app to Vercel, verify URL | ⏳ Phase 3 |
 
 **Verified so far:** `templates/static-react` installs cleanly and
