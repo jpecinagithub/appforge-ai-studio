@@ -11,6 +11,8 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/(set-cookie\s*:[^\r\n]*?af_session=)[^;\s]+/gi, '$1[redacted]'],
   [/(cookie\s*:\s*)[^\r\n]+/gi, '$1[redacted]'],
   [/((?:session[_-]?token|auth[_-]?token)["']?\s*[:=]\s*['"]?)[A-Za-z0-9\-._~+/=]{8,}/gi, '$1[redacted]'],
+  // Revisión Codex (Fase 6): clave genérica `token` (p. ej. `token=abc…`).
+  [/((?:\btoken\b)["']?\s*[:=]\s*['"]?)[A-Za-z0-9\-._~+/=]{8,}/gi, '$1[redacted]'],
 ];
 
 /** Remove passwords, cookies, tokens and secrets from captured logs. */

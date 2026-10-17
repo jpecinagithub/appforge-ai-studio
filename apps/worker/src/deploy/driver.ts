@@ -26,6 +26,15 @@ export interface DriverOpArgs {
   projectId: string;
   /** Identificador del candidato, derivado como `cand-<8 del deployment id>`. */
   candidateId: string;
+  /**
+   * Revisión Codex (Fase 6): señal de aborto. Toda implementación del driver
+   * DEBE abortar el trabajo real cuando se dispare y resolver su promesa con
+   * prontitud (`{ ok:false, code:'OPERATION_ABORTED' }`). El orquestador la
+   * dispara ante timeout de operación, timeout total del pipeline o
+   * cancelación (fuera de la sección crítica de `promoting`) y ESPERA a que
+   * la operación termine: nunca deja trabajo en segundo plano.
+   */
+  signal?: AbortSignal;
 }
 
 export interface HealthCheckArgs extends DriverOpArgs {
@@ -82,6 +91,17 @@ export function assertDriverArgs(args: DriverOpArgs): void {
   if ('runtime' in extra && extra.runtime !== 'verify' && extra.runtime !== 'live') {
     throw new Error(`invalid driver argument 'runtime': must be 'verify' or 'live'`);
   }
+  if ('signal' in extra && extra.signal !== undefined) {
+    const s = extra.signal as unknown;
+    if (
+      typeof s !== 'object' ||
+      s === null ||
+      typeof (s as AbortSignal).addEventListener !== 'function' ||
+      typeof (s as AbortSignal).aborted !== 'boolean'
+    ) {
+      throw new Error(`invalid driver argument 'signal': must be an AbortSignal`);
+    }
+  }
   for (const k of ['previousLiveVersion', 'backupId'] as const) {
     if (k in extra) {
       const v = extra[k];
@@ -91,7 +111,7 @@ export function assertDriverArgs(args: DriverOpArgs): void {
     }
   }
   const allowed = new Set([
-    'deploymentId', 'projectId', 'candidateId', 'runtime', 'previousLiveVersion', 'backupId',
+    'deploymentId', 'projectId', 'candidateId', 'signal', 'runtime', 'previousLiveVersion', 'backupId',
   ]);
   for (const k of Object.keys(extra)) {
     if (!allowed.has(k)) throw new Error(`invalid driver argument '${k}': unknown argument`);
@@ -114,7 +134,18 @@ export interface DeploymentDriver {
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult>;
   restoreBackup(args: RestoreBackupArgs): Promise<DriverResult>;
   startPreviousVersion(args: StartPreviousVersionArgs): Promise<DriverResult>;
-  removeCandidate(args: DriverOpArgs): Promise<DriverResult>;
+  /**
+   * Revisión Codex (Fase 6): descarta un candidato FALLIDO o NO PROMOCIONADO.
+   * Semántica estricta:
+   * - Solo para candidatos que nunca llegaron a live (fallo en
+   *   building/migrating/verifying, cancelación pre-promoting, rollback).
+   * - NUNCA debe llamarse después de que el candidato arrancase como live:
+   *   en ese momento el candidato ES la versión live y descartarlo podría
+   *   eliminar la imagen/runtime que acaba de promocionarse (Fase 7).
+   * - La limpieza de recursos temporales de verificación usa
+   *   `stopVerificationRuntime` + `discardVerificationDatabase`, no esta op.
+   */
+  discardCandidate(args: DriverOpArgs): Promise<DriverResult>;
   reconcileRuntime(args: ReconcileArgs): Promise<DriverResult>;
 }
 
@@ -137,7 +168,7 @@ export type FakeOpName =
   | 'startCandidateAsLive'
   | 'restoreBackup'
   | 'startPreviousVersion'
-  | 'removeCandidate'
+  | 'discardCandidate'
   | 'reconcileRuntime';
 
 export const FAKE_OP_NAMES: readonly FakeOpName[] = [
@@ -155,12 +186,12 @@ export const FAKE_OP_NAMES: readonly FakeOpName[] = [
   'startCandidateAsLive',
   'restoreBackup',
   'startPreviousVersion',
-  'removeCandidate',
+  'discardCandidate',
   'reconcileRuntime',
 ];
 
-/** Comportamiento configurable por operación. */
-export type FakeOpBehavior = 'success' | 'fail' | 'timeout';
+/** Comportamiento configurable por operación. 'hang' = no resuelve hasta recibir abort. */
+export type FakeOpBehavior = 'success' | 'fail' | 'timeout' | 'hang';
 
 export interface FakeCall {
   op: FakeOpName;
@@ -214,6 +245,8 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   readonly name = 'fake';
   readonly calls: FakeCall[] = [];
   private readonly opts: FakeDriverOptions;
+  /** Operaciones en vuelo (revisión Codex: debe quedar a 0 tras abort/timeout). */
+  private readonly pending = new Set<FakeCall>();
 
   constructor(opts: FakeDriverOptions = {}) {
     this.opts = opts;
@@ -221,6 +254,35 @@ export class FakeDeploymentDriver implements DeploymentDriver {
 
   callsOf(op: FakeOpName): FakeCall[] {
     return this.calls.filter((c) => c.op === op);
+  }
+
+  /** Número de operaciones del driver aún sin resolver. */
+  pendingOpCount(): number {
+    return this.pending.size;
+  }
+
+  private abortAwareDelay(signal: AbortSignal | undefined, ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      if (signal?.aborted) return resolve();
+      const t = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(t);
+        resolve();
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /** Revisión Codex: el fake de una operación colgada solo resuelve al recibir abort. */
+  private waitForAbort(signal: AbortSignal | undefined): Promise<void> {
+    return new Promise((resolve) => {
+      if (!signal || signal.aborted) return resolve();
+      signal.addEventListener('abort', () => resolve(), { once: true });
+    });
   }
 
   private async run(op: FakeOpName, args: DriverOpArgs): Promise<DriverResult> {
@@ -240,24 +302,40 @@ export class FakeDeploymentDriver implements DeploymentDriver {
     // Se registra al invocar (antes de la compuerta): el orquestador ya
     // llamó a la operación aunque esta espere.
     this.calls.push(call);
-    const gate = this.opts.gates?.[op];
-    if (gate) await gate();
-    const hook = this.opts.hooks?.[op];
-    if (hook) await hook(call);
-    const delay = this.opts.delayMs?.[op] ?? 0;
-    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-    const behavior = this.opts.decide?.(op, args) ?? this.opts.behavior?.[op] ?? 'success';
-    if (behavior === 'success') {
-      const data: Record<string, string> | undefined =
-        op === 'createLiveBackup' ? { backupId: this.opts.backupId ?? `backup-${args.deploymentId.slice(0, 8)}` } : undefined;
-      return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
+    this.pending.add(call);
+    try {
+      const gate = this.opts.gates?.[op];
+      if (gate) await gate();
+      const hook = this.opts.hooks?.[op];
+      if (hook) await hook(call);
+      await this.abortAwareDelay(args.signal, this.opts.delayMs?.[op] ?? 0);
+      if (args.signal?.aborted) {
+        return { ok: false, code: 'OPERATION_ABORTED', error: `fake ${op} aborted` };
+      }
+      const behavior = this.opts.decide?.(op, args) ?? this.opts.behavior?.[op] ?? 'success';
+      if (behavior === 'hang') {
+        await this.waitForAbort(args.signal);
+        return { ok: false, code: 'OPERATION_ABORTED', error: `fake ${op} aborted after hang` };
+      }
+      if (behavior === 'success') {
+        const data: Record<string, string> | undefined =
+          op === 'createLiveBackup'
+            ? {
+                backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}`,
+                backupValidated: 'true',
+              }
+            : undefined;
+        return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
+      }
+      const code =
+        behavior === 'timeout'
+          ? 'OPERATION_TIMEOUT'
+          : (this.opts.failCode?.[op] ?? `${op.toUpperCase()}_FAILED`);
+      const error = this.opts.failError?.[op] ?? `fake ${op} failed`;
+      return { ok: false, code, error, output: `fake ${op}: ${error}` };
+    } finally {
+      this.pending.delete(call);
     }
-    const code =
-      behavior === 'timeout'
-        ? 'OPERATION_TIMEOUT'
-        : (this.opts.failCode?.[op] ?? `${op.toUpperCase()}_FAILED`);
-    const error = this.opts.failError?.[op] ?? `fake ${op} failed`;
-    return { ok: false, code, error, output: `fake ${op}: ${error}` };
   }
 
   buildCandidate(args: DriverOpArgs): Promise<DriverResult> { return this.run('buildCandidate', args); }
@@ -274,7 +352,7 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult> { return this.run('startCandidateAsLive', args); }
   restoreBackup(args: RestoreBackupArgs): Promise<DriverResult> { return this.run('restoreBackup', args); }
   startPreviousVersion(args: StartPreviousVersionArgs): Promise<DriverResult> { return this.run('startPreviousVersion', args); }
-  removeCandidate(args: DriverOpArgs): Promise<DriverResult> { return this.run('removeCandidate', args); }
+  discardCandidate(args: DriverOpArgs): Promise<DriverResult> { return this.run('discardCandidate', args); }
   reconcileRuntime(args: ReconcileArgs): Promise<DriverResult> {
     return this.run('reconcileRuntime', {
       deploymentId: args.deploymentId,

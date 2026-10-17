@@ -151,6 +151,19 @@ export function getActiveDeployment(db: Database.Database, projectId: string): D
 
 export const MAX_EVENT_OUTPUT_CHARS = 4_000;
 export const MAX_DEPLOYMENT_LOGS_CHARS = 20_000;
+/** Tope para `deployments.error` (se devuelve por la API: siempre sanitizado). */
+export const MAX_ERROR_CHARS = 4_000;
+
+/**
+ * Revisión Codex (Fase 6): `deployments.error` se devuelve por la API, así
+ * que TODO error (del driver, excepciones, rollback, reconciliación) se
+ * sanitiza y limita ANTES de persistirlo. Nunca debe contener passwords,
+ * tokens, cookies ni cabeceras Authorization.
+ */
+export function sanitizeDeploymentError(s: string | null | undefined): string | null {
+  if (s === null || s === undefined) return null;
+  return sanitizeSecrets(s).slice(0, MAX_ERROR_CHARS);
+}
 
 function truncateWithMarker(s: string, max: number, marker: (kept: number, total: number) => string): string {
   if (s.length <= max) return s;
@@ -187,7 +200,14 @@ export interface DeploymentEvent {
  * limita por evento con indicador explícito de truncado; los eventos
  * conservan el orden mediante `seq` por deployment.
  */
-export function recordEvent(
+/**
+ * Inserta el evento SIN abrir transacción propia: el llamador decide la
+ * transacción. Revisión Codex (Fase 6): creación/transición/cancelación de
+ * un deployment y su evento deben persistirse en UNA sola transacción, de
+ * modo que un fallo al insertar el evento revierte también el cambio de
+ * estado (nunca "estado sin evento").
+ */
+function insertEventRow(
   db: Database.Database,
   deploymentId: string,
   input: DeploymentEventInput,
@@ -200,56 +220,61 @@ export function recordEvent(
       : truncateWithMarker(sanitizeSecrets(rawOutput), MAX_EVENT_OUTPUT_CHARS, (kept, total) =>
           `\n…[output truncated: kept ${kept} of ${total} chars]`,
         );
-  const insert = () => {
-    const seq = (
-      db
-        .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM deployment_events WHERE deployment_id=?')
-        .get(deploymentId) as { m: number }
-    ).m + 1;
-    db.prepare(
-      `INSERT INTO deployment_events(deployment_id, seq, phase, event, status, started_at, finished_at,
-        duration_ms, output, error, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    ).run(
-      deploymentId,
-      seq,
-      input.phase,
-      input.event,
-      input.status ?? null,
-      input.startedAt ?? now,
-      input.finishedAt ?? now,
-      input.durationMs ?? null,
-      output,
-      input.error ? sanitizeSecrets(input.error).slice(0, MAX_EVENT_OUTPUT_CHARS) : null,
-      now,
-    );
-    // Resumen acotado en deployments.logs (una línea por evento).
-    const line = `[${input.phase}] ${input.event}${input.status ? ` (${input.status})` : ''}${
-      input.error ? `: ${sanitizeSecrets(input.error).slice(0, 300)}` : ''
-    }\n`;
-    const prev = (
-      db.prepare('SELECT logs FROM deployments WHERE id=?').get(deploymentId) as { logs: string | null } | undefined
-    )?.logs;
-    const next = truncateWithMarker(`${prev ?? ''}${line}`, MAX_DEPLOYMENT_LOGS_CHARS, () =>
-      `\n…[deployment logs truncated at ${MAX_DEPLOYMENT_LOGS_CHARS} chars]`,
-    );
-    db.prepare('UPDATE deployments SET logs=?, updated_at=? WHERE id=?').run(next, now, deploymentId);
-    return {
-      seq,
-      phase: input.phase,
-      event: input.event,
-      status: input.status ?? null,
-      startedAt: input.startedAt ?? now,
-      finishedAt: input.finishedAt ?? now,
-      durationMs: input.durationMs ?? null,
-      output,
-      error: input.error ?? null,
-      createdAt: now,
-    };
+  const seq = (
+    db
+      .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM deployment_events WHERE deployment_id=?')
+      .get(deploymentId) as { m: number }
+  ).m + 1;
+  db.prepare(
+    `INSERT INTO deployment_events(deployment_id, seq, phase, event, status, started_at, finished_at,
+      duration_ms, output, error, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    deploymentId,
+    seq,
+    input.phase,
+    input.event,
+    input.status ?? null,
+    input.startedAt ?? now,
+    input.finishedAt ?? now,
+    input.durationMs ?? null,
+    output,
+    input.error ? sanitizeSecrets(input.error).slice(0, MAX_EVENT_OUTPUT_CHARS) : null,
+    now,
+  );
+  // Resumen acotado en deployments.logs (una línea por evento).
+  const line = `[${input.phase}] ${input.event}${input.status ? ` (${input.status})` : ''}${
+    input.error ? `: ${sanitizeSecrets(input.error).slice(0, 300)}` : ''
+  }\n`;
+  const prev = (
+    db.prepare('SELECT logs FROM deployments WHERE id=?').get(deploymentId) as { logs: string | null } | undefined
+  )?.logs;
+  const next = truncateWithMarker(`${prev ?? ''}${line}`, MAX_DEPLOYMENT_LOGS_CHARS, () =>
+    `\n…[deployment logs truncated at ${MAX_DEPLOYMENT_LOGS_CHARS} chars]`,
+  );
+  db.prepare('UPDATE deployments SET logs=?, updated_at=? WHERE id=?').run(next, now, deploymentId);
+  return {
+    seq,
+    phase: input.phase,
+    event: input.event,
+    status: input.status ?? null,
+    startedAt: input.startedAt ?? now,
+    finishedAt: input.finishedAt ?? now,
+    durationMs: input.durationMs ?? null,
+    output,
+    error: input.error ?? null,
+    createdAt: now,
   };
+}
+
+export function recordEvent(
+  db: Database.Database,
+  deploymentId: string,
+  input: DeploymentEventInput,
+): DeploymentEvent {
   // better-sqlite3 anida transacciones con SAVEPOINT: seguro llamarlo dentro
   // o fuera de una transacción existente.
-  return db.transaction(insert)();
+  return db.transaction(() => insertEventRow(db, deploymentId, input))();
 }
 
 export function listDeploymentEvents(db: Database.Database, deploymentId: string): DeploymentEvent[] {
@@ -339,6 +364,9 @@ export function createDeployment(db: Database.Database, input: CreateDeploymentI
         null,
         null,
       );
+      // Revisión Codex: el evento 'created' se inserta en la MISMA
+      // transacción: si falla, la creación entera se revierte.
+      insertEventRow(db, id, { phase: 'pending', event: 'created', status: 'pending', output: `target=${input.target}` });
       db.exec('COMMIT');
     } catch (e) {
       try {
@@ -358,7 +386,6 @@ export function createDeployment(db: Database.Database, input: CreateDeploymentI
     }
   };
   run();
-  recordEvent(db, id, { phase: 'pending', event: 'created', status: 'pending', output: `target=${input.target}` });
   const created = getDeployment(db, id);
   if (!created) throw new DeploymentError('INTERNAL', 'deployment creation failed');
   return created;
@@ -383,6 +410,9 @@ export interface TransitionOptions {
  * - Transición no permitida por la tabla → `INVALID_TRANSITION`.
  * - Repetir la transición al estado actual → idempotente (no-op).
  * - Estados terminales fijan `finished_at`.
+ * - Revisión Codex: la actualización de estado y su evento se persisten en
+ *   UNA sola transacción (nunca "estado sin evento"); `deployments.error`
+ *   se sanitiza siempre (se devuelve por la API).
  */
 export function transitionDeployment(
   db: Database.Database,
@@ -408,28 +438,25 @@ export function transitionDeployment(
     }
     const now = nowIso();
     const terminal = isTerminalStatus(to);
+    const errorToPersist =
+      to === 'failed' ? sanitizeDeploymentError(opts.error ?? current.error) : current.error;
     db.prepare(
       `UPDATE deployments SET status=?, updated_at=?, finished_at=COALESCE(finished_at,?), error=?
        WHERE id=?`,
-    ).run(to, now, terminal ? now : null, to === 'failed' ? (opts.error ?? current.error) : current.error, deploymentId);
-    return {
-      record: rowToDeploymentRecord(
-        db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as Record<string, any>,
-      ),
-      repeated: false,
-    };
-  };
-  const { record: next, repeated } = db.transaction(apply)();
-  if (!repeated) {
-    recordEvent(db, deploymentId, {
+    ).run(to, now, terminal ? now : null, errorToPersist, deploymentId);
+    const next = rowToDeploymentRecord(
+      db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as Record<string, any>,
+    );
+    insertEventRow(db, deploymentId, {
       phase: to,
       event: 'transition',
       status: to,
       output: opts.diagnostic ?? null,
       error: to === 'failed' ? (opts.error ?? null) : null,
     });
-  }
-  return next;
+    return { record: next, repeated: false };
+  };
+  return db.transaction(apply)().record;
 }
 
 /** Marca `cancel_requested=1` (persistente). Solo tiene efecto en estados no terminales. */
@@ -437,14 +464,27 @@ export function requestDeploymentCancel(db: Database.Database, deploymentId: str
   const dep = getDeployment(db, deploymentId);
   if (!dep) return null;
   if (!isTerminalStatus(dep.status) && !dep.cancelRequested) {
-    db.prepare('UPDATE deployments SET cancel_requested=1, updated_at=? WHERE id=?').run(nowIso(), deploymentId);
-    recordEvent(db, deploymentId, { phase: dep.status, event: 'cancel_requested', status: dep.status });
+    // Revisión Codex: flag + evento en una sola transacción.
+    db.transaction(() => {
+      db.prepare('UPDATE deployments SET cancel_requested=1, updated_at=? WHERE id=?').run(nowIso(), deploymentId);
+      insertEventRow(db, deploymentId, { phase: dep.status, event: 'cancel_requested', status: dep.status });
+    })();
   }
   return getDeployment(db, deploymentId);
 }
 
-export function isDeploymentCancelRequested(db: Database.Database, deploymentId: string): boolean {
-  const row = db.prepare('SELECT cancel_requested FROM deployments WHERE id=?').get(deploymentId) as
+/**
+ * Revisión Codex (Fase 6): formato interno obligatorio de identificadores
+ * de backup. Antes de tocar live, el orquestador exige: resultado ok +
+ * backupId con este formato + confirmación semántica `backupValidated`
+ * del driver. Sin las tres cosas: `failed`, sin migraciones live.
+ */
+const BACKUP_ID_RE = /^bk_[A-Za-z0-9_-]{1,64}$/;
+export function isValidBackupId(id: string | null | undefined): id is string {
+  return typeof id === 'string' && BACKUP_ID_RE.test(id);
+}
+
+export function isDeploymentCancelRequested(db: Database.Database, deploymentId: string): boolean {  const row = db.prepare('SELECT cancel_requested FROM deployments WHERE id=?').get(deploymentId) as
     | { cancel_requested: number }
     | undefined;
   return !!row && Number(row.cancel_requested) === 1;
@@ -557,16 +597,20 @@ export async function reconcileDeployments(
       }
     }
     const now = nowIso();
-    db.prepare(
-      `UPDATE deployments SET status='failed', updated_at=?, finished_at=?, error=? WHERE id=? AND status=?`,
-    ).run(now, now, 'interrupted by server restart', dep.id, dep.status);
-    recordEvent(db, dep.id, {
-      phase: 'failed',
-      event: 'restart_recovery',
-      status: 'failed',
-      error: 'interrupted by server restart',
-      output: `non-terminal status '${dep.status}' at startup; marked failed without trusting persisted PIDs`,
-    });
+    // Revisión Codex: el UPDATE y su evento van en una sola transacción;
+    // si el evento falla, el deployment NO queda marcado (reintentable).
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE deployments SET status='failed', updated_at=?, finished_at=?, error=? WHERE id=? AND status=?`,
+      ).run(now, now, sanitizeDeploymentError('interrupted by server restart'), dep.id, dep.status);
+      insertEventRow(db, dep.id, {
+        phase: 'failed',
+        event: 'restart_recovery',
+        status: 'failed',
+        error: 'interrupted by server restart',
+        output: `non-terminal status '${dep.status}' at startup; marked failed without trusting persisted PIDs`,
+      });
+    })();
     count += 1;
   }
   return count;
