@@ -169,7 +169,7 @@ describe('B1 timeouts and real abort (revisión Codex)', () => {
 
   it('cancel during promoting with live failure → rollback, never stuck', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       delayMs: { runLiveMigrations: 300 },
@@ -188,7 +188,7 @@ describe('B1 timeouts and real abort (revisión Codex)', () => {
 
   it('timeout during promoting → rollback, never stuck', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { runLiveMigrations: 'hang' } });
     const final = await runPipeline(driver, 'p1', { opTimeoutMs: 200 });
     expect(final.status).toBe('rolled_back');
@@ -239,7 +239,7 @@ describe('B3 error sanitization (revisión Codex)', () => {
 
   it('rollback diagnostics are sanitized too', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       decide: failFirstLiveHealth(),
@@ -263,7 +263,7 @@ describe('B3 error sanitization (revisión Codex)', () => {
 describe('B4 mandatory validated backup (revisión Codex)', () => {
   it('ok backup without backupId → failed, live migrations never run', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     class NoBackupId extends FakeDeploymentDriver {
       override async createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> {
         assertDriverArgs(args);
@@ -280,7 +280,7 @@ describe('B4 mandatory validated backup (revisión Codex)', () => {
 
   it('malformed backupId → failed, live untouched', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, backupId: '../evil' });
     const final = await runPipeline(driver, 'p1');
     expect(final.status).toBe('failed');
@@ -290,7 +290,7 @@ describe('B4 mandatory validated backup (revisión Codex)', () => {
 
   it('missing semantic validation → failed', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     class NoValidation extends FakeDeploymentDriver {
       override async createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> {
         assertDriverArgs(args);
@@ -350,7 +350,7 @@ describe('B6 cleanup matrix (revisión Codex)', () => {
   for (const { name, failOp, expectStop } of matrix) {
     it(`failure in ${name} → full verification cleanup`, async () => {
       addProject('p1');
-      seedRuntime('p1', 'old-img');
+      seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
       const driver = new FakeDeploymentDriver({
         db,
         decide: (op, args) => {
@@ -401,7 +401,7 @@ describe('B7 discardCandidate semantics (revisión Codex)', () => {
 
   it('rollback discards the failed candidate after the rollback health check', async () => {
     addProject('p1');
-    seedRuntime('p1', 'img-old');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, decide: failFirstLiveHealth() });
     const final = await runPipeline(driver, 'p1');
     expect(final.status).toBe('rolled_back');

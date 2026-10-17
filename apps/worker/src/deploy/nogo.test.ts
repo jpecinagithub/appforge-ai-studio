@@ -99,7 +99,7 @@ afterEach(() => {
 describe('N1 independent rollback recovery budget (bloqueo 2)', () => {
   it('pipeline timeout during promoting → rolled_back with slow rollback ops, zero pending', async () => {
     addProject('p1');
-    seedRuntime('p1', 'prev-v1');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       delayMs: {
@@ -139,7 +139,7 @@ describe('N2 mandatory verification-runtime stop (bloqueo 1)', () => {
     ['timeout', { stopVerificationRuntime: 'hang' } as const, { opTimeoutMs: 200 }],
   ])('stopVerificationRuntime=%s tras autenticación correcta → failed, live intacto', async (_label, behavior, extra) => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior });
     const final = await runPipeline(driver, 'p1', { opTimeoutMs: 10_000, ...extra });
     expect(final.status).toBe('failed');
@@ -148,7 +148,7 @@ describe('N2 mandatory verification-runtime stop (bloqueo 1)', () => {
     for (const op of LIVE_OPS) {
       expect(driver.callsOf(op).length).toBe(0);
     }
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     expect(getDeployment(db, final.id)!.status).toBe('failed');
   });
 });
@@ -212,7 +212,7 @@ describe('N4 invalid backup discards the candidate exactly once (bloqueo 3)', ()
   for (const [name, fakeOpts] of cases) {
     it(`backup ${name} → failed, discardCandidate x1, live intacto`, async () => {
       addProject('p1');
-      seedRuntime('p1', 'old-img');
+      seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
       const driver = new FakeDeploymentDriver({ db, ...fakeOpts });
       const final = await runPipeline(driver, 'p1');
       expect(final.status).toBe('failed');
@@ -221,13 +221,13 @@ describe('N4 invalid backup discards the candidate exactly once (bloqueo 3)', ()
       expect(driver.callsOf('runLiveMigrations').length).toBe(0);
       expect(driver.callsOf('stopCurrentLiveRuntime').length).toBe(0);
       expect(driver.callsOf('startCandidateAsLive').length).toBe(0);
-      expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+      expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     });
   }
 
   it('backup inválido + discardCandidate falla → el fallo queda en deployments.error y eventos', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       omitBackupId: true,
@@ -249,7 +249,7 @@ describe('N4 invalid backup discards the candidate exactly once (bloqueo 3)', ()
 describe('N5 verification-database discard failure blocks promoting (bloqueo 3)', () => {
   it('discardVerificationDatabase=fail en flujo correcto → failed, sin promoción, diagnóstico de limpieza', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       behavior: { discardVerificationDatabase: 'fail' },
@@ -263,7 +263,7 @@ describe('N5 verification-database discard failure blocks promoting (bloqueo 3)'
     }
     // El candidato también se descarta (nunca fue live).
     expect(driver.callsOf('discardCandidate').length).toBe(1);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 });
 
@@ -274,7 +274,7 @@ describe('N5 verification-database discard failure blocks promoting (bloqueo 3)'
 describe('N6 atomic live finalization (bloqueo 4)', () => {
   it('el evento de transición a live falla → project_runtime revierte, se conserva la versión anterior', async () => {
     addProject('p1');
-    seedRuntime('p1', 'prev-v1');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     // Trigger que hace fallar exactamente el INSERT del evento de
     // transición a live: la transacción debe revertir también el
     // upsert de project_runtime y el UPDATE de deployments.
@@ -291,7 +291,7 @@ describe('N6 atomic live finalization (bloqueo 4)', () => {
     expect(final.error).toMatch(/injected live-event failure/i);
     // project_runtime conserva la versión anterior: el nuevo runtime NO
     // quedó publicado.
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('prev-v1');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     // Sin evento de transición a live.
     const events = listDeploymentEvents(db, final.id);
     expect(events.some((e) => e.phase === 'live' && e.event === 'transition')).toBe(false);

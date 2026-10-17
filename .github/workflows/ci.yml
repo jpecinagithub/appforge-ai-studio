@@ -74,3 +74,44 @@ jobs:
       - name: Smoke test (server boots and /healthz answers)
         run: node scripts/smoke-test.mjs
         working-directory: templates/dynamic-react-node
+
+  # Fase 7A: driver Docker + pruebas aisladas (CONTRACT.md §9.22).
+  # Construye la plantilla real, levanta contenedores endurecidos en una red
+  # interna propia y verifica backup/restore/rollback. Recursos únicos por
+  # run (APPFORGE_TEST_RUN_ID) y limpieza garantizada en always().
+  # Nunca toca Oracle ni secretos de producción.
+  docker-driver-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APPFORGE_DOCKER_INTEGRATION: strict
+      APPFORGE_TEST_RUN_ID: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/studio/package-lock.json
+
+      - name: Install backend and worker dependencies
+        run: npm ci
+
+      - name: Docker driver integration tests (strict)
+        run: npx vitest run src/docker/integration.test.ts
+        working-directory: apps/worker
+
+      - name: Cleanup Docker test resources (always)
+        if: always()
+        run: |
+          LBL="com.appforge.test-run=${{ github.run_id }}"
+          docker ps -aq --filter "label=$LBL" | xargs -r docker rm -f || true
+          docker ps -aq --filter "label=com.appforge.managed=true" | xargs -r docker rm -f || true
+          docker volume ls -q --filter "label=$LBL" | xargs -r docker volume rm || true
+          docker volume ls -q --filter "label=com.appforge.managed=true" | xargs -r docker volume rm || true
+          docker images -q --filter "label=com.appforge.managed=true" | xargs -r docker rmi -f || true
+          docker network rm "af-test-net-${{ github.run_id }}" 2>/dev/null || true
+          docker volume rm "af-test-data-${{ github.run_id }}" 2>/dev/null || true
