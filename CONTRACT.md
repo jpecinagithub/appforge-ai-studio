@@ -1218,3 +1218,109 @@ También quedan fuera de 7B los endpoints operativos aún no implementados de
 autorización operativa, idempotencia y retención en el entorno real; no se
 simulan ni se publican a medias. Los endpoints de deploy/listado/cancel/runtime
 y preview ya existentes sí quedan conectados y cubiertos en 7B.
+
+### 9.24 Producción Oracle y operación autónoma (Fase 7C — contrato cerrado)
+
+**Objetivo:** convertir el pipeline certificado de 7B en una entrega operable
+en una VM Oracle dedicada: un administrador solicita el despliegue desde el
+Studio y recibe una aplicación dinámica accesible, con autenticación y SQLite
+persistente, sin entrar en el servidor ni ejecutar comandos manuales. 7C no
+relaja ninguna garantía de 5A–7B y no introduce un segundo orquestador.
+
+7C se entrega en tres cortes secuenciales. Ningún corte se considera cerrado
+por documentación o mocks: exige pruebas automatizadas y la evidencia indicada.
+
+#### 7C.1 — Plano de ejecución productivo
+
+1. `infra/docker-compose.yml` deja de publicar el backend directamente. Solo el
+   proxy de borde expone 80/443; `studio` queda en una red de control y en la
+   red interna `appforge-apps`. Los contenedores generados no publican puertos,
+   solo pertenecen a `appforge-apps`, y nunca reciben el socket, el volumen del
+   Studio ni secretos del Studio.
+2. La imagen del Studio incluye un cliente Docker versionado y ejecuta el
+   backend como usuario no root. El único componente con acceso de escritura al
+   socket es el backend/orquestador. Se documenta expresamente que ese acceso
+   equivale a privilegio de host; por tanto 7C requiere una VM dedicada, API de
+   administración autenticada y ningún código generado ejecutándose dentro del
+   proceso del Studio.
+3. `DATA_DIR`, base SQLite del Studio, snapshots, manifiestos, backups y env de
+   runtime viven en almacenamiento persistente. Los secretos llegan mediante
+   un fichero 0600 no versionado; no aparecen en imagen, Git, ZIP, logs, eventos
+   ni respuestas HTTP. El arranque falla cerrado si faltan token administrador,
+   rutas persistentes, permisos, red, volumen, socket o preflight 7A.
+4. Healthchecks de Studio, proxy y runtime; política de reinicio; rotación y
+   límites de logs; límites CPU/RAM/PIDs; `no-new-privileges`; filesystem de
+   Studio de solo lectura salvo temporales y datos declarados. El apagado espera
+   operaciones en curso dentro de un presupuesto y la reconciliación posterior
+   conserva la semántica de Fase 6.
+5. Caddy publica `/api/*` y `/a/*` hacia el Studio. El dominio configurable y
+   TLS automático se admiten cuando DNS ya apunta a la VM; para certificar el
+   núcleo basta una URL HTTP/IP de Oracle. Nunca se genera un certificado falso
+   ni se afirma que un dominio está activo sin comprobarlo externamente.
+
+#### 7C.2 — Operación administrada y UI
+
+1. Se completan los endpoints de §9.20 para migración pendiente, backup manual
+   y rollback manual reutilizando el driver real y el mismo bloqueo global por
+   proyecto. No aceptan comandos, rutas, imágenes, hosts ni nombres Docker del
+   cliente.
+2. Toda mutación exige autenticación administrativa y `Idempotency-Key` con
+   formato y longitud limitados. La clave, el actor, la operación, el proyecto,
+   el resultado y las fechas quedan en un registro de auditoría persistente.
+   Repetir la misma clave y payload devuelve el resultado original; reutilizarla
+   con otro payload devuelve `409 IDEMPOTENCY_CONFLICT`.
+3. Backup manual devuelve un identificador opaco y metadatos, nunca una ruta del
+   host. Solo cuenta como correcto tras manifiesto, checksums y `quick_check`.
+   La retención reutiliza la protección de 7A y falla cerrada si no puede
+   calcular los backups protegidos.
+4. Rollback manual crea un deployment nuevo y auditable, requiere imagen y
+   backup anterior coherentes, serializa contra deploy/migración/backup, restaura
+   físicamente, arranca, verifica health y flujo autenticado, y solo entonces
+   actualiza `project_runtime`. Ante fallo conserva o recupera el último live
+   sano; nunca publica un rollback parcial.
+5. La UI muestra capacidad del driver, estado/fase, historial, diagnóstico
+   sanitizado, URL live y acciones permitidas. Deshabilita operaciones
+   incompatibles y explica el motivo; la UI no es autoridad y el servidor
+   repite todas las comprobaciones. No se muestra un éxito hasta confirmar el
+   estado terminal persistido.
+
+#### 7C.3 — Certificación en Oracle
+
+1. Instalación reproducible desde un commit y tag exactos, con preflight que no
+   imprime secretos. La ejecución genera un paquete de evidencia sanitizado y
+   versionable: versiones, commit, configuración no sensible, checks y marcas
+   temporales; nunca `.env`, cookies, tokens ni datos personales.
+2. Recorrido E2E obligatorio desde navegador y API: crear proyecto dinámico,
+   generar, obtener los seis receipts, desplegar, abrir `/a/:projectId/`,
+   registrar usuario, iniciar/cerrar sesión y completar CRUD persistente.
+3. Segundo despliegue con migración compatible conserva usuario y datos.
+   Se provoca después un fallo controlado tras el backup para demostrar rollback
+   físico: vuelve la versión previa sana y se mantienen los datos anteriores.
+4. Reinicio real de `studio`, proxy y VM: reconciliación correcta, aplicación
+   accesible y datos persistentes. Se prueba además cancelación, concurrencia,
+   límite de respuesta, aislamiento entre dos proyectos y rechazo de recursos
+   Docker ajenos.
+5. La aceptación exige tres recorridos consecutivos completos sobre Oracle,
+   todos desde estado conocido, sin reparación manual entre pasadas. Cada pasada
+   conserva su evidencia, IDs y resultados. Un rerun o intervención se declara;
+   nunca se sustituye silenciosamente una pasada fallida.
+
+#### Puertas de aceptación y exclusiones
+
+- CI de PR y CI post-merge: `verify`, plantilla Ubuntu/Windows e integración
+  Docker estricta verdes en intento 1. Se añade validación estática del compose
+  productivo y un smoke test Linux sin secretos reales.
+- Pruebas negativas obligatorias: socket ausente/solo lectura, daemon caído,
+  red o volumen ajenos, token ausente, secretos con permisos inseguros, segundo
+  deployment concurrente, clave idempotente conflictiva, backup corrupto,
+  rollback sin anterior y reinicio durante una operación.
+- La activación continúa detrás de los kill switches de §9.22. `disabled` o
+  preflight fallido mantienen el Studio disponible y devuelven 501 sin crear ni
+  modificar deployments o recursos Docker.
+- 7C no compra dominios, no acepta términos externos, no contrata servicios y
+  no incorpora pagos, correo corporativo, multi-host, Kubernetes, PostgreSQL,
+  alta disponibilidad ni restauración fuera de la VM. Son trabajos posteriores
+  y no bloquean la certificación por IP/URL de Oracle.
+- No se fusiona ni etiqueta 7C hasta revisión final del PR, CI verde y evidencia
+  Oracle completa. Si no hay acceso autorizado a Oracle, el código puede quedar
+  listo para revisión, pero 7C permanece **no certificada**.
