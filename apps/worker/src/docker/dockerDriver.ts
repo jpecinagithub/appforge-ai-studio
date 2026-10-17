@@ -544,42 +544,76 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (receiptFp && sourceFingerprint(projectDir) !== receiptFp) {
         return err('RECEIPT_FINGERPRINT_MISMATCH', 'project sources changed after the verification gate');
       }
+      // Idempotencia antes de tocar el snapshot.
+      const manifestPath = path.join(this.snapshotDir(deploymentId), '.appforge-manifest.json');
+      if (fs.existsSync(manifestPath)) {
+        // El snapshot ya existe: re-verificar (lanza si fue manipulado).
+        const fp = verifySnapshot(this.snapshotDir(deploymentId));
+        const reused = await this.reuseBuiltImage(projectId, deploymentId, fp);
+        if (reused) return reused;
+        // Snapshot verificado pero imagen ausente: reconstruir desde él.
+        return await this.buildFromSnapshot(args, this.snapshotDir(deploymentId), fp);
+      }
       const snap = createSnapshot({ projectDir, snapshotsRoot: this.snapshotsRoot(), deploymentId });
       this.persistSnapshot(deploymentId, snap.fingerprint, snap.dir);
       // Re-verificación TOCTOU inmediatamente antes del build.
       if (verifySnapshot(snap.dir) !== snap.fingerprint) {
         return err('SNAPSHOT_TAMPERED', 'snapshot changed between creation and build');
       }
-      const dockerfile = path.join(snap.dir, 'Dockerfile');
-      if (!fs.existsSync(dockerfile) || !fs.statSync(dockerfile).isFile()) {
-        return err('DOCKERFILE_MISSING', 'controlled Dockerfile not found in snapshot');
-      }
-      const names = this.names(projectId, deploymentId);
-      const labels = this.opLabels(projectId, deploymentId, 'live');
-      // Idempotencia: imagen ya construida con labels exactas.
-      if (await resourceExists(this.runner, 'image', names.image)) {
-        return this.validateImage(names.image, labels);
-      }
-      const buildArgs = ['build', '-t', names.image, ...labelArgs(labels), '-f', 'Dockerfile', snap.dir];
-      assertNoForbiddenFlags(buildArgs);
-      const b = await this.sh(buildArgs, { timeoutMs: BUILD_TIMEOUT_MS, signal: args.signal, maxOutputBytes: 2_097_152 });
-      if (b.aborted) {
-        await this.sh(['rmi', names.image], { timeoutMs: 60_000 }).catch(() => undefined);
-        return err('OPERATION_ABORTED', 'buildCandidate aborted; partial image removed');
-      }
-      if (b.timedOut) {
-        await this.sh(['rmi', names.image], { timeoutMs: 60_000 }).catch(() => undefined);
-        return err('BUILD_TIMEOUT', `docker build timed out: ${b.stderr.slice(0, 300)}`);
-      }
-      if (b.code !== 0) {
-        return err('BUILD_FAILED', `docker build failed (code ${b.code}): ${(b.stdout + '\n' + b.stderr).slice(0, 800)}`);
-      }
-      return await this.validateImage(names.image, labels);
+      return await this.buildFromSnapshot(args, snap.dir, snap.fingerprint);
     } catch (e) {
       if (e instanceof SnapshotError) return err('SNAPSHOT_FAILED', `${e.code}: ${e.message}`);
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('BUILD_ERROR', (e as Error).message);
     }
+  }
+
+  /**
+   * Idempotencia de build: si el snapshot ya existe y la imagen está
+   * construida con labels exactas, se reutiliza sin reconstruir.
+   * Llamar antes de createSnapshot.
+   */
+  private async reuseBuiltImage(
+    projectId: string,
+    deploymentId: string,
+    fp: string,
+  ): Promise<DriverResult | null> {
+    const names = resourceNames(projectId, deploymentId, fp);
+    const labels: ManagedLabels = { projectId, deploymentId, role: 'live', fingerprint: fp };
+    if (await resourceExists(this.runner, 'image', names.image)) {
+      return this.validateImage(names.image, labels);
+    }
+    return null;
+  }
+
+  /** Construye la imagen desde un snapshot ya verificado. */
+  private async buildFromSnapshot(
+    args: DriverOpArgs,
+    snapDir: string,
+    fp: string,
+  ): Promise<DriverResult> {
+    const { deploymentId, projectId } = args;
+    const dockerfile = path.join(snapDir, 'Dockerfile');
+    if (!fs.existsSync(dockerfile) || !fs.statSync(dockerfile).isFile()) {
+      return err('DOCKERFILE_MISSING', 'controlled Dockerfile not found in snapshot');
+    }
+    const names = resourceNames(projectId, deploymentId, fp);
+    const labels: ManagedLabels = { projectId, deploymentId, role: 'live', fingerprint: fp };
+    const buildArgs = ['build', '-t', names.image, ...labelArgs(labels), '-f', 'Dockerfile', snapDir];
+    assertNoForbiddenFlags(buildArgs);
+    const b = await this.sh(buildArgs, { timeoutMs: BUILD_TIMEOUT_MS, signal: args.signal, maxOutputBytes: 2_097_152 });
+    if (b.aborted) {
+      await this.sh(['rmi', names.image], { timeoutMs: 60_000 }).catch(() => undefined);
+      return err('OPERATION_ABORTED', 'buildCandidate aborted; partial image removed');
+    }
+    if (b.timedOut) {
+      await this.sh(['rmi', names.image], { timeoutMs: 60_000 }).catch(() => undefined);
+      return err('BUILD_TIMEOUT', `docker build timed out: ${b.stderr.slice(0, 300)}`);
+    }
+    if (b.code !== 0) {
+      return err('BUILD_FAILED', `docker build failed (code ${b.code}): ${(b.stdout + '\n' + b.stderr).slice(0, 800)}`);
+    }
+    return await this.validateImage(names.image, labels);
   }
 
   async prepareVerificationDatabase(args: DriverOpArgs): Promise<DriverResult> {
@@ -688,11 +722,41 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
+  /** Crea el volumen live con labels si falta (sin él, `docker run -v` lo
+   * autocrearía SIN labels y quedaría fuera del inventario managed). */
+  private async ensureLiveVolume(
+    projectId: string,
+    deploymentId: string,
+    signal?: AbortSignal,
+  ): Promise<DriverResult | null> {
+    const names = this.names(projectId, deploymentId);
+    const labels = this.opLabels(projectId, deploymentId, 'live');
+    if (await resourceExists(this.runner, 'volume', names.liveVolume)) {
+      const info = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+        Labels?: Record<string, string>;
+      };
+      try {
+        assertLabelsMatch(info?.Labels, labels);
+      } catch {
+        return err('FOREIGN_RESOURCE', `refusing to use volume '${names.liveVolume}' with non-matching labels`);
+      }
+      return null;
+    }
+    const c = await this.sh(['volume', 'create', ...labelArgs(labels), names.liveVolume], {
+      timeoutMs: 30_000,
+      signal,
+    });
+    if (c.code !== 0) return err('VOLUME_CREATE_FAILED', c.stderr.slice(0, 300));
+    return null;
+  }
+
   async runLiveMigrations(args: DriverOpArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     try {
       const names = this.names(args.projectId, args.deploymentId);
+      const v = await this.ensureLiveVolume(args.projectId, args.deploymentId, args.signal);
+      if (v) return v;
       return await this.runMigrations(args, names.liveVolume, 'migration', MIGRATION_TIMEOUT_MS);
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
@@ -1050,6 +1114,8 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     try {
       const names = this.names(args.projectId, args.deploymentId);
       const labels = this.opLabels(args.projectId, args.deploymentId, 'live');
+      const v = await this.ensureLiveVolume(args.projectId, args.deploymentId, args.signal);
+      if (v) return v;
       if (await resourceExists(this.runner, 'container', names.liveContainer)) {
         await this.assertLiveSlot(args.projectId, names.liveContainer);
         if (await this.containerRunning(names.liveContainer)) {

@@ -43,10 +43,10 @@ describe('argv validation (lista cerrada)', () => {
   test('rejects empty argv', async () => {
     await expect(r.run({ args: [] })).rejects.toThrowError(DockerCommandError);
   });
-  test.each([['system', 'prune'], ['exec'], ['compose'], ['swarm'], ['context']])(
+  test.each([['system', 'prune'], ['exec'], ['compose'], ['swarm'], ['context']] as string[][])(
     'rejects free subcommand %s',
-    async (sub) => {
-      await expect(r.run({ args: [sub] })).rejects.toMatchObject({ code: 'COMMAND_NOT_ALLOWED' });
+    async (...sub) => {
+      await expect(r.run({ args: sub })).rejects.toMatchObject({ code: 'COMMAND_NOT_ALLOWED' });
     },
   );
   test.each([['volume', 'prune'], ['network', 'prune']])('rejects %s prune', async (a, b) => {
