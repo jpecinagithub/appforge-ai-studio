@@ -1052,6 +1052,67 @@ volumen sin labels → rechazados sin mutar; volumen live ajeno sobrevive a
 labels exactas antes del `rmi`); poda con scope no toca otros proyectos;
 `live_image`/`previous_image` sobreviven; validación `inspect` completa.
 
+**Regresiones NO-GO 2** (`dockerDriverRegressions.test.ts`, stub sin daemon;
+`hardening.test.ts` para el vector del temporal): retención con >10
+backups y protegidos reales; volumen huérfano con/sin datos y con labels
+ajenas; `docker cp`/`quick_check` fallando tras detener el live (se
+re-levanta con health o se informa `BACKUP_RECOVERY_FAILED`); staging
+ajeno; `hadDatabase` no booleano o inconsistente con `files`; fallo
+inyectado en `volume create`, copia a live y verificación final (la
+compensación devuelve los bytes originales y `startPreviousVersion`
+arranca sana); imagen anterior ajena/incompleta; arquitectura distinta a
+la del daemon; red adicional; `PidMode`/`IpcMode` no permitidos;
+`Devices` ausente/no vacío; `verified_source_fingerprint` ausente, NULL,
+vacío, malformado o distinto.
+
+**Revisión Codex (NO-GO 2) — 6 bloqueos corregidos** (rama
+`fase7-docker-oracle-driver`, sin merge/tag/7B):
+
+1. **Retención real de backups**: `createLiveBackup` pasa `protectedIds` a
+   `enforceRetention`, leídos de SQLite (`protectedBackupIds`): backups de
+   deployments activos (no terminales, incluido rollback pendiente) y del
+   último despliegue `live`. El test antes titulado "backups protegidos"
+   probaba imágenes: renombrado a "imágenes protegidas…"; la retención de
+   backups se prueba con >10 directorios reales.
+2. **Primer despliegue seguro**: "contenedor live ausente" NO equivale a
+   primer despliegue. `hadDatabase=false` solo si no hay
+   `previousLiveVersion`, ni contenedor live, ni volumen live con datos. Un
+   volumen live huérfano se verifica con `assertLiveVolumeLabels` y se
+   respalda con un contenedor temporal endurecido
+   (`hardenedTempVolumeArgs`: usuario 1001, read-only, tmpfs, cap-drop ALL,
+   no-new-privileges, límites, `--network=none`, sin labels de managed).
+   Si el backup falla o se aborta DESPUÉS de detener el live,
+   `recoverStoppedLive` re-levanta el contenedor y verifica health antes de
+   devolver el error original; si la recuperación falla →
+   `BACKUP_RECOVERY_FAILED` (se informa, no se oculta).
+3. **Restore failure-safe**: un staging preexistente se inspecciona con
+   labels exactas antes de eliminarlo (ajeno → `FOREIGN_RESOURCE`, el
+   staging sobrevive). `validateBackupForRestore` exige `hadDatabase`
+   booleano, `false ⇒ files=[]` y `true ⇒ app.db` presente. Antes de tocar
+   el live se rescatan sus datos a un temporal del host
+   (`rescueLiveVolume`); si algo falla tras eliminar el live,
+   `compensateRestoreFailure` recrea el volumen con labels estables,
+   devuelve los datos rescatados y verifica checksums + `quick_check`. El
+   contenedor no se arranca en la compensación: lo hace
+   `startPreviousVersion`.
+4. **Identidad de `previousLiveVersion`**: `startPreviousVersion`
+   inspecciona la imagen ANTES de ejecutarla y exige `managed=true`,
+   `project-id` exacto del proyecto, `deployment-id` UUID válido, `role`
+   `live` y `source-fingerprint` válido (una imagen de otro proyecto se
+   rechaza aunque el nombre tenga formato válido). El nuevo contenedor live
+   usa las labels REALES de la imagen anterior, no las del deployment
+   fallido.
+5. **Hardening exacto** (`validateRunningContainer`): la arquitectura de la
+   imagen debe coincidir EXACTAMENTE con la del daemon/host detectada en
+   preflight (`detectDaemonArchitecture`, `normalizeArch`); exactamente UNA
+   red (la configurada); `PidMode`/`IpcMode` solo con los valores exactos
+   permitidos (`''`/`'private'`); `Devices` explícitamente vacío (ausente
+   → rechazado).
+6. **Snapshot fail closed**: `reuseSnapshot` rechaza
+   `verified_source_fingerprint` ausente, NULL, vacío, malformado o
+   distinto (`SNAPSHOT_SOURCE_FP_INVALID` / `SNAPSHOT_SOURCE_MISMATCH`); no
+   basta con comprobarlo solo cuando sea truthy.
+
 **Archivos de 7A** (inventario):
 `apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
 `apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),
