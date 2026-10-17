@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { FileNode, ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
+import type { DeploymentDriver } from './deploy/driver.js';
 import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
 import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
@@ -64,6 +65,13 @@ export interface ToolContext {
    * (the published preview through the Studio proxy).
    */
   studioBaseUrl?: string;
+  /**
+   * Deployment driver for the Fase 6 pipeline (deploy_project tool).
+   * Explicitly configured only; never a default. When absent, the
+   * deploy_project tool refuses with DEPLOYMENT_DRIVER_NOT_CONFIGURED
+   * instead of simulating a real deployment.
+   */
+  deploymentDriver?: DeploymentDriver;
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;

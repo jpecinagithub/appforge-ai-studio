@@ -15,6 +15,9 @@ export {
   runLive,
   invalidateDynamicChecks,
   dynamicGateStatus,
+  persistedDynamicGateStatus,
+  checkScopeFingerprint,
+  recordDynamicCheckForTest,
 } from './dynamicTools.js';
 export type { DynamicCheckKey, ProcResult } from './dynamicTools.js';
 export { runAgentOnce } from './agent.js';
@@ -35,3 +38,48 @@ export {
 export type { PreviewStatus, PreviewRow } from './previewManager.js';
 export { resolveAreaPath, AREA_NAMES } from './dynamicAreas.js';
 export type { DynamicArea } from './dynamicAreas.js';
+export {
+  DeploymentError,
+  createDeployment,
+  getDeployment,
+  getActiveDeployment,
+  listDeployments,
+  listDeploymentEvents,
+  transitionDeployment,
+  finalizeLiveDeployment,
+  recordEvent,
+  requestDeploymentCancel,
+  isDeploymentCancelRequested,
+  getProjectRuntime,
+  upsertProjectRuntime,
+  reconcileDeployments,
+  isDeploymentStatus,
+  isTerminalStatus,
+  NON_TERMINAL_STATUSES,
+  TERMINAL_STATUSES,
+  MAX_EVENT_OUTPUT_CHARS,
+  MAX_DEPLOYMENT_LOGS_CHARS,
+  MAX_ERROR_CHARS,
+  sanitizeDeploymentError,
+  isValidBackupId,
+} from './deploy/stateMachine.js';
+export type { DeploymentRecord, DeploymentEvent, DeploymentEventInput, ProjectRuntimeRecord } from './deploy/stateMachine.js';
+export { FakeDeploymentDriver, assertDriverArgs, FAKE_OP_NAMES } from './deploy/driver.js';
+export type {
+  DeploymentDriver,
+  DriverOpArgs,
+  DriverResult,
+  FakeCall,
+  FakeDriverOptions,
+  FakeOpBehavior,
+  FakeOpName,
+} from './deploy/driver.js';
+export { runDeploymentPipeline, SUPPORTED_DEPLOY_TARGETS } from './deploy/orchestrator.js';
+export type { RunDeploymentOptions, VerificationGateResult } from './deploy/orchestrator.js';
+export {
+  ensureVerificationReceiptsTable,
+  recordVerificationReceipt,
+  deleteVerificationReceipts,
+  listVerificationReceipts,
+} from './deploy/receipts.js';
+export type { VerificationReceipt } from './deploy/receipts.js';

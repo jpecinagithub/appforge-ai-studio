@@ -713,10 +713,15 @@ donde se indica (`400 INVALID_TYPE` en otro caso).
 - `GET /api/projects/:id/migrations` → `{"items":[MigrationRecord]}`
   (desc por versión)
 - `POST /api/projects/:id/deploy` body `{target:'oracle'}`
-  → `202 DeploymentInfo` (pipeline §9.13; `409` si hay deploy no
-  terminal; proyecto `static` → `501 {"error":{"code":"PHASE_3"}}`)
+  → `202 DeploymentInfo` (pipeline §9.21; `409` si hay deploy no terminal
+  o si la puerta 5A/5B no está vigente; proyecto `static` →
+  `400 INVALID_TYPE`; target ≠ `oracle` → `400 INVALID_TARGET`; sin
+  driver real configurado → `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`, sin
+  simular nada)
 - `GET /api/projects/:id/deployments` → `{"items":[DeploymentInfo]}` (desc)
 - `GET /api/deployments/:deploymentId` → `DeploymentInfo`
+- `POST /api/deployments/:deploymentId/cancel` → `DeploymentInfo`
+  (`cancel_requested` persistente; `404` si no existe)
 - `POST /api/projects/:id/rollback` → `DeploymentInfo` (nuevo registro;
   `409` si no hay `previous_image` o no hay backup pre-migración)
 - `POST /api/projects/:id/database/backup`
@@ -744,3 +749,157 @@ interface AppHealth { ok:boolean; version:string; }
 interface AuthUser { id:string; email:string; displayName:string|null;
   createdAt:string; }
 ```
+
+### 9.21 Pipeline de despliegue: Fase 6 (orquestador) vs Fase 7 (Docker/Oracle)
+
+Fase 6 implementa el **orquestador persistente** del pipeline con un
+**adaptador falso determinista**. Fase 7 añadirá el controlador Docker
+real, el despliegue en Oracle y el aislamiento definitivo. Nada de la
+Fase 6 ejecuta Docker, toca Oracle, monta el socket Docker, llama a
+Vercel ni modifica producción.
+
+**Fase 6 — hecho:**
+- Máquina de estados cerrada (`apps/worker/src/deploy/stateMachine.ts`):
+  `pending → building → migrating → verifying → promoting → live`, más
+  `failed`/`rolled_back`/`cancelled`. Tabla explícita de transiciones;
+  estados arbitrarios imposibles desde HTTP, tools o adaptadores;
+  transición persistida ANTES de invocar al driver; fecha/fase/resultado/
+  diagnóstico por transición; `updated_at`; error estable
+  (`INVALID_TRANSITION`/`INVALID_STATE`); idempotencia al repetir.
+  Sin `promoting → cancelled`: la cancelación en la sección crítica
+  completa una promoción segura o ejecuta el rollback.
+- Persistencia no destructiva (migraciones aditivas en `db.ts`):
+  `deployments` ampliada (`candidate_id`, `previous_live_version`,
+  `backup_id`, `cancel_requested`, `started_at`, `updated_at`,
+  `finished_at`, `error`); tabla append-only `deployment_events`
+  (`deployment_id, seq, phase, event/status, started_at, finished_at,
+  duration_ms, output, error`); tabla `project_runtime`; índice único
+  parcial que impide dos deployments no terminales por proyecto
+  (carrera → `409 DEPLOYMENT_ACTIVE`).
+- `DeploymentDriver` (`apps/worker/src/deploy/driver.ts`): interfaz
+  cerrada y agnóstica de Docker con operaciones semánticas tipadas
+  (`buildCandidate`, `prepareVerificationDatabase`,
+  `runVerificationMigrations`, `discardVerificationDatabase`,
+  `startVerificationRuntime`, `runHealthCheck`, `runAuthenticatedVerification`,
+  `stopVerificationRuntime`, `createLiveBackup`, `runLiveMigrations`,
+  `stopCurrentLiveRuntime`, `startCandidateAsLive`, `restoreBackup`,
+  `startPreviousVersion`, `discardCandidate`, `reconcileRuntime`). Sin
+  comandos/shell/rutas/nombres de contenedor del LLM: identificadores
+  derivados internamente y validados. El adaptador nunca muta el estado;
+  solo el orquestador decide transiciones. El LLM no accede al driver.
+  `discardCandidate` es SOLO para candidatos fallidos/no promocionados:
+  nunca se llama tras una promoción correcta (el candidato ES el live).
+- Solo existe `FakeDeploymentDriver`: configurable por operación
+  (éxito/fallo/timeout), con retardos, hooks y compuertas manuales;
+  observa el estado persistido durante cada llamada. No hay
+  `DockerDeploymentDriver` todavía.
+- Orquestador (`apps/worker/src/deploy/orchestrator.ts`): orden fijo;
+  fallos según §9.13 adaptado al fake (rollback exactamente una vez, sin
+  bucles; `project_runtime` solo tras health live; nunca dos live según
+  el estado persistido); `cancel_requested` persistente comprobado antes
+  de cada fase, tras operaciones largas y antes de `promoting`;
+  recuperación al arranque (`failed` + `error='interrupted by server
+  restart'` + reconciliación abstracta del driver; sin confiar en PIDs).
+- API §9.20 (driver solo vía `ServerOptions`, nunca por defecto).
+- Tool `deploy_project` (solo dynamic, cero parámetros libres, delega en
+  el orquestador, rechaza sin driver real, no expone transiciones, no
+  toca el kill switch de 5B).
+- Logs sanitizados (`sanitizeSecrets`), tope por evento (4 000) y por
+  deployment (20 000) con indicador explícito de truncado; sin secretos,
+  cookies, tokens, `.env` ni `Authorization`. `deployments.error`
+  (devuelto por la API) se sanitiza y limita a 4 000 caracteres: cubre
+  errores del driver, excepciones, rollback y reconciliación.
+
+**Revisión Codex (2026-10-17) — 10 bloqueos corregidos sobre el PR #10:**
+1. **Timeouts y cancelación real.** `DeploymentDriver` acepta
+   `AbortSignal` por operación; el driver debe abortar el trabajo real y
+   resolver su promesa al abortar. El orquestador crea un
+   `AbortController` por operación con timeout por operación (defecto
+   10 min), timeout total del pipeline (defecto 20 min, §9.18) y sondeo
+   de `cancel_requested`; tras el abort ESPERA a la operación (nunca
+   `Promise.race` con trabajo en segundo plano). Pre-promoting la
+   cancelación interrumpe operaciones bloqueadas → `cancelled`; en
+   `promoting` la cancelación no aborta (promoción segura o rollback) y
+   los timeouts disparan rollback. Todo termina en estado terminal con
+   limpieza y sin operaciones en vuelo.
+2. **Puerta persistida autoritativa.** Tabla `verification_receipts`
+   (`project_id, check_key, fingerprint, seq, created_at`). Las
+   herramientas 5A/5B persisten el receipt al completar (con `seq` =
+   índice canónico) y las mutaciones los invalidan igual que el gate en
+   memoria (también con el estado en memoria vacío). `POST
+   /api/projects/:id/deploy` exige los seis receipts vigentes sobre las
+   fuentes actuales y en orden canónico; si no → `409 VERIFICATION_GATE`.
+   La aproximación anterior (último build + migraciones) queda eliminada.
+3. **Sanitización de error.** Todo `deployments.error` se sanitiza y
+   limita antes de persistir.
+4. **Backup obligatorio y validado.** Antes de tocar live se exige:
+   resultado ok + `backupId` con formato interno `bk_[A-Za-z0-9_-]{1,64}`
+   + `backupValidated='true'` del driver. Si falta o es inválido →
+   `failed`, `runLiveMigrations` nunca se ejecuta, live intacto.
+5. **Rollback sin versión anterior.** `rolled_back` solo si existía
+   `previousLiveVersion`, fue arrancada y pasó health. Sin versión
+   anterior: se restaura el backup cuando corresponda, se limpia el
+   candidato y se termina en `failed` (nunca health ficticio).
+6. **Limpieza de recursos.** `cleanup()` inspecciona cada `DriverResult`,
+   registra los fallos de limpieza como eventos y los conserva en el
+   diagnóstico final. Matriz completa en migrating/verifying
+   (`stopVerificationRuntime` + `discardVerificationDatabase` +
+   `discardCandidate` según corresponda).
+7. **`discardCandidate`.** Renombrado desde `removeCandidate` con
+   semántica estricta documentada; tras rollback se descarta el candidato
+   fallido; tras promoción correcta jamás se elimina la versión live.
+8. **Atomicidad estado+eventos.** Creación `pending` + evento `created`,
+   transición + evento, `cancel_requested` + evento y recuperación tras
+   reinicio + evento van cada uno en UNA sola transacción.
+9. **CI flaky.** `runLive` chequea `isCancelled()` de forma síncrona
+   antes de spawnear: `cancellation produces BUILD_CANCELLED` ya no
+   depende del poll de 250 ms.
+10. **Documentación de Vercel.** El reporte corrige la afirmación: el PR
+   activó automáticamente el Vercel Preview Check (integración
+   GitHub→Vercel del repo); no hubo intervención manual ni promoción
+   consciente a producción.
+
+**Revisión final de Codex (NO-GO, 4 bloqueos; corregidos en el mismo
+PR #10, sin fusionar):**
+1. **`stopVerificationRuntime` como precondición obligatoria de
+   promoting.** Tras una verificación correcta, detener el runtime es
+   obligatorio: cualquier resultado no-ok (fallo, excepción, timeout o
+   abort —incluido por cancelación—) impide ejecutar el backup o tocar
+   live. Termina en `failed`, ejecuta la limpieza restante
+   (`discardVerificationDatabase` + `discardCandidate`) y conserva todos
+   los fallos en el diagnóstico, porque no se puede garantizar que el
+   runtime haya desaparecido. El warning-y-continúa queda eliminado.
+2. **Presupuesto de recuperación independiente para el rollback.**
+   `rollbackTimeoutMs` (defecto 5 min, configurable en
+   `RunDeploymentOptions`): el rollback ya no depende del deadline
+   global del pipeline (puede estar vencido). Mantiene `AbortSignal`
+   por operación y espera la terminación real; un timeout global
+   durante `promoting` permite igualmente restaurar una versión
+   anterior sana (causa de abort `rollback-timeout`).
+3. **Consumo total de `cleanup()`.** Un backup inválido (fallido, sin
+   `backupId`, ID inválido o sin validación) descarta el candidato
+   exactamente una vez; si el descarte falla, queda en
+   `deployments.error` y en los eventos. Si
+   `discardVerificationDatabase` falla tras una verificación correcta,
+   no se entra en `promoting`: `failed` con el fallo de limpieza en el
+   diagnóstico. Ningún resultado de limpieza se traga en silencio.
+4. **Finalización correcta atómica.** `finalizeLiveDeployment()`:
+   `project_runtime` + transición a `live` + evento, todo en UNA sola
+   transacción SQLite. Si falla cualquiera de las escrituras, el nuevo
+   runtime no queda publicado (revierte todo; el deployment termina en
+   `failed` vía catch-all). Idempotente si ya está en `live`.
+
+**Fase 7 — pendiente (exclusiones expresas de Fase 6):**
+`DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
+socket Docker; red `appforge-apps`; límites CPU/RAM/PIDs reales;
+contenedores de verificación reales; backup real de SQLite live;
+migraciones sobre producción; promoción real; proxy hacia contenedor
+live; despliegue en Oracle; cambios nginx; DNS/dominio/certificados;
+publicación en Vercel; captura final de biblioteca; recorridos reales
+en Oracle. Los §9.13/§9.14/§9.15 describen ese objetivo con Docker; la
+Fase 6 implementa la misma máquina de estados y semántica contra el
+fake driver.
+
+**Sin UI de despliegue en Fase 6:** no hay botón que prometa despliegue
+real a Oracle. Cuando la infraestructura no está configurada, la API
+responde `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`.

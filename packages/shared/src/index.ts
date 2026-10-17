@@ -108,6 +108,33 @@ export interface DeploymentInfo {
   url: string | null;
   createdAt: string;
   logs: string | null;
+  /** Fase 6 (CONTRACT.md §9.21): identificador del candidato derivado internamente. */
+  candidateId: string | null;
+  /** Fase 6: versión live anterior, cuando existía. */
+  previousLiveVersion: string | null;
+  /** Fase 6: backup pre-migración asociado, cuando corresponda. */
+  backupId: string | null;
+  /** Fase 6: cancelación solicitada (persistente). */
+  cancelRequested: boolean;
+  startedAt: string | null;
+  updatedAt: string | null;
+  finishedAt: string | null;
+  /** Fase 6: error estructurado del despliegue. */
+  error: string | null;
+}
+
+/** Fase 6: evento append-only del historial exacto de un deployment. */
+export interface DeploymentEvent {
+  seq: number;
+  phase: string;
+  event: string;
+  status: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  output: string | null;
+  error: string | null;
+  createdAt: string;
 }
 
 // ---------------------------------------------------------------------------
