@@ -91,6 +91,16 @@ class StubDocker {
   inspectLabelOverride = new Map<string, Record<string, string>>();
   /** Arquitectura que `docker info --format '{{.Architecture}}'` reporta (defecto: x86_64). */
   daemonArch = 'x86_64';
+  /**
+   * Fallos inyectados (NO-GO 2): el primer patrón que case con el prefijo
+   * del argv devuelve el resultado indicado UNA vez y se consume.
+   */
+  faults: Array<{ prefix: string[]; result: 'fail' | 'aborted'; stderr: string }> = [];
+
+  /** Inyecta un fallo en la próxima llamada cuyo argv empiece por `prefix`. */
+  failNext(prefix: string[], result: 'fail' | 'aborted' = 'fail', stderr = 'injected failure'): void {
+    this.faults.push({ prefix, result, stderr });
+  }
 
   private deepCopy<T>(v: T): T {
     return JSON.parse(JSON.stringify(v)) as T;
@@ -106,6 +116,15 @@ class StubDocker {
   async run(options: DockerRunOptions): Promise<DockerRunResult> {
     const args = options.args;
     this.calls.push([...args]);
+    // Fallo inyectado (se consume una sola vez).
+    const faultIdx = this.faults.findIndex((f) => f.prefix.every((p, i) => args[i] === p));
+    if (faultIdx >= 0) {
+      const [fault] = this.faults.splice(faultIdx, 1);
+      if (fault.result === 'aborted') {
+        return { ...this.okRes(), code: null, aborted: true };
+      }
+      return this.failRes(1, fault.stderr);
+    }
     const [sub, second] = args;
     const last = args[args.length - 1]!;
 
@@ -1507,5 +1526,212 @@ describe('NO-GO2 B4: identidad de previousLiveVersion antes de ejecutar', () => 
     expect(labels['com.appforge.source-fingerprint']).toBe(FP);
     expect(labels['com.appforge.project-id']).toBe(PID);
     expect(labels['com.appforge.role']).toBe('live');
+  });
+});
+
+describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fallo de backup', () => {
+  const LIVE = `appforge-app-${PID.slice(0, 8)}`;
+
+  function liveLabels() {
+    return {
+      'com.appforge.managed': 'true',
+      'com.appforge.project-id': PID,
+      'com.appforge.role': 'live',
+    };
+  }
+
+  function backupArgs(prev: string | null = null) {
+    return {
+      projectId: PID,
+      deploymentId: DID,
+      candidateId: `cand-${DID.slice(0, 8)}`,
+      previousLiveVersion: prev,
+    } as never;
+  }
+
+  /** Construye el deployment y deja un live en marcha con app.db copiable. */
+  async function setupLive(dataDir: string, db: Database.Database, stub: StubDocker) {
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    stub.containers.set(LIVE, {
+      Config: {
+        Labels: liveLabels(),
+        User: '1001',
+        Image: 'appforge/app-11111111:dep-aaaaaaaa-000000000000',
+      },
+      State: { Running: true },
+    });
+    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'af-db-')), 'app.db');
+    const sdb = new Database(p);
+    sdb.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES (\'x\');');
+    sdb.close();
+    stub.hostFiles.set('app.db', fs.readFileSync(p));
+    return d;
+  }
+
+  function mockHealthOk(d: DockerDeploymentDriver) {
+    (d as unknown as { runHealthCheck: (a: never) => Promise<unknown> }).runHealthCheck = async () => ({
+      ok: true,
+      data: { version: '1' },
+    });
+  }
+
+  function mockHealthFail(d: DockerDeploymentDriver) {
+    (d as unknown as { runHealthCheck: (a: never) => Promise<unknown> }).runHealthCheck = async () => ({
+      ok: false,
+      code: 'HEALTH_CHECK_FAILED',
+      error: 'unhealthy',
+    });
+  }
+
+  test('contenedor ausente + volumen live con datos → backup hadDatabase=true vía temporal endurecido', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.volumes.set(liveVolume, liveLabels());
+    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'af-db-')), 'app.db');
+    const sdb = new Database(p);
+    sdb.exec('CREATE TABLE t(id INTEGER PRIMARY KEY);');
+    sdb.close();
+    stub.hostFiles.set('app.db', fs.readFileSync(p));
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(true);
+    expect(r.data?.backupValidated).toBe('true');
+    const created = (r.data as Record<string, string>).backupId;
+    const m = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'project-backups', PID, created, 'backup.json'), 'utf8'),
+    ) as BackupManifest;
+    expect(m.hadDatabase).toBe(true);
+    expect(m.files.map((f) => f.name)).toContain('app.db');
+    // El temporal se creó endurecido: sin red, read-only, cap-drop ALL,
+    // usuario 1001, sin labels de managed (no es un recurso inventariado).
+    const createCall = stub.calls.find((c) => c[0] === 'create' && c.includes('-v') && c.some((a) => a.startsWith(`${liveVolume}:/data`)));
+    expect(createCall).toBeDefined();
+    expect(createCall).toContain('--read-only');
+    expect(createCall).toContain('--cap-drop=ALL');
+    expect(createCall).toContain('--user');
+    expect(createCall).toContain('1001');
+    const netIdx = createCall!.indexOf('--network');
+    expect(createCall![netIdx + 1]).toBe('none');
+    expect(createCall!.includes('--label')).toBe(false);
+    // El temporal se limpió.
+    expect(stub.calledWith('rm')).toBe(true);
+  });
+
+  test('contenedor ausente + volumen live con labels ajenas → FOREIGN_RESOURCE sin backup', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.volumes.set(liveVolume, { 'otra': 'etiqueta' });
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/FOREIGN_RESOURCE/);
+    expect(fs.existsSync(path.join(dataDir, 'project-backups', PID))).toBe(false);
+    expect(stub.volumes.get(liveVolume)).toEqual({ 'otra': 'etiqueta' });
+  });
+
+  test('contenedor ausente + volumen live vacío → hadDatabase=false (no es primer despliegue, pero no hay datos)', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    stub.volumes.set(projectLiveVolumeName(PID), liveLabels());
+    // Sin app.db en el volumen: el cp falla con "no such file".
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(true);
+    const created = (r.data as Record<string, string>).backupId;
+    const m = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'project-backups', PID, created, 'backup.json'), 'utf8'),
+    ) as BackupManifest;
+    expect(m.hadDatabase).toBe(false);
+    expect(m.files).toEqual([]);
+  });
+
+  test('primer despliegue real (sin previous, sin contenedor, sin volumen) → hadDatabase=false', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(true);
+    const created = (r.data as Record<string, string>).backupId;
+    const m = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'project-backups', PID, created, 'backup.json'), 'utf8'),
+    ) as BackupManifest;
+    expect(m.hadDatabase).toBe(false);
+    expect(m.files).toEqual([]);
+  });
+
+  test('fallo de docker cp tras detener el live → se re-levanta con health y se devuelve el error original', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthOk(d);
+    stub.failNext(['cp'], 'fail', 'simulated cp failure');
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/BACKUP_CP_FAILED/);
+    // El live se re-levantó: start llamado y contenedor en marcha.
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+    const entry = stub.containers.get(LIVE) as { State: { Running: boolean } };
+    expect(entry.State.Running).toBe(true);
+    // No se escribió manifiesto de backup válido (el directorio puede existir vacío).
+    const root = path.join(dataDir, 'project-backups', PID);
+    const manifests = fs.existsSync(root)
+      ? fs.readdirSync(root).filter((d) => fs.existsSync(path.join(root, d, 'backup.json')))
+      : [];
+    expect(manifests.length).toBe(0);
+  });
+
+  test('abort durante la copia tras detener el live → se recupera y se devuelve OPERATION_ABORTED', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthOk(d);
+    stub.failNext(['cp'], 'aborted');
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/OPERATION_ABORTED/);
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+    const entry = stub.containers.get(LIVE) as { State: { Running: boolean } };
+    expect(entry.State.Running).toBe(true);
+  });
+
+  test('fallo de copia + recuperación sin health → BACKUP_RECOVERY_FAILED (servicio caído, se informa)', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthFail(d);
+    stub.failNext(['cp'], 'fail', 'simulated cp failure');
+    const r = await d.createLiveBackup(backupArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/BACKUP_RECOVERY_FAILED/);
+    expect(r.error).toMatch(/BACKUP_CP_FAILED/);
   });
 });

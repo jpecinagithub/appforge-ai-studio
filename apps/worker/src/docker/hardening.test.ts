@@ -2,7 +2,7 @@
  * Fase 7A — Tests unitarios del endurecimiento (vectores exactos de argv).
  */
 import { describe, test, expect } from 'vitest';
-import { hardenedRunArgs, assertNoForbiddenFlags, HardeningError } from './hardening.js';
+import { hardenedRunArgs, hardenedTempVolumeArgs, assertNoForbiddenFlags, HardeningError } from './hardening.js';
 import type { ManagedLabels } from './resources.js';
 
 const LABELS: ManagedLabels = {
@@ -100,5 +100,44 @@ describe('validación de spec', () => {
     expect(() => hardenedRunArgs({ ...BASE, role: 'verify', name: '../evil' })).toThrowError(HardeningError);
     expect(() => hardenedRunArgs({ ...BASE, role: 'verify', image: 'evil; rm -rf /' })).toThrowError(HardeningError);
     expect(() => hardenedRunArgs({ ...BASE, role: 'verify', envFile: 'relative/path' })).toThrowError(HardeningError);
+  });
+});
+
+describe('hardenedTempVolumeArgs (temporal de copia, NO-GO2 B2)', () => {
+  test('vector endurecido sin labels de managed ni red', () => {
+    const args = hardenedTempVolumeArgs({
+      name: 'appforge-tmp-backup-abc12345',
+      image: 'appforge/app-12345678:dep-abcdefab-aaaaaaaaaaaa',
+      volume: 'appforge-project-12345678-1234-1234-1234-1234567890ab-data',
+    });
+    expect(args).toEqual([
+      'create',
+      '--name', 'appforge-tmp-backup-abc12345',
+      '--user', '1001',
+      '--read-only',
+      '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
+      '--cap-drop=ALL',
+      '--security-opt', 'no-new-privileges:true',
+      '--pids-limit', '128',
+      '--cpus', '1.0',
+      '--memory', '512m',
+      '--memory-swap', '512m',
+      '--network', 'none',
+      '--stop-timeout', '5',
+      '-v', 'appforge-project-12345678-1234-1234-1234-1234567890ab-data:/data',
+      'appforge/app-12345678:dep-abcdefab-aaaaaaaaaaaa',
+    ]);
+    expect(() => assertNoForbiddenFlags(args)).not.toThrow();
+  });
+
+  test('rechaza nombres/imágenes/volúmenes inválidos', () => {
+    const good = {
+      name: 'appforge-tmp-backup-abc12345',
+      image: 'appforge/app-12345678:dep-abcdefab-aaaaaaaaaaaa',
+      volume: 'appforge-project-12345678-1234-1234-1234-1234567890ab-data',
+    };
+    expect(() => hardenedTempVolumeArgs({ ...good, name: 'mal nombre' })).toThrow(HardeningError);
+    expect(() => hardenedTempVolumeArgs({ ...good, image: 'sin-tag' })).toThrow(HardeningError);
+    expect(() => hardenedTempVolumeArgs({ ...good, volume: '' })).toThrow(HardeningError);
   });
 });

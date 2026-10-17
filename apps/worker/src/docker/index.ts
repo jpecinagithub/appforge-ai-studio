@@ -35,7 +35,7 @@ export {
   ResourceError,
 } from './resources.js';
 export type { ManagedLabels, ResourceRole, ResourceNames, ListedResource } from './resources.js';
-export { hardenedRunArgs, assertNoForbiddenFlags, HardeningError } from './hardening.js';
+export { hardenedRunArgs, hardenedTempVolumeArgs, assertNoForbiddenFlags, HardeningError } from './hardening.js';
 export type { HardenedContainerSpec, HardenedRole } from './hardening.js';
 export {
   parseEnvFile,

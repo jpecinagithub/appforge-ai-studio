@@ -58,7 +58,7 @@ import {
   type ManagedLabels,
   type ResourceRole,
 } from './resources.js';
-import { hardenedRunArgs, assertNoForbiddenFlags } from './hardening.js';
+import { hardenedRunArgs, hardenedTempVolumeArgs, assertNoForbiddenFlags } from './hardening.js';
 import { writeValidatedEnvFile } from './env.js';
 import {
   backupDirFor,
@@ -1508,9 +1508,37 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       const backupId = newBackupId();
       const dir = backupDirFor(this.config.dataDir, projectId, backupId);
       const stamp = new Date().toISOString();
-      if (!(await resourceExists(this.runner, 'container', names.liveContainer))) {
-        // Primer despliegue: backup validado con hadDatabase=false.
+      const hasPrevious =
+        typeof args.previousLiveVersion === 'string' && APPFORGE_IMAGE_REF_RE.test(args.previousLiveVersion);
+      const liveContainerExists = await resourceExists(this.runner, 'container', names.liveContainer);
+      if (!liveContainerExists) {
+        const liveVolumeExists = await resourceExists(this.runner, 'volume', names.liveVolume);
+        // hadDatabase=false SOLO si no hay versión anterior, ni contenedor
+        // live, ni volumen live con datos (revisión Codex, NO-GO 2, bloqueo
+        // 2). "Contenedor live ausente" NO equivale a "primer despliegue".
+        if (!hasPrevious && !liveVolumeExists) {
+          writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] });
+          enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
+          return ok({ backupId, backupValidated: 'true' });
+        }
+        if (liveVolumeExists) {
+          // Volumen live huérfano (existe sin contenedor): verificar sus
+          // labels y respaldar sus datos con un contenedor temporal
+          // endurecido.
+          const info = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+            Labels?: Record<string, string>;
+          };
+          try {
+            assertLiveVolumeLabels(info?.Labels, projectId);
+          } catch {
+            return err('FOREIGN_RESOURCE', `refusing to back up foreign live volume '${names.liveVolume}'`);
+          }
+          return await this.backupOrphanLiveVolume(args, names.liveVolume, backupId, stamp);
+        }
+        // Sin contenedor ni volumen (pero con previousLiveVersion): no hay
+        // BD que respaldar; backup vacío validado.
         writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] });
+        enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
         return ok({ backupId, backupValidated: 'true' });
       }
       await this.assertLiveSlot(projectId, names.liveContainer);
@@ -1519,38 +1547,121 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (await this.containerRunning(names.liveContainer)) {
         return err('BACKUP_STOP_FAILED', 'live container did not stop before backup');
       }
-      fs.mkdirSync(dir, { recursive: true });
-      const copied: Array<{ name: string; size: number; sha256: string }> = [];
-      // Solo app.db + app.db-wal: el -shm es memoria compartida transitoria
-      // (SQLite lo recrea al abrir); su checksum no es estable entre copias.
-      for (const f of ['app.db', 'app.db-wal']) {
-        const dest = path.join(dir, f);
-        const cp = await this.sh(['cp', `${names.liveContainer}:/data/${f}`, dest], {
-          timeoutMs: 120_000,
-          signal: args.signal,
-        });
-        if (cp.code !== 0) {
-          if (/no such file/i.test(cp.stderr)) continue;
-          return err('BACKUP_CP_FAILED', `docker cp ${f}: ${cp.stderr.slice(0, 200)}`);
+      // A partir de aquí el live está detenido: cualquier fallo o abort debe
+      // intentar re-levantarlo y verificar health ANTES de devolver el error.
+      // Nunca se deja el servicio parado por un backup fallido (bloqueo 2).
+      try {
+        const copied = await this.copyDatabaseFilesFromContainer(args, names.liveContainer, dir);
+        if (!copied.some((c) => c.name === 'app.db')) {
+          throw new DockerDriverError('BACKUP_SOURCE_MISSING', 'live container has no app.db');
         }
         try {
-          fs.chownSync(dest, 1001, 1001);
+          quickCheck(path.join(dir, 'app.db'));
         } catch (e) {
-          return err('BACKUP_CHOWN_FAILED', `cannot chown ${f}: ${(e as Error).message.slice(0, 150)}`);
+          throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
         }
-        copied.push({ name: f, ...sha256File(dest) });
+        writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied });
+        // Retención real (revisión Codex, NO-GO 2, bloqueo 1): se protegen los
+        // backups referenciados por deployments activos y por el último live.
+        enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
+        return ok({ backupId, backupValidated: 'true' });
+      } catch (e) {
+        const backupErr =
+          e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
+            ? err(e.code, e.message)
+            : err('BACKUP_ERROR', (e as Error).message);
+        const recovered = await this.recoverStoppedLive(args, names.liveContainer);
+        if (!recovered.ok) {
+          return err(
+            'BACKUP_RECOVERY_FAILED',
+            `backup failed (${backupErr.code}); live recovery also failed (${recovered.code}): ${recovered.error} — service may be down`,
+          );
+        }
+        // El live se re-levantó y pasó health: se devuelve el error ORIGINAL
+        // del backup, sin ocultar que hubo recuperación.
+        return err(backupErr.code ?? 'BACKUP_ERROR', `${backupErr.error} (live container restarted and healthy)`);
       }
-      if (!copied.some((c) => c.name === 'app.db')) {
-        return err('BACKUP_SOURCE_MISSING', 'live container has no app.db');
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
+        return err(e.code, e.message);
+      }
+      return err('BACKUP_ERROR', (e as Error).message);
+    }
+  }
+
+  /**
+   * Copia `app.db` (+ `app.db-wal` si existe) desde un contenedor al
+   * directorio del backup, con chown 1001 y SHA-256 por fichero. Lanza
+   * `DockerDriverError` ante cualquier problema (el llamador decide si
+   * `app.db` ausente es error o `hadDatabase=false`).
+   */
+  private async copyDatabaseFilesFromContainer(
+    args: LiveBackupArgs,
+    containerName: string,
+    dir: string,
+  ): Promise<Array<{ name: string; size: number; sha256: string }>> {
+    fs.mkdirSync(dir, { recursive: true });
+    const copied: Array<{ name: string; size: number; sha256: string }> = [];
+    // Solo app.db + app.db-wal: el -shm es memoria compartida transitoria
+    // (SQLite lo recrea al abrir); su checksum no es estable entre copias.
+    for (const f of ['app.db', 'app.db-wal']) {
+      const dest = path.join(dir, f);
+      const cp = await this.sh(['cp', `${containerName}:/data/${f}`, dest], {
+        timeoutMs: 120_000,
+        signal: args.signal,
+      });
+      if (cp.aborted) throw new DockerDriverError('OPERATION_ABORTED', 'backup aborted during copy');
+      if (cp.timedOut) throw new DockerDriverError('BACKUP_CP_TIMEOUT', `docker cp ${f} timed out`);
+      if (cp.code !== 0) {
+        if (/no such file/i.test(cp.stderr)) continue;
+        throw new DockerDriverError('BACKUP_CP_FAILED', `docker cp ${f}: ${cp.stderr.slice(0, 200)}`);
       }
       try {
-        quickCheck(path.join(dir, 'app.db'));
+        fs.chownSync(dest, 1001, 1001);
       } catch (e) {
-        return err('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
+        throw new DockerDriverError('BACKUP_CHOWN_FAILED', `cannot chown ${f}: ${(e as Error).message.slice(0, 150)}`);
       }
-      writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied });
-      // Retención real (revisión Codex, NO-GO 2, bloqueo 1): se protegen los
-      // backups referenciados por deployments activos y por el último live.
+      copied.push({ name: f, ...sha256File(dest) });
+    }
+    return copied;
+  }
+
+  /**
+   * Backup de un volumen live huérfano (existe sin contenedor live).
+   * Revisión Codex (NO-GO 2, bloqueo 2): el volumen ya tiene sus labels
+   * verificadas por el llamador. Los datos se extraen con un contenedor
+   * temporal ENDURECIDO (`hardenedTempVolumeArgs`: sin red, sin
+   * privilegios, efímero, sin labels de managed).
+   */
+  private async backupOrphanLiveVolume(
+    args: LiveBackupArgs,
+    liveVolume: string,
+    backupId: string,
+    stamp: string,
+  ): Promise<DriverResult> {
+    const { projectId, deploymentId } = args;
+    if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
+    const names = this.names(projectId, deploymentId);
+    const dir = backupDirFor(this.config.dataDir, projectId, backupId);
+    const tmp = `appforge-tmp-backup-${randomUUID().slice(0, 8)}`;
+    const createArgs = hardenedTempVolumeArgs({ name: tmp, image: names.image, volume: liveVolume });
+    assertNoForbiddenFlags(createArgs);
+    const cc = await this.sh(createArgs, { timeoutMs: 30_000, signal: args.signal });
+    if (cc.aborted) return err('OPERATION_ABORTED', 'orphan volume backup aborted');
+    if (cc.timedOut || cc.code !== 0) {
+      return err('BACKUP_TMP_CREATE_FAILED', `cannot create hardened temp container: ${cc.stderr.slice(0, 300)}`);
+    }
+    try {
+      const copied = await this.copyDatabaseFilesFromContainer(args, tmp, dir);
+      const hadDatabase = copied.some((c) => c.name === 'app.db');
+      if (hadDatabase) {
+        try {
+          quickCheck(path.join(dir, 'app.db'));
+        } catch (e) {
+          throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
+        }
+      }
+      writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase, files: copied });
       enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
       return ok({ backupId, backupValidated: 'true' });
     } catch (e) {
@@ -1558,7 +1669,41 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err(e.code, e.message);
       }
       return err('BACKUP_ERROR', (e as Error).message);
+    } finally {
+      await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
     }
+  }
+
+  /**
+   * Re-levanta el contenedor live detenido por `createLiveBackup` y verifica
+   * su health. Se usa cuando el backup falla o se aborta DESPUÉS de detener
+   * el live: el servicio nunca debe quedar parado por un backup fallido
+   * (revisión Codex, NO-GO 2, bloqueo 2).
+   */
+  private async recoverStoppedLive(args: LiveBackupArgs, containerName: string): Promise<DriverResult> {
+    const start = await this.sh(['start', containerName], { timeoutMs: 60_000, signal: args.signal });
+    if (start.aborted) return err('OPERATION_ABORTED', 'live recovery aborted');
+    if (start.timedOut || start.code !== 0) {
+      return err('BACKUP_RECOVERY_START_FAILED', `could not restart live container: ${start.stderr.slice(0, 200)}`);
+    }
+    for (let i = 0; i < 10; i++) {
+      if (await this.containerRunning(containerName)) break;
+      await this.abortAwareSleep(1000, args.signal);
+    }
+    if (!(await this.containerRunning(containerName))) {
+      return err('BACKUP_RECOVERY_NOT_RUNNING', 'live container did not come back up after restart');
+    }
+    const health = await this.runHealthCheck({
+      projectId: args.projectId,
+      deploymentId: args.deploymentId,
+      candidateId: args.candidateId,
+      runtime: 'live',
+      signal: args.signal,
+    });
+    if (!health.ok) {
+      return err('BACKUP_RECOVERY_UNHEALTHY', `live restarted but health check failed: ${health.error}`);
+    }
+    return ok({ recovered: 'true' });
   }
 
   async stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {

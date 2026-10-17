@@ -102,6 +102,46 @@ export function hardenedRunArgs(spec: HardenedContainerSpec, createOnly = false)
   return args;
 }
 
+/**
+ * Vector para `docker create` de un contenedor temporal de copia de
+ * volúmenes (revisión Codex, NO-GO 2, bloqueo 2): extraer ficheros de un
+ * volumen live huérfano sin arrancar ningún servicio del proyecto.
+ *
+ * Endurecido como los contenedores de proyecto (usuario 1001, read-only,
+ * tmpfs, cap-drop ALL, no-new-privileges, límites, sin red) pero SIN las
+ * labels de managed: es un temporal efímero, no un recurso inventariado
+ * (el llamador lo elimina en `finally`).
+ */
+export function hardenedTempVolumeArgs(opts: {
+  name: string;
+  image: string;
+  volume: string;
+  mountPoint?: string;
+}): string[] {
+  assertSafe(opts.name, 'container name', SAFE_NAME);
+  assertSafe(opts.image, 'image', /^[a-z0-9][a-z0-9_.\-/]{0,255}:[a-zA-Z0-9_.\-]{1,128}$/);
+  assertSafe(opts.volume, 'volume', SAFE_NAME);
+  const mountPoint = opts.mountPoint ?? '/data';
+  assertSafe(mountPoint, 'mount point', SAFE_ABS_PATH);
+  return [
+    'create',
+    '--name', opts.name,
+    '--user', '1001',
+    '--read-only',
+    '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
+    '--cap-drop=ALL',
+    '--security-opt', 'no-new-privileges:true',
+    '--pids-limit', '128',
+    '--cpus', '1.0',
+    '--memory', '512m',
+    '--memory-swap', '512m',
+    '--network', 'none',
+    '--stop-timeout', '5',
+    '-v', `${opts.volume}:${mountPoint}`,
+    opts.image,
+  ];
+}
+
 /** Comprueba que un vector NO contiene patrones prohibidos (defensa en profundidad). */
 export function assertNoForbiddenFlags(args: string[]): void {
   const joined = `\n${args.join('\n')}\n`;
