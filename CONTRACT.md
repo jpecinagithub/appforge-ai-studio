@@ -713,10 +713,15 @@ donde se indica (`400 INVALID_TYPE` en otro caso).
 - `GET /api/projects/:id/migrations` → `{"items":[MigrationRecord]}`
   (desc por versión)
 - `POST /api/projects/:id/deploy` body `{target:'oracle'}`
-  → `202 DeploymentInfo` (pipeline §9.13; `409` si hay deploy no
-  terminal; proyecto `static` → `501 {"error":{"code":"PHASE_3"}}`)
+  → `202 DeploymentInfo` (pipeline §9.21; `409` si hay deploy no terminal
+  o si la puerta 5A/5B no está vigente; proyecto `static` →
+  `400 INVALID_TYPE`; target ≠ `oracle` → `400 INVALID_TARGET`; sin
+  driver real configurado → `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`, sin
+  simular nada)
 - `GET /api/projects/:id/deployments` → `{"items":[DeploymentInfo]}` (desc)
 - `GET /api/deployments/:deploymentId` → `DeploymentInfo`
+- `POST /api/deployments/:deploymentId/cancel` → `DeploymentInfo`
+  (`cancel_requested` persistente; `404` si no existe)
 - `POST /api/projects/:id/rollback` → `DeploymentInfo` (nuevo registro;
   `409` si no hay `previous_image` o no hay backup pre-migración)
 - `POST /api/projects/:id/database/backup`
@@ -744,3 +749,74 @@ interface AppHealth { ok:boolean; version:string; }
 interface AuthUser { id:string; email:string; displayName:string|null;
   createdAt:string; }
 ```
+
+### 9.21 Pipeline de despliegue: Fase 6 (orquestador) vs Fase 7 (Docker/Oracle)
+
+Fase 6 implementa el **orquestador persistente** del pipeline con un
+**adaptador falso determinista**. Fase 7 añadirá el controlador Docker
+real, el despliegue en Oracle y el aislamiento definitivo. Nada de la
+Fase 6 ejecuta Docker, toca Oracle, monta el socket Docker, llama a
+Vercel ni modifica producción.
+
+**Fase 6 — hecho:**
+- Máquina de estados cerrada (`apps/worker/src/deploy/stateMachine.ts`):
+  `pending → building → migrating → verifying → promoting → live`, más
+  `failed`/`rolled_back`/`cancelled`. Tabla explícita de transiciones;
+  estados arbitrarios imposibles desde HTTP, tools o adaptadores;
+  transición persistida ANTES de invocar al driver; fecha/fase/resultado/
+  diagnóstico por transición; `updated_at`; error estable
+  (`INVALID_TRANSITION`/`INVALID_STATE`); idempotencia al repetir.
+  Sin `promoting → cancelled`: la cancelación en la sección crítica
+  completa una promoción segura o ejecuta el rollback.
+- Persistencia no destructiva (migraciones aditivas en `db.ts`):
+  `deployments` ampliada (`candidate_id`, `previous_live_version`,
+  `backup_id`, `cancel_requested`, `started_at`, `updated_at`,
+  `finished_at`, `error`); tabla append-only `deployment_events`
+  (`deployment_id, seq, phase, event/status, started_at, finished_at,
+  duration_ms, output, error`); tabla `project_runtime`; índice único
+  parcial que impide dos deployments no terminales por proyecto
+  (carrera → `409 DEPLOYMENT_ACTIVE`).
+- `DeploymentDriver` (`apps/worker/src/deploy/driver.ts`): interfaz
+  cerrada y agnóstica de Docker con operaciones semánticas tipadas
+  (`buildCandidate`, `prepareVerificationDatabase`,
+  `runVerificationMigrations`, `discardVerificationDatabase`,
+  `startVerificationRuntime`, `runHealthCheck`, `runAuthenticatedVerification`,
+  `stopVerificationRuntime`, `createLiveBackup`, `runLiveMigrations`,
+  `stopCurrentLiveRuntime`, `startCandidateAsLive`, `restoreBackup`,
+  `startPreviousVersion`, `removeCandidate`, `reconcileRuntime`). Sin
+  comandos/shell/rutas/nombres de contenedor del LLM: identificadores
+  derivados internamente y validados. El adaptador nunca muta el estado;
+  solo el orquestador decide transiciones. El LLM no accede al driver.
+- Solo existe `FakeDeploymentDriver`: configurable por operación
+  (éxito/fallo/timeout), con retardos, hooks y compuertas manuales;
+  observa el estado persistido durante cada llamada. No hay
+  `DockerDeploymentDriver` todavía.
+- Orquestador (`apps/worker/src/deploy/orchestrator.ts`): orden fijo;
+  fallos según §9.13 adaptado al fake (rollback exactamente una vez, sin
+  bucles; `project_runtime` solo tras health live; nunca dos live según
+  el estado persistido); `cancel_requested` persistente comprobado antes
+  de cada fase, tras operaciones largas y antes de `promoting`;
+  recuperación al arranque (`failed` + `error='interrupted by server
+  restart'` + reconciliación abstracta del driver; sin confiar en PIDs).
+- API §9.20 (driver solo vía `ServerOptions`, nunca por defecto).
+- Tool `deploy_project` (solo dynamic, cero parámetros libres, delega en
+  el orquestador, rechaza sin driver real, no expone transiciones, no
+  toca el kill switch de 5B).
+- Logs sanitizados (`sanitizeSecrets`), tope por evento (4 000) y por
+  deployment (20 000) con indicador explícito de truncado; sin secretos,
+  cookies, tokens, `.env` ni `Authorization`.
+
+**Fase 7 — pendiente (exclusiones expresas de Fase 6):**
+`DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
+socket Docker; red `appforge-apps`; límites CPU/RAM/PIDs reales;
+contenedores de verificación reales; backup real de SQLite live;
+migraciones sobre producción; promoción real; proxy hacia contenedor
+live; despliegue en Oracle; cambios nginx; DNS/dominio/certificados;
+publicación en Vercel; captura final de biblioteca; recorridos reales
+en Oracle. Los §9.13/§9.14/§9.15 describen ese objetivo con Docker; la
+Fase 6 implementa la misma máquina de estados y semántica contra el
+fake driver.
+
+**Sin UI de despliegue en Fase 6:** no hay botón que prometa despliegue
+real a Oracle. Cuando la infraestructura no está configurada, la API
+responde `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`.
