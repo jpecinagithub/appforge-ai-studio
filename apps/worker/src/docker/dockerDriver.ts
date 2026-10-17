@@ -2393,7 +2393,33 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           Config?: { Image?: string; Labels?: Record<string, string> };
           State?: { Running?: boolean };
         };
-        assertLabelsMatch(info?.Config?.Labels, this.opLabels(args.projectId, args.deploymentId, 'live'));
+        // El slot puede contener el deployment consultado O una versión
+        // anterior legítimamente restaurada por rollback. Se valida la
+        // identidad autoconsistente de sus labels reales, no las del
+        // deployment fallido que provocó la reconciliación.
+        const labels = info?.Config?.Labels ?? {};
+        if (labels[MANAGED_LABEL] !== 'true') {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container is not AppForge-managed');
+        }
+        if ((labels[LABEL_PROJECT] ?? '').toLowerCase() !== args.projectId.toLowerCase()) {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container belongs to another project');
+        }
+        if (labels[LABEL_ROLE] !== 'live') {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container has a non-live role');
+        }
+        assertUuid(labels[LABEL_DEPLOYMENT] ?? '', 'deployment-id');
+        assertFingerprint(labels[LABEL_FINGERPRINT] ?? '');
+        const actualIdentity = resourceNames(
+          args.projectId,
+          labels[LABEL_DEPLOYMENT]!,
+          labels[LABEL_FINGERPRINT]!,
+        );
+        if (String(info?.Config?.Image ?? '') !== actualIdentity.image) {
+          throw new DockerDriverError(
+            'FOREIGN_RESOURCE',
+            'live image reference does not match its deployment/fingerprint labels',
+          );
+        }
         liveRunning = info?.State?.Running === true;
         liveImage = String(info?.Config?.Image ?? '');
       }
