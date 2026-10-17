@@ -5,6 +5,7 @@
  */
 
 import type Database from 'better-sqlite3';
+import type { DeploymentDriver } from './deploy/driver.js';
 import { runAgentOnce, type AgentSettings, type RunAgentOptions } from './agent.js';
 import { nowIso } from './tools.js';
 
@@ -12,6 +13,8 @@ export interface WorkerOptions {
   dataDir: string;
   pollMs?: number;
   getSettings: () => AgentSettings;
+  /** Fase 6: explicitly-configured deployment driver (never a default). */
+  deploymentDriver?: DeploymentDriver;
 }
 
 export function startWorker(
@@ -43,7 +46,7 @@ export function startWorker(
       if (claimed.changes === 0) return;
 
       inflight += 1;
-      const runOpts: RunAgentOptions = { dataDir: opts.dataDir, settings: opts.getSettings() };
+      const runOpts: RunAgentOptions = { dataDir: opts.dataDir, settings: opts.getSettings(), deploymentDriver: opts.deploymentDriver };
       runAgentOnce(db, cand.id, runOpts)
         .catch((err: unknown) => {
           try {

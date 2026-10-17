@@ -35,3 +35,38 @@ export {
 export type { PreviewStatus, PreviewRow } from './previewManager.js';
 export { resolveAreaPath, AREA_NAMES } from './dynamicAreas.js';
 export type { DynamicArea } from './dynamicAreas.js';
+export {
+  DeploymentError,
+  createDeployment,
+  getDeployment,
+  getActiveDeployment,
+  listDeployments,
+  listDeploymentEvents,
+  transitionDeployment,
+  recordEvent,
+  requestDeploymentCancel,
+  isCancelRequested,
+  getProjectRuntime,
+  upsertProjectRuntime,
+  reconcileDeployments,
+  isDeploymentStatus,
+  isTerminalStatus,
+  NON_TERMINAL_STATUSES,
+  TERMINAL_STATUSES,
+  MAX_EVENT_OUTPUT_CHARS,
+  MAX_DEPLOYMENT_LOGS_CHARS,
+} from './deploy/stateMachine.js';
+export type { DeploymentRecord, DeploymentEvent, DeploymentEventInput, ProjectRuntimeRecord } from './deploy/stateMachine.js';
+export { FakeDeploymentDriver, assertDriverArgs, FAKE_OP_NAMES } from './deploy/driver.js';
+export type {
+  DeploymentDriver,
+  DriverOpArgs,
+  DriverResult,
+  FakeCall,
+  FakeDriverOptions,
+  FakeOpBehavior,
+  FakeOpName,
+} from './deploy/driver.js';
+export { runDeploymentPipeline, persistedVerificationGate, SUPPORTED_DEPLOY_TARGETS } from './deploy/orchestrator.js';
+export type { RunDeploymentOptions, VerificationGateResult } from './deploy/orchestrator.js';
+export { sanitizeSecrets } from './secrets.js';

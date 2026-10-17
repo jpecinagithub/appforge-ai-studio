@@ -257,27 +257,14 @@ export async function runLive(
 }
 
 // ---------------------------------------------------------------------------
-// Secret sanitization for logs
+// ---------------------------------------------------------------------------
+// Secret sanitization for logs (single home: ./secrets.js; re-exported here
+// so existing `import { sanitizeSecrets } from './dynamicTools.js'` keep
+// working, e.g. the Fase 6 deploy pipeline).
 // ---------------------------------------------------------------------------
 
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/((?:password|passwd|pwd|client[_-]secret|api[_-]key)["']?\s*[:=]\s*['"]?)[^\s"',}\]]+/gi, '$1[redacted]'],
-  [/(authorization\s*[:=]\s*['"]?)(bearer\s+)?[A-Za-z0-9\-._~+/=]{8,}/gi, '$1[redacted]'],
-  [/(af_session=)[^;\s"']+/gi, '$1[redacted]'],
-  [/(set-cookie\s*:[^\r\n]*?af_session=)[^;\s]+/gi, '$1[redacted]'],
-  [/(cookie\s*:\s*)[^\r\n]+/gi, '$1[redacted]'],
-  [/((?:session[_-]?token|auth[_-]?token)["']?\s*[:=]\s*['"]?)[A-Za-z0-9\-._~+/=]{8,}/gi, '$1[redacted]'],
-];
-
-/** Remove passwords, cookies, tokens and secrets from captured logs. */
-export function sanitizeSecrets(s: string): string {
-  let out = s;
-  for (const [re, replacement] of SECRET_PATTERNS) {
-    re.lastIndex = 0;
-    out = out.replace(re, replacement);
-  }
-  return out;
-}
+import { sanitizeSecrets } from './secrets.js';
+export { sanitizeSecrets };
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -1019,6 +1006,12 @@ export const DYNAMIC_TOOL_DEFS: ToolDef[] = [
       'Dynamic projects only: verify the authenticated user journey against the published preview at /a/:projectId/ (never a different server). Runs deterministic API checks (register, HttpOnly+SameSite cookie, session, CRUD, cross-user isolation, logout, 401) then real Chromium against the preview UI using stable data-testid selectors. Requires a ready fullstack preview. Takes no arguments: no URLs, selectors, credentials or commands are accepted.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
   },
+  {
+    name: 'deploy_project',
+    description:
+      'Dynamic projects only (Fase 6): run the persistent full-stack deployment pipeline (pending → building → migrating → verifying → promoting → live, with single-attempt rollback and persistent cancellation) through the configured deployment driver. Requires the 5A/5B verification gate to be current on the present sources. Deterministic: takes no arguments — no commands, paths, image names, container names or Docker arguments are accepted; all identifiers are derived internally. Refuses with DEPLOYMENT_DRIVER_NOT_CONFIGURED when no real driver is configured (never simulates a real deployment). Cannot set deployment states manually.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
 ];
 
 export function createDynamicTools(): Record<string, ToolHandler> {
@@ -1029,6 +1022,7 @@ export function createDynamicTools(): Record<string, ToolHandler> {
     run_api_tests: runApiTests,
     start_fullstack_preview: startFullstackPreviewTool,
     test_authenticated_flow: testAuthenticatedFlowTool,
+    deploy_project: deployProjectTool,
   };
 }
 
@@ -1041,4 +1035,60 @@ async function startFullstackPreviewTool(ctx: ToolContext, _args: Record<string,
 async function testAuthenticatedFlowTool(ctx: ToolContext, _args: Record<string, unknown>): Promise<ToolResult> {
   const { testAuthenticatedFlow } = await import('./authFlow.js');
   return testAuthenticatedFlow(ctx);
+}
+
+/**
+ * Fase 6 — `deploy_project`: deterministic, zero free parameters. Delegates
+ * exclusively to the persistent orchestrator (`runDeploymentPipeline`); the
+ * agent can never set deployment states manually (no tool or HTTP route
+ * exposes transitions). Refuses when no real driver is configured.
+ * Does not touch the 5B preview kill switch or its guarantees.
+ */
+async function deployProjectTool(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
+  const t0 = Date.now();
+  const durationMs = () => Date.now() - t0;
+  if (!isDynamicProject(ctx)) {
+    return fail('INVALID_TYPE', 'deploy_project is only available for dynamic projects', durationMs());
+  }
+  if (Object.keys(args).length > 0) {
+    return fail('INVALID_ARGS', 'deploy_project takes no arguments', durationMs());
+  }
+  const driver = ctx.deploymentDriver;
+  if (!driver) {
+    return fail(
+      'DEPLOYMENT_DRIVER_NOT_CONFIGURED',
+      'Deployment infrastructure is not configured: refusing to simulate a real deployment. Configure a real DeploymentDriver to enable deployments.',
+      durationMs(),
+    );
+  }
+  const { runDeploymentPipeline, DeploymentError } = await import('./deploy/orchestrator.js');
+  try {
+    const final = await runDeploymentPipeline(ctx.db, driver, {
+      projectId: ctx.projectId,
+      target: 'oracle',
+      verificationGate: () => {
+        const gate = dynamicGateStatus(ctx);
+        return gate.complete
+          ? { ok: true }
+          : {
+              ok: false,
+              reason: `5A/5B verification checks are not current (missing: ${gate.missing.join(', ') || 'none'}; orderValid=${gate.orderValid}). Run the missing tools in canonical order first.`,
+            };
+      },
+    });
+    const ok = final.status === 'live';
+    return {
+      ok,
+      code: ok ? 'DEPLOY_LIVE' : `DEPLOY_${final.status.toUpperCase()}`,
+      error: ok ? undefined : (final.error ?? `deployment ended in '${final.status}'`),
+      data: { deploymentId: final.id, status: final.status },
+      durationMs: durationMs(),
+      output: `deployment ${final.id} -> ${final.status}`,
+    };
+  } catch (e) {
+    if (e instanceof DeploymentError) {
+      return fail(e.code, e.message, durationMs());
+    }
+    return fail('DEPLOY_ERROR', `deployment failed: ${(e as Error).message}`.slice(0, 2000), durationMs());
+  }
 }

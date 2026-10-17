@@ -18,6 +18,7 @@ import type {
   ToolResult,
 } from 'appforge-shared';
 import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js';
+import type { DeploymentDriver } from './deploy/driver.js';
 import { createTools, nowIso, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
@@ -41,6 +42,8 @@ export interface AgentSettings {
 export interface RunAgentOptions {
   dataDir: string;
   settings: AgentSettings;
+  /** Fase 6: explicitly-configured deployment driver (never a default). */
+  deploymentDriver?: DeploymentDriver;
 }
 
 const DEFAULT_LIMITS: AgentLimits = {
@@ -277,6 +280,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     // Same-host loopback is preferred; override with APPFORGE_STUDIO_URL.
     studioBaseUrl:
       process.env.APPFORGE_STUDIO_URL ?? `http://127.0.0.1:${process.env.PORT ?? 3001}`,
+    deploymentDriver: opts.deploymentDriver,
   };
 
   // Optional checkpoint before touching files
