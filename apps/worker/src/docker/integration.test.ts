@@ -560,7 +560,7 @@ d('docker integration (fase 7A)', () => {
     await runner.run({ args: ['start', h.names.liveContainer], timeoutMs: 30_000 }).catch(() => undefined);
   }, 900_000);
 
-  test('reconcile tras kill: informa sin curar (7A solo lectura)', async () => {
+  test('reconcile tras parada: informa sin curar (7A solo lectura)', async () => {
     if (!haveImage) return;
     const h = await sharedHarness();
     // Asegura live corriendo (el test anterior lo deja arrancado).
@@ -570,8 +570,11 @@ d('docker integration (fase 7A)', () => {
     if (!running.stdout.includes(h.names.liveContainer)) {
       okRes(await h.driver.startCandidateAsLive(h.args));
     }
-    const killed = await runner.run({ args: ['kill', h.names.liveContainer], timeoutMs: 30_000 });
-    expect(killed.code).toBe(0);
+    // Stop explícito: con `unless-stopped` el daemon NO lo reanima solo
+    // (con `kill` sí lo haría: carrera). Simula live caído de forma
+    // determinista.
+    const stopped = await runner.run({ args: ['stop', '-t', '1', h.names.liveContainer], timeoutMs: 30_000 });
+    expect(stopped.code).toBe(0);
     const rec = await h.driver.reconcileRuntime(h.args);
     okRes(rec);
     expect(rec.data?.liveFound).toBe('true');
@@ -623,10 +626,11 @@ d('docker integration (fase 7A)', () => {
   test('abort durante el build: sin imagen parcial ni contenedores colgados', async () => {
     if (!haveImage) return;
     const h = await sharedHarness();
-    // Cache-busting: el build debe tardar (si no, la caché lo completa
-    // antes del abort y el test no prueba nada). No es una migración
-    // (no coincide con el patrón \d+_*.sql).
-    fs.writeFileSync(path.join(h.projectDir, 'migrations', 'cachebust.txt'), `bust ${Date.now()}\n`);
+    // Build determinísticamente lento: se inyecta `RUN sleep 45` en la
+    // COPIA del Dockerfile (no en la plantilla del repo). Así el abort a
+    // los 5s siempre pilla el build a mitad, sin carreras con la caché.
+    const dockerfile = path.join(h.projectDir, 'Dockerfile');
+    fs.appendFileSync(dockerfile, '\n# test-only: slow down the build for abort testing\nRUN sleep 45\n');
     h.db.prepare('UPDATE verification_receipts SET fingerprint=? WHERE project_id=?').run(
       sourceFingerprint(h.projectDir), h.projectId,
     );
