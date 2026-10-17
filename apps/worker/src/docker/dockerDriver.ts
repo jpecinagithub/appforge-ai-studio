@@ -153,28 +153,6 @@ export function resolveDockerDriverConfig(
 }
 
 // ---------------------------------------------------------------------------
-// Semáforo de despliegues simultáneos (vida del proceso)
-// ---------------------------------------------------------------------------
-
-let processActiveDeploys = 0;
-
-/** Intenta adquirir un slot de despliegue. false = límite alcanzado. */
-export function acquireDeploySlot(maxConcurrentDeploys: number): boolean {
-  const max = Math.max(1, Math.floor(maxConcurrentDeploys));
-  if (processActiveDeploys >= max) return false;
-  processActiveDeploys += 1;
-  return true;
-}
-
-export function releaseDeploySlot(): void {
-  processActiveDeploys = Math.max(0, processActiveDeploys - 1);
-}
-
-export function activeDeploySlots(): number {
-  return processActiveDeploys;
-}
-
-// ---------------------------------------------------------------------------
 // Preflight (§4)
 // ---------------------------------------------------------------------------
 
@@ -395,6 +373,8 @@ function ok(data?: Record<string, string>): DriverResult {
 
 export class DockerDeploymentDriver implements DeploymentDriver {
   readonly name = 'docker';
+  readonly maxConcurrentDeploys: number;
+  readonly requiresCandidateVersion = true;
   private readonly runner: DockerCommandRunner;
   private readonly config: DockerDriverConfig;
   /**
@@ -421,6 +401,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
 
   constructor(config: DockerDriverConfig, opts: DockerDriverOptions = {} as DockerDriverOptions) {
     this.config = config;
+    this.maxConcurrentDeploys = config.maxConcurrentDeploys;
     this.runner = opts.runner ?? new DockerCommandRunner({ dockerBin: config.dockerBin });
     if (!opts.db) {
       throw new DockerDriverError(
@@ -763,13 +744,13 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         maxOutputBytes: 134_217_728,
       });
       if (raw.code !== 0) {
-        if (isMissingContainerPath(raw.stderr)) return ok();
+        if (isMissingContainerPath(raw.stderr)) return ok({ candidateVersion: image });
         return err('SCAN_CP_FAILED', raw.stderr.slice(0, 300));
       }
       if (raw.truncated) return err('IMAGE_SCAN_TRUNCATED', 'image /app too large to scan');
       const bad = DockerDeploymentDriver.scanTarForForbidden(raw.stdoutBytes);
       if (bad) return err('IMAGE_FORBIDDEN_FILE', `image contains forbidden file: ${bad}`);
-      return ok();
+      return ok({ candidateVersion: image });
     } finally {
       await this.sh(['rm', cname], { timeoutMs: 30_000 }).catch(() => undefined);
     }
@@ -2409,13 +2390,46 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       let liveImage = '';
       if (liveExists) {
         const info = (await inspectResource(this.runner, 'container', names.liveContainer)) as {
-          Config?: { Image?: string };
+          Config?: { Image?: string; Labels?: Record<string, string> };
           State?: { Running?: boolean };
         };
+        // El slot puede contener el deployment consultado O una versión
+        // anterior legítimamente restaurada por rollback. Se valida la
+        // identidad autoconsistente de sus labels reales, no las del
+        // deployment fallido que provocó la reconciliación.
+        const labels = info?.Config?.Labels ?? {};
+        if (labels[MANAGED_LABEL] !== 'true') {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container is not AppForge-managed');
+        }
+        if ((labels[LABEL_PROJECT] ?? '').toLowerCase() !== args.projectId.toLowerCase()) {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container belongs to another project');
+        }
+        if (labels[LABEL_ROLE] !== 'live') {
+          throw new DockerDriverError('FOREIGN_RESOURCE', 'live container has a non-live role');
+        }
+        assertUuid(labels[LABEL_DEPLOYMENT] ?? '', 'deployment-id');
+        assertFingerprint(labels[LABEL_FINGERPRINT] ?? '');
+        const actualIdentity = resourceNames(
+          args.projectId,
+          labels[LABEL_DEPLOYMENT]!,
+          labels[LABEL_FINGERPRINT]!,
+        );
+        if (String(info?.Config?.Image ?? '') !== actualIdentity.image) {
+          throw new DockerDriverError(
+            'FOREIGN_RESOURCE',
+            'live image reference does not match its deployment/fingerprint labels',
+          );
+        }
         liveRunning = info?.State?.Running === true;
         liveImage = String(info?.Config?.Image ?? '');
       }
       const volumeExists = await resourceExists(this.runner, 'volume', names.liveVolume);
+      if (volumeExists) {
+        const volume = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+          Labels?: Record<string, string>;
+        };
+        assertLiveVolumeLabels(volume?.Labels, args.projectId);
+      }
       return ok({
         liveFound: String(liveExists),
         liveRunning: String(liveRunning),

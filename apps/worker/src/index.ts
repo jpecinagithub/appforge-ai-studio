@@ -53,6 +53,7 @@ export {
   getProjectRuntime,
   upsertProjectRuntime,
   reconcileDeployments,
+  reconcileProjectRuntimes,
   isDeploymentStatus,
   isTerminalStatus,
   NON_TERMINAL_STATUSES,
@@ -64,7 +65,14 @@ export {
   isValidBackupId,
 } from './deploy/stateMachine.js';
 export type { DeploymentRecord, DeploymentEvent, DeploymentEventInput, ProjectRuntimeRecord } from './deploy/stateMachine.js';
-export { FakeDeploymentDriver, assertDriverArgs, FAKE_OP_NAMES } from './deploy/driver.js';
+export {
+  FakeDeploymentDriver,
+  assertDriverArgs,
+  FAKE_OP_NAMES,
+  acquireDeploymentCapacity,
+  activeDeploymentCapacity,
+  APPFORGE_IMAGE_REF_RE,
+} from './deploy/driver.js';
 export type {
   DeploymentDriver,
   DriverOpArgs,

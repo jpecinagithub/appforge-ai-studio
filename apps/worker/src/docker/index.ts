@@ -62,8 +62,7 @@ export {
   preflightDocker,
   detectDaemonArchitecture,
   normalizeArch,
-  acquireDeploySlot,
-  releaseDeploySlot,
-  activeDeploySlots,
 } from './dockerDriver.js';
 export type { DockerDriverConfig, DockerDriverOptions, PreflightResult } from './dockerDriver.js';
+export { activateDockerDeployment } from './activation.js';
+export type { ActivateDockerOptions, DockerActivation } from './activation.js';
