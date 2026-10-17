@@ -17,6 +17,7 @@
  * - restart `unless-stopped` solo en live.
  */
 
+import path from 'node:path';
 import { labelArgs, type ManagedLabels } from './resources.js';
 
 export type HardenedRole = 'live' | 'verify' | 'migration';
@@ -46,10 +47,18 @@ export class HardeningError extends Error {
 }
 
 const SAFE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
-const SAFE_ABS_PATH = /^\/[^\0]{1,1024}$/;
+const SAFE_CONTAINER_PATH = /^\/[^\0\r\n]{1,1024}$/;
 
 function assertSafe(value: string, what: string, re: RegExp): void {
   if (typeof value !== 'string' || !re.test(value)) {
+    throw new HardeningError('INVALID_SPEC', `invalid ${what}: '${String(value).slice(0, 80)}'`);
+  }
+}
+
+function assertSafeAbsolutePath(value: string, what: string): void {
+  const absolute = typeof value === 'string'
+    && (path.posix.isAbsolute(value) || path.win32.isAbsolute(value));
+  if (!absolute || value.length > 1024 || /[\0\r\n]/.test(value)) {
     throw new HardeningError('INVALID_SPEC', `invalid ${what}: '${String(value).slice(0, 80)}'`);
   }
 }
@@ -62,7 +71,7 @@ export function hardenedRunArgs(spec: HardenedContainerSpec, createOnly = false)
   assertSafe(spec.name, 'container name', SAFE_NAME);
   assertSafe(spec.image, 'image', /^[a-z0-9][a-z0-9_.\-/]{0,255}:[a-zA-Z0-9_.\-]{1,128}$/);
   assertSafe(spec.volume, 'volume', SAFE_NAME);
-  assertSafe(spec.envFile, 'env file', SAFE_ABS_PATH);
+  assertSafeAbsolutePath(spec.envFile, 'env file');
   assertSafe(spec.network, 'network', SAFE_NAME);
   if (spec.command) {
     for (const c of spec.command) assertSafe(c, 'command arg', /^[^\0]{1,1024}$/);
@@ -122,7 +131,7 @@ export function hardenedTempVolumeArgs(opts: {
   assertSafe(opts.image, 'image', /^[a-z0-9][a-z0-9_.\-/]{0,255}:[a-zA-Z0-9_.\-]{1,128}$/);
   assertSafe(opts.volume, 'volume', SAFE_NAME);
   const mountPoint = opts.mountPoint ?? '/data';
-  assertSafe(mountPoint, 'mount point', SAFE_ABS_PATH);
+  assertSafe(mountPoint, 'mount point', SAFE_CONTAINER_PATH);
   return [
     'create',
     '--name', opts.name,

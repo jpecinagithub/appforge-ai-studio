@@ -74,6 +74,7 @@ function parseLabelArgs(args: string[]): Record<string, string> {
 
 class StubDocker {
   calls: string[][] = [];
+  callSignals: Array<AbortSignal | undefined> = [];
   volumes = new Map<string, Record<string, string>>();
   networks = new Map<string, { internal: boolean; labels: Record<string, string> }>();
   images = new Map<string, StubImage>(); // por ref o id
@@ -142,6 +143,7 @@ class StubDocker {
   async run(options: DockerRunOptions): Promise<DockerRunResult> {
     const args = options.args;
     this.calls.push([...args]);
+    this.callSignals.push(options.signal);
     // Fallo inyectado por predicado (se consume una sola vez).
     const predIdx = this.failPreds.findIndex((f) => f.pred(args, this));
     if (predIdx >= 0) {
@@ -404,7 +406,15 @@ function makeProjectDir(dataDir: string, projectId: string, opts: { evilDockerfi
 function openDb(): Database.Database {
   const db = new Database(':memory:');
   ensureVerificationReceiptsTable(db);
-  db.exec('CREATE TABLE IF NOT EXISTS deployments(id TEXT PRIMARY KEY)');
+  db.exec(`CREATE TABLE IF NOT EXISTS deployments(
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    status TEXT,
+    backup_id TEXT,
+    finished_at TEXT,
+    updated_at TEXT,
+    started_at TEXT
+  )`);
   return db;
 }
 
@@ -1357,12 +1367,6 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     const db = openDb();
     const projectDir = makeProjectDir(dataDir, PID);
     recordAllReceipts(db, PID, projectDir);
-    db.exec('ALTER TABLE deployments ADD COLUMN project_id TEXT');
-    db.exec('ALTER TABLE deployments ADD COLUMN status TEXT');
-    db.exec('ALTER TABLE deployments ADD COLUMN backup_id TEXT');
-    db.exec('ALTER TABLE deployments ADD COLUMN finished_at TEXT');
-    db.exec('ALTER TABLE deployments ADD COLUMN updated_at TEXT');
-    db.exec('ALTER TABLE deployments ADD COLUMN started_at TEXT');
     db.prepare('INSERT INTO deployments(id, project_id, status) VALUES (?,?,?)').run(DID, PID, 'building');
     const stub = new StubDocker();
     const d = makeDriver(dataDir, db, stub);
@@ -1441,6 +1445,16 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     expect(r.ok).toBe(true);
     const exists = (id: string) => fs.existsSync(path.join(dataDir, 'project-backups', PID, id));
     expect(exists(ids[0])).toBe(false); // no protegido: se elimina por antigüedad
+  });
+
+  test('fallo al leer el estado protegido → retención fail closed, ningún backup antiguo se elimina', async () => {
+    const { dataDir, db, d, ids } = await setupWithBackups(12);
+    db.exec('ALTER TABLE deployments RENAME COLUMN backup_id TO backup_id_unavailable');
+    expect(() => (
+      d as unknown as { protectedBackupIds: (projectId: string) => Set<string> }
+    ).protectedBackupIds(PID)).toThrow(/retention skipped/);
+    const exists = (id: string) => fs.existsSync(path.join(dataDir, 'project-backups', PID, id));
+    for (const id of ids) expect(exists(id)).toBe(true);
   });
 });
 
@@ -1579,6 +1593,21 @@ describe('NO-GO2 B4: identidad de previousLiveVersion antes de ejecutar', () => 
     const r = await d.startPreviousVersion(prevArgs());
     expect(r.ok).toBe(false);
     expect(r.code).toMatch(/PREVIOUS_IMAGE_MISSING/);
+  });
+
+  test('referencia válida con labels de otra imagen → PREVIOUS_IMAGE_IDENTITY_MISMATCH', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    seedPrevImage(stub, {
+      ...goodLabels(),
+      'com.appforge.deployment-id': 'eeeeeeee-dddd-4eee-8fff-000000000000',
+    });
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_IDENTITY_MISMATCH/);
+    expect(stub.calledWith('run')).toBe(false);
   });
 
   test('imagen válida: el contenedor usa las labels REALES de la imagen anterior', async () => {
@@ -1756,6 +1785,26 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     expect(m.files).toEqual([]);
   });
 
+  test('previousLiveVersion sin contenedor ni volumen → LIVE_DATA_MISSING, nunca backup vacío', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const previous = `appforge/app-${PID.slice(0, 8)}:dep-bbbbbbbb-${'b'.repeat(12)}`;
+    const r = await d.createLiveBackup(backupArgs(previous));
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/LIVE_DATA_MISSING/);
+    const root = path.join(dataDir, 'project-backups', PID);
+    const manifests = fs.existsSync(root)
+      ? fs.readdirSync(root).filter((entry) => fs.existsSync(path.join(root, entry, 'backup.json')))
+      : [];
+    expect(manifests).toEqual([]);
+  });
+
   test('fallo de docker cp tras detener el live → se re-levanta con health y se devuelve el error original', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
     const db = openDb();
@@ -1791,6 +1840,37 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     expect(stub.calledWith('start', LIVE)).toBe(true);
     const entry = stub.containers.get(LIVE) as { State: { Running: boolean } };
     expect(entry.State.Running).toBe(true);
+  });
+
+  test('señal original realmente abortada → la recuperación usa una señal independiente', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthOk(d);
+    const controller = new AbortController();
+    stub.failWhen(
+      (call) => {
+        if (call[0] !== 'cp') return false;
+        controller.abort();
+        return true;
+      },
+      'aborted',
+    );
+    const r = await d.createLiveBackup({
+      projectId: PID,
+      deploymentId: DID,
+      candidateId: `cand-${DID.slice(0, 8)}`,
+      previousLiveVersion: null,
+      signal: controller.signal,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/OPERATION_ABORTED/);
+    expect(controller.signal.aborted).toBe(true);
+    const startIndex = stub.calls.findIndex((call) => call[0] === 'start' && call[1] === LIVE);
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(stub.callSignals[startIndex]).not.toBe(controller.signal);
+    expect(stub.callSignals[startIndex]?.aborted).toBe(false);
   });
 
   test('fallo de copia + recuperación sin health → BACKUP_RECOVERY_FAILED (servicio caído, se informa)', async () => {
@@ -2047,7 +2127,7 @@ describe('NO-GO2 B3: restore failure-safe y propiedad del staging', () => {
       let hostCpCount = 0;
       stub.failWhen(
         (c) => {
-          if (c[0] === 'cp' && c[1] && !c[1].includes(':/data/') && c[1].endsWith('/app.db')) {
+          if (c[0] === 'cp' && c[1] && !c[1].includes(':/data/') && path.basename(c[1]) === 'app.db') {
             hostCpCount++;
             return hostCpCount === 2;
           }
@@ -2071,6 +2151,73 @@ describe('NO-GO2 B3: restore failure-safe y propiedad del staging', () => {
         'simulated verify failure',
       );
     });
+  });
+
+  test('live original vacío + fallo tras copia parcial → compensación restaura un volumen vacío', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    makeValidBackup(dataDir);
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.volumes.set(liveVolume, liveVolumeLabels());
+    seedLiveContainer(stub);
+    stub.failWhen(
+      (call, state) => {
+        if (call[0] !== 'cp' || !call[1].startsWith('appforge-tmp-verify-')) return false;
+        const cname = call[1].split(':/data/')[0]!;
+        return state.containerVolumes.get(cname) === liveVolume;
+      },
+      'fail',
+      'simulated verify failure after partial restore',
+    );
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/RESTORE_FAILED_COMPENSATED/);
+    expect(stub.volumes.has(liveVolume)).toBe(true);
+    expect(stub.volumeFiles.get(liveVolume)?.has('app.db') ?? false).toBe(false);
+  });
+
+  test('señal original abortada durante restore → compensación usa presupuesto independiente', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    makeValidBackup(dataDir);
+    const liveVolume = projectLiveVolumeName(PID);
+    const originalBytes = seedLiveVolumeWithData(stub);
+    seedLiveContainer(stub);
+    const controller = new AbortController();
+    stub.failWhen(
+      (call, state) => {
+        if (call[0] !== 'cp' || !call[1].startsWith('appforge-tmp-verify-')) return false;
+        const cname = call[1].split(':/data/')[0]!;
+        if (state.containerVolumes.get(cname) !== liveVolume) return false;
+        controller.abort();
+        return true;
+      },
+      'aborted',
+    );
+    const r = await d.restoreBackup({
+      projectId: PID,
+      deploymentId: DID,
+      candidateId: `cand-${DID.slice(0, 8)}`,
+      backupId: BACKUP_ID,
+      signal: controller.signal,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/RESTORE_FAILED_COMPENSATED/);
+    expect(controller.signal.aborted).toBe(true);
+    const after = stub.volumeFiles.get(liveVolume)?.get('app.db');
+    expect(after).toBeDefined();
+    expect(Buffer.compare(after!, originalBytes)).toBe(0);
+    const compensationCreate = stub.calls
+      .map((call, index) => ({ call, index }))
+      .filter(({ call }) => call[0] === 'volume' && call[1] === 'create' && call[call.length - 1] === liveVolume)
+      .at(-1)?.index ?? -1;
+    expect(compensationCreate).toBeGreaterThanOrEqual(0);
+    expect(stub.callSignals[compensationCreate]).not.toBe(controller.signal);
+    expect(stub.callSignals[compensationCreate]?.aborted).toBe(false);
   });
 
   test('fallo en volume rm del live → el volumen original sobrevive intacto', async () => {

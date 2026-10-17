@@ -101,6 +101,13 @@ describe('validación de spec', () => {
     expect(() => hardenedRunArgs({ ...BASE, role: 'verify', image: 'evil; rm -rf /' })).toThrowError(HardeningError);
     expect(() => hardenedRunArgs({ ...BASE, role: 'verify', envFile: 'relative/path' })).toThrowError(HardeningError);
   });
+
+  test('acepta env-file absoluto de Windows y rechaza caracteres de control', () => {
+    const windowsPath = 'C:\\appforge\\deploy-env\\runtime.env';
+    expect(hardenedRunArgs({ ...BASE, role: 'verify', envFile: windowsPath })).toContain(windowsPath);
+    expect(() => hardenedRunArgs({ ...BASE, role: 'verify', envFile: 'C:\\appforge\\bad\nname.env' })).toThrowError(HardeningError);
+    expect(() => hardenedRunArgs({ ...BASE, role: 'verify', envFile: 'C:\\appforge\\bad\0name.env' })).toThrowError(HardeningError);
+  });
 });
 
 describe('hardenedTempVolumeArgs (temporal de copia, NO-GO2 B2)', () => {

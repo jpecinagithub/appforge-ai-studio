@@ -201,7 +201,15 @@ d('docker integration (fase 7A)', () => {
       fs.writeFileSync(path.join(projectDir, 'migrations', '002_broken.sql'), 'THIS IS NOT VALID SQL;\n');
     }
     const db = new DatabaseSync(path.join(dataDir, 'studio.db'));
-    db.exec('CREATE TABLE deployments(id TEXT PRIMARY KEY)');
+    db.exec(`CREATE TABLE deployments(
+      id TEXT PRIMARY KEY,
+      project_id TEXT,
+      status TEXT,
+      backup_id TEXT,
+      started_at TEXT,
+      updated_at TEXT,
+      finished_at TEXT
+    )`);
     db.exec(`CREATE TABLE IF NOT EXISTS verification_receipts(
        project_id TEXT NOT NULL,
        check_key TEXT NOT NULL,

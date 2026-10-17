@@ -1113,6 +1113,26 @@ vacío, malformado o distinto.
    distinto (`SNAPSHOT_SOURCE_FP_INVALID` / `SNAPSHOT_SOURCE_MISMATCH`); no
    basta con comprobarlo solo cuando sea truthy.
 
+**Revisión final Codex — cierres adicionales antes del merge**:
+
+- La retención falla cerrada con `BACKUP_RETENTION_STATE_ERROR` si SQLite
+  no permite determinar los backups protegidos; no se poda a ciegas.
+- Una `previousLiveVersion` persistida sin contenedor ni volumen devuelve
+  `LIVE_DATA_MISSING`; nunca se certifica un backup vacío como válido.
+- La recuperación del live tras un backup abortado y la compensación de un
+  restore disponen de una señal y presupuesto independientes del timeout
+  original. Así el mismo abort que dispara el rollback no impide repararlo.
+- La compensación elimina cualquier copia parcial y recrea el volumen
+  incluso cuando el estado original estaba vacío, por lo que restaura el
+  estado exacto y no conserva datos introducidos a medias.
+- `startPreviousVersion` exige que la referencia de imagen coincida con el
+  nombre derivado de sus propias labels de deployment/fingerprint, y crea o
+  valida el volumen live antes de arrancar; nombre y metadatos no pueden
+  describir identidades distintas.
+- Las rutas absolutas de `--env-file` aceptan sintaxis POSIX y Windows, con
+  límite de longitud y rechazo de NUL/CR/LF; se conserva la validación
+  POSIX estricta para rutas internas del contenedor.
+
 **Archivos de 7A** (inventario):
 `apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
 `apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),

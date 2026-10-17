@@ -586,8 +586,8 @@ export class DockerDeploymentDriver implements DeploymentDriver {
    * bloqueo 1): backups referenciados por deployments activos (no
    * terminales, incluido un rollback pendiente) y el backup del último
    * despliegue `live` (objetivo de un eventual rollback). Se leen de
-   * SQLite; si la lectura falla (p. ej. columna ausente), no se protege
-   * nada extra y la retención conserva igualmente las 10 copias recientes.
+   * SQLite. Si la lectura falla, se falla cerrado: ejecutar retención sin
+   * conocer los protegidos podría borrar el único rollback recuperable.
    */
   private protectedBackupIds(projectId: string): Set<string> {
     const ids = new Set<string>();
@@ -609,8 +609,11 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         )
         .get(projectId) as { backup_id: string } | undefined;
       if (lastLive && isValidBackupId(lastLive.backup_id)) ids.add(lastLive.backup_id);
-    } catch {
-      /* sin columnas/tabla legible: sin protegidos extra */
+    } catch (e) {
+      throw new DockerDriverError(
+        'BACKUP_RETENTION_STATE_ERROR',
+        `cannot determine protected backups; retention skipped: ${(e as Error).message}`,
+      );
     }
     return ids;
   }
@@ -1535,11 +1538,13 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           }
           return await this.backupOrphanLiveVolume(args, names.liveVolume, backupId, stamp);
         }
-        // Sin contenedor ni volumen (pero con previousLiveVersion): no hay
-        // BD que respaldar; backup vacío validado.
-        writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] });
-        enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-        return ok({ backupId, backupValidated: 'true' });
+        // Una versión anterior persistida sin contenedor ni volumen es una
+        // inconsistencia peligrosa, no un primer despliegue vacío. Afirmar
+        // hadDatabase=false aquí permitiría que el rollback borrase datos.
+        return err(
+          'LIVE_DATA_MISSING',
+          'previousLiveVersion exists but both live container and live volume are missing; refusing an empty backup',
+        );
       }
       await this.assertLiveSlot(projectId, names.liveContainer);
       // Detener de forma controlada antes de copiar.
@@ -1681,14 +1686,18 @@ export class DockerDeploymentDriver implements DeploymentDriver {
    * (revisión Codex, NO-GO 2, bloqueo 2).
    */
   private async recoverStoppedLive(args: LiveBackupArgs, containerName: string): Promise<DriverResult> {
-    const start = await this.sh(['start', containerName], { timeoutMs: 60_000, signal: args.signal });
+    // La señal de la operación original puede estar ya abortada por timeout.
+    // La recuperación necesita un presupuesto independiente o el runner ni
+    // siquiera ejecutaría `docker start`.
+    const recoverySignal = AbortSignal.timeout(120_000);
+    const start = await this.sh(['start', containerName], { timeoutMs: 60_000, signal: recoverySignal });
     if (start.aborted) return err('OPERATION_ABORTED', 'live recovery aborted');
     if (start.timedOut || start.code !== 0) {
       return err('BACKUP_RECOVERY_START_FAILED', `could not restart live container: ${start.stderr.slice(0, 200)}`);
     }
     for (let i = 0; i < 10; i++) {
       if (await this.containerRunning(containerName)) break;
-      await this.abortAwareSleep(1000, args.signal);
+      await this.abortAwareSleep(1000, recoverySignal);
     }
     if (!(await this.containerRunning(containerName))) {
       return err('BACKUP_RECOVERY_NOT_RUNNING', 'live container did not come back up after restart');
@@ -1698,7 +1707,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       deploymentId: args.deploymentId,
       candidateId: args.candidateId,
       runtime: 'live',
-      signal: args.signal,
+      signal: recoverySignal,
     });
     if (!health.ok) {
       return err('BACKUP_RECOVERY_UNHEALTHY', `live restarted but health check failed: ${health.error}`);
@@ -1922,15 +1931,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     signal?: AbortSignal,
   ): Promise<DriverResult> {
     try {
-      if (!(await resourceExists(this.runner, 'volume', liveVolume))) {
-        const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
-          timeoutMs: 30_000,
-          signal,
-        });
-        if (vc.code !== 0) {
-          return err('RESTORE_COMPENSATION_FAILED', `cannot recreate live volume: ${vc.stderr.slice(0, 200)}`);
-        }
-      } else {
+      if (await resourceExists(this.runner, 'volume', liveVolume)) {
         const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
           Labels?: Record<string, string>;
         };
@@ -1939,6 +1940,20 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         } catch {
           return err('FOREIGN_RESOURCE', `refusing to compensate foreign live volume '${liveVolume}'`);
         }
+        // El volumen existente puede contener una copia parcial del backup
+        // que falló. Se elimina y recrea incluso cuando el rescate original
+        // estaba vacío, para restaurar exactamente el estado previo.
+        const rm = await this.sh(['volume', 'rm', liveVolume], { timeoutMs: 30_000, signal });
+        if (rm.code !== 0) {
+          return err('RESTORE_COMPENSATION_FAILED', `cannot clear partial live volume: ${rm.stderr.slice(0, 200)}`);
+        }
+      }
+      const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
+        timeoutMs: 30_000,
+        signal,
+      });
+      if (vc.code !== 0) {
+        return err('RESTORE_COMPENSATION_FAILED', `cannot recreate live volume: ${vc.stderr.slice(0, 200)}`);
       }
       if (rescue.files.length > 0) {
         await this.copyHostFilesToVolume(image, liveVolume, rescue.files, rescue.dir, signal);
@@ -2199,7 +2214,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
             e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
               ? `${e.code}: ${e.message}`
               : `RESTORE_ERROR: ${(e as Error).message}`;
-          const comp = await this.compensateRestoreFailure(projectId, liveVolume, names.image, rescue!, args.signal);
+          // Igual que el rollback del orquestador, la compensación debe tener
+          // presupuesto independiente: la señal que causó el fallo puede
+          // estar ya abortada y no debe impedir recuperar los datos.
+          const recoverySignal = AbortSignal.timeout(120_000);
+          const comp = await this.compensateRestoreFailure(
+            projectId,
+            liveVolume,
+            names.image,
+            rescue!,
+            recoverySignal,
+          );
           if (!comp.ok) {
             return err(
               'RESTORE_COMPENSATION_FAILED',
@@ -2274,6 +2299,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           `refusing to run previous image with invalid labels: ${labelProblems.join(', ')}`,
         );
       }
+      const identity = resourceNames(
+        args.projectId,
+        prevLabels[LABEL_DEPLOYMENT]!,
+        prevLabels[LABEL_FINGERPRINT]!,
+      );
+      if (identity.image !== prevImage) {
+        return err(
+          'PREVIOUS_IMAGE_IDENTITY_MISMATCH',
+          `previous image reference '${prevImage}' does not match its persisted labels`,
+        );
+      }
       // El nuevo contenedor live usa las labels REALES de la imagen anterior
       // (deployment + fingerprint de cuando se construyó), no las del
       // deployment fallido.
@@ -2283,6 +2319,8 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         role: 'live',
         fingerprint: prevLabels[LABEL_FINGERPRINT]!,
       };
+      const liveVolumeCheck = await this.ensureLiveVolume(args.projectId, args.signal);
+      if (liveVolumeCheck) return liveVolumeCheck;
       const runArgs = hardenedRunArgs({
         name: names.liveContainer,
         image: prevImage,
