@@ -15,19 +15,31 @@
  * - building: failed, sin rollback, limpieza del candidato.
  * - migrating (verificación): failed, live intacto, limpieza de verificación.
  * - verifying: failed, live intacto, runtime verify eliminado siempre.
+ *   Tras una verificación CORRECTA, detener el runtime es PRECONDICIÓN
+ *   OBLIGATORIA para promocionar (revisión Codex final): cualquier
+ *   resultado no-ok del stop (fallo, excepción, timeout o abort)
+ *   impide el backup y tocar live → failed + limpieza restante +
+ *   diagnóstico completo. Si la BD de verificación no puede descartarse
+ *   tras una verificación correcta, tampoco se promociona → failed.
  * - backup: failed, sin migraciones live, live intacto. El backup debe ser
  *   ok + backupId con formato interno válido + confirmación semántica de
- *   backup validado; si falta o es inválido, failed sin tocar live.
+ *   backup validado; si falta o es inválido, failed sin tocar live y el
+ *   candidato se descarta exactamente una vez (un fallo del descarte
+ *   queda en deployments.error y en los eventos).
  * - migración live / stop live / start candidato / health live: rollback
  *   exactamente una vez → rolled_back si funciona, failed (con ambos
- *   diagnósticos) si el rollback falla. Sin bucles.
+ *   diagnósticos) si el rollback falla. Sin bucles. El rollback usa un
+ *   presupuesto de recuperación INDEPENDIENTE (rollbackTimeoutMs,
+ *   defecto 5 min): no depende del deadline global del pipeline, que
+ *   puede estar ya vencido.
  * - rolled_back SOLO es válido si existía previousLiveVersion, fue
  *   arrancada y pasó health. Sin versión anterior: se restaura el backup
  *   cuando corresponda, se limpia el candidato y se termina en failed
  *   (nunca health ficticio sobre una versión inexistente).
  * - Nunca hay dos versiones live simultáneas según el estado persistido:
  *   `project_runtime` tiene una sola fila por proyecto y solo se actualiza
- *   tras el health live correcto.
+ *   tras el health live correcto, en la MISMA transacción que la
+ *   transición a live y su evento (`finalizeLiveDeployment`, atómico).
  *
  * Semántica de timeouts y cancelación (revisión Codex):
  * - Cada operación del driver corre con un AbortController propio:
@@ -57,6 +69,7 @@ import type Database from 'better-sqlite3';
 import {
   DeploymentError,
   createDeployment,
+  finalizeLiveDeployment,
   getDeployment,
   getProjectRuntime,
   isDeploymentCancelRequested,
@@ -66,7 +79,6 @@ import {
   setDeploymentCandidate,
   setDeploymentPreviousLive,
   transitionDeployment,
-  upsertProjectRuntime,
   type DeploymentRecord,
 } from './stateMachine.js';
 
@@ -104,6 +116,13 @@ export interface RunDeploymentOptions {
    */
   opTimeoutMs?: number;
   pipelineTimeoutMs?: number;
+  /**
+   * Revisión Codex final (NO-GO, bloqueo 2): presupuesto de recuperación
+   * INDEPENDIENTE para el rollback. El rollback no puede depender del
+   * deadline global del pipeline (puede estar ya vencido cuando se
+   * necesita). Defecto 5 min; acotado y configurable.
+   */
+  rollbackTimeoutMs?: number;
   /** Sondeo de `cancel_requested` mientras una operación está en vuelo. */
   cancelPollMs?: number;
 }
@@ -139,6 +158,7 @@ export async function runDeploymentPipeline(
   }
   const opTimeoutMs = opts.opTimeoutMs ?? 600_000;
   const pipelineTimeoutMs = opts.pipelineTimeoutMs ?? 1_200_000;
+  const rollbackTimeoutMs = opts.rollbackTimeoutMs ?? 300_000;
   const cancelPollMs = opts.cancelPollMs ?? 250;
   const pipelineDeadline = Date.now() + pipelineTimeoutMs;
 
@@ -172,7 +192,7 @@ export async function runDeploymentPipeline(
   const args: DriverOpArgs = { deploymentId: depId, projectId, candidateId };
   setDeploymentCandidate(db, depId, candidateId);
 
-  type AbortCause = 'op-timeout' | 'pipeline-timeout' | 'cancel' | null;
+  type AbortCause = 'op-timeout' | 'pipeline-timeout' | 'rollback-timeout' | 'cancel' | null;
   interface DriveOutcome {
     result: DriverResult;
     aborted: AbortCause;
@@ -191,12 +211,17 @@ export async function runDeploymentPipeline(
     phase: string,
     opName: string,
     fn: (signal: AbortSignal) => Promise<DriverResult>,
-    driveOpts?: { abortOnCancel?: boolean },
+    driveOpts?: { abortOnCancel?: boolean; deadlineMs?: number },
   ): Promise<DriveOutcome> => {
     const startedAt = nowIso();
     const t0 = Date.now();
     const controller = new AbortController();
     const abortOnCancel = driveOpts?.abortOnCancel ?? true;
+    // Revisión Codex final (bloqueo 2): el deadline puede ser el global del
+    // pipeline o el presupuesto de recuperación independiente del rollback.
+    const deadlineMs = driveOpts?.deadlineMs ?? pipelineDeadline;
+    const deadlineCause: Exclude<AbortCause, null> =
+      driveOpts?.deadlineMs !== undefined ? 'rollback-timeout' : 'pipeline-timeout';
     let aborted: AbortCause = null;
     const fireAbort = (cause: Exclude<AbortCause, null>) => {
       if (aborted) return;
@@ -205,8 +230,8 @@ export async function runDeploymentPipeline(
     };
     const opTimer = setTimeout(() => fireAbort('op-timeout'), Math.max(1, opTimeoutMs));
     const pipelineTimer = setTimeout(
-      () => fireAbort('pipeline-timeout'),
-      Math.max(1, pipelineDeadline - Date.now()),
+      () => fireAbort(deadlineCause),
+      Math.max(1, deadlineMs - Date.now()),
     );
     const cancelPoll = setInterval(() => {
       try {
@@ -415,26 +440,51 @@ export async function runDeploymentPipeline(
     outcome = await drive('verifying', 'runAuthenticatedVerification', (signal) =>
       driver.runAuthenticatedVerification({ ...args, signal }),
     );
-    // El runtime de verificación se elimina SIEMPRE, falle o no la verificación.
-    const stopOutcome = await drive('verifying', 'stopVerificationRuntime', (signal) =>
-      driver.stopVerificationRuntime({ ...args, signal }),
-    );
-    if (!stopOutcome.result.ok && !stopOutcome.aborted) {
-      recordEvent(db, depId, {
-        phase: 'verifying',
-        event: 'verify_cleanup_warning',
-        status: 'warning',
-        error: `verification runtime stop reported failure (${describeResult(stopOutcome.result)}); continuing`,
-      });
-    }
+    // Si la propia verificación falla, expira o se cancela, el runtime puede
+    // seguir en pie: la limpieza lo detiene (best-effort con diagnóstico).
     terminal = await handlePrePromotingOutcome(
       'verifying',
       outcome,
-      [discardVerificationDbFn, discardCandidateFn],
+      [stopVerifyFn, discardVerificationDbFn, discardCandidateFn],
       (r) => `authenticated verification failed (${describeResult(r)}); live untouched`,
     );
     if (terminal) return terminal;
-    await cleanup('verifying', 'discardVerification', [discardVerificationDbFn]);
+    // Revisión Codex final (bloqueo 1): detener el runtime de verificación
+    // es PRECONDICIÓN OBLIGATORIA para promocionar. Cualquier resultado
+    // no-ok (fallo, excepción, timeout o abort —incluido por cancelación—)
+    // impide ejecutar el backup o tocar live: termina en failed, ejecuta
+    // la limpieza restante y conserva todos los fallos en el diagnóstico,
+    // porque no se puede garantizar que el runtime haya desaparecido.
+    const stopOutcome = await drive('verifying', 'stopVerificationRuntime', (signal) =>
+      driver.stopVerificationRuntime({ ...args, signal }),
+    );
+    if (!stopOutcome.result.ok) {
+      const cause = stopOutcome.aborted
+        ? `aborted (${stopOutcome.aborted}${stopOutcome.aborted === 'cancel' ? '; cancel was requested' : ''})`
+        : describeResult(stopOutcome.result);
+      const cleanFails = await cleanup('verifying', 'mandatoryStop', [discardVerificationDbFn, discardCandidateFn]);
+      return finishFailed(
+        'verifying',
+        withCleanupFailures(
+          `mandatory verification runtime stop failed (${cause}); cannot promote: backup and live untouched`,
+          cleanFails,
+        ),
+      );
+    }
+    // Revisión Codex final (bloqueo 3): si la BD de verificación no puede
+    // descartarse tras una verificación correcta, no se entra en promoting:
+    // failed con el fallo de limpieza en el diagnóstico.
+    const discardFails = await cleanup('verifying', 'discardVerification', [discardVerificationDbFn]);
+    if (discardFails.length > 0) {
+      const candidateFails = await cleanup('verifying', 'discardCandidate', [discardCandidateFn]);
+      return finishFailed(
+        'verifying',
+        withCleanupFailures(
+          `verification database discard failed; cannot promote: ${discardFails.join('; ')}`,
+          candidateFails,
+        ),
+      );
+    }
 
     // ---- 4. verifying → promoting (SECCIÓN CRÍTICA) -----------------------
     // La cancelación se comprueba ANTES de entrar. Una vez dentro, la
@@ -462,18 +512,37 @@ export async function runDeploymentPipeline(
       fn: (signal: AbortSignal) => Promise<DriverResult>,
     ): Promise<DriveOutcome> => drive('promoting', opName, fn, { abortOnCancel: false });
 
+    // `backupId` se declara aquí (y no junto a su validación) porque
+    // `rollbackOnce` lo referencia: declararlo después provocaría un
+    // ReferenceError por TDZ si el backup se aborta antes de validarse.
+    let backupId: string | null = null;
+
     /** Frase humana para la causa de abort en diagnósticos de promoting. */
     const abortNote = (aborted: AbortCause): string =>
       aborted === 'op-timeout'
         ? ' (operation timed out)'
         : aborted === 'pipeline-timeout'
           ? ' (pipeline timed out)'
-          : aborted === 'cancel'
-            ? ' (cancelled)'
-            : '';
+          : aborted === 'rollback-timeout'
+            ? ' (rollback recovery timed out)'
+            : aborted === 'cancel'
+              ? ' (cancelled)'
+              : '';
 
     /** Rollback exactamente una vez; sin bucles. */
     const rollbackOnce = async (originalError: string): Promise<DeploymentRecord> => {
+      // Revisión Codex final (bloqueo 2): presupuesto de recuperación
+      // INDEPENDIENTE y compartido por todo el rollback. El deadline
+      // global del pipeline puede estar ya vencido cuando se necesita el
+      // rollback; sin presupuesto propio, las operaciones de recuperación
+      // se abortarían de inmediato. Mantiene AbortSignal por operación y
+      // espera la terminación real de cada una.
+      const recoveryDeadline = Date.now() + Math.max(1, rollbackTimeoutMs);
+      const driveRollback = (
+        opName: string,
+        fn: (signal: AbortSignal) => Promise<DriverResult>,
+      ): Promise<DriveOutcome> =>
+        drive('promoting', opName, fn, { abortOnCancel: false, deadlineMs: recoveryDeadline });
       recordEvent(db, depId, {
         phase: 'promoting',
         event: 'rollback_started',
@@ -487,7 +556,7 @@ export async function runDeploymentPipeline(
       if (!previousLiveVersion) {
         const parts = [`deploy failed (${originalError})`, 'no previous live version to roll back to'];
         if (backupId) {
-          const rb = await driveCritical('rollback:restoreBackup', (signal) =>
+          const rb = await driveRollback('rollback:restoreBackup', (signal) =>
             driver.restoreBackup({ ...args, backupId, signal }),
           );
           if (!rb.result.ok) parts.push(`backup restore also failed (${describeResult(rb.result)})`);
@@ -495,18 +564,18 @@ export async function runDeploymentPipeline(
         const cleanFails = await cleanup('promoting', 'discardCandidate', [discardCandidateFn]);
         return finishFailed('promoting', withCleanupFailures(parts.join('; '), cleanFails));
       }
-      const s1 = await driveCritical('rollback:stopCurrentLiveRuntime', (signal) =>
+      const s1 = await driveRollback('rollback:stopCurrentLiveRuntime', (signal) =>
         driver.stopCurrentLiveRuntime({ ...args, signal }),
       );
       const s2 = backupId
-        ? await driveCritical('rollback:restoreBackup', (signal) =>
+        ? await driveRollback('rollback:restoreBackup', (signal) =>
             driver.restoreBackup({ ...args, backupId, signal }),
           )
         : null;
-      const s3 = await driveCritical('rollback:startPreviousVersion', (signal) =>
+      const s3 = await driveRollback('rollback:startPreviousVersion', (signal) =>
         driver.startPreviousVersion({ ...args, previousLiveVersion, signal }),
       );
-      const s4 = await driveCritical('rollback:runHealthCheck', (signal) =>
+      const s4 = await driveRollback('rollback:runHealthCheck', (signal) =>
         driver.runHealthCheck({ ...args, runtime: 'live', signal }),
       );
       const failures = [
@@ -549,12 +618,19 @@ export async function runDeploymentPipeline(
         : !isValidBackupId(backupIdCandidate)
           ? `backupId missing or invalid ('${backupIdCandidate ?? '(none)'}')`
           : 'backup not semantically validated by driver';
+      // Revisión Codex final (bloqueo 3): un backup inválido descarta el
+      // candidato EXACTAMENTE UNA VEZ. Si el descarte falla, el fallo queda
+      // en deployments.error y en los eventos (nunca se traga en silencio).
+      const discardFails = await cleanup('promoting', 'discardCandidate', [discardCandidateFn]);
       return finishFailed(
         'promoting',
-        `live backup invalid (${detail}); live migrations never ran; live untouched`,
+        withCleanupFailures(
+          `live backup invalid (${detail}); live migrations never ran; live untouched`,
+          discardFails,
+        ),
       );
     }
-    const backupId: string = backupIdCandidate;
+    backupId = backupIdCandidate;
     setDeploymentBackup(db, depId, backupId);
 
     r = await driveCritical('runLiveMigrations', (signal) => driver.runLiveMigrations({ ...args, signal }));
@@ -567,17 +643,21 @@ export async function runDeploymentPipeline(
     if (!r.result.ok) return rollbackOnce(`live health check failed for candidate (${describeResult(r.result)})${abortNote(r.aborted)}`);
 
     // ---- 5. promoting → live ---------------------------------------------
-    // project_runtime SOLO se actualiza tras el health live correcto.
-    // El candidato ES ahora la versión live: nunca se descarta aquí
-    // (revisión Codex; podar artefactos viejos queda para Fase 7).
-    upsertProjectRuntime(db, {
-      projectId,
-      containerName: containerNameFor(projectId),
-      liveImage: candidateId,
-      previousImage: previousLiveVersion,
-      status: 'running',
-    });
-    return transitionDeployment(db, depId, 'live', {
+    // Revisión Codex final (bloqueo 4): finalización ATÓMICA en una sola
+    // transacción SQLite: project_runtime + transición a live + evento. Si
+    // falla cualquiera de las escrituras, el nuevo runtime NO queda
+    // publicado (revierte todo; el catch-all deja el deployment en failed
+    // con el diagnóstico). project_runtime SOLO se actualiza tras el
+    // health live correcto. El candidato ES ahora la versión live: nunca
+    // se descarta aquí (podar artefactos viejos queda para Fase 7).
+    return finalizeLiveDeployment(db, depId, {
+      runtime: {
+        projectId,
+        containerName: containerNameFor(projectId),
+        liveImage: candidateId,
+        previousImage: previousLiveVersion,
+        status: 'running',
+      },
       diagnostic: `live=${candidateId} previous=${previousLiveVersion ?? '(none)'}`,
     });
   } catch (e) {
