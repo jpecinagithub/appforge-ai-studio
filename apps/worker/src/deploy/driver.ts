@@ -72,7 +72,7 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$/;
  * admite 'verify'|'live'. Interfaz cerrada: claves desconocidas → error.
  */
 export function assertDriverArgs(args: DriverOpArgs): void {
-  const extra = args as Record<string, unknown>;
+  const extra = args as unknown as Record<string, unknown>;
   for (const k of ['deploymentId', 'projectId', 'candidateId'] as const) {
     const v = extra[k];
     if (typeof v !== 'string' || !SAFE_ID.test(v)) {

@@ -59,9 +59,10 @@ function seedVerificationEvidence(projectId: string): void {
   ).run(`m-${projectId}`, projectId, 1, '001_init.sql', 'success', now, now, 10, 'ok', null);
 }
 
-function buildApp(driver?: FakeDeploymentDriver): Promise<FastifyInstance> {
+async function buildApp(driver?: FakeDeploymentDriver): Promise<FastifyInstance> {
   const a = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR, deploymentDriver: driver });
-  return a.ready().then(() => a);
+  await a.ready();
+  return a;
 }
 
 async function waitForTerminal(

@@ -51,7 +51,7 @@ import {
   MAX_EVENT_OUTPUT_CHARS,
   MAX_DEPLOYMENT_LOGS_CHARS,
 } from '../index.js';
-import { FakeDeploymentDriver, type HealthCheckArgs } from './driver.js';
+import { FakeDeploymentDriver, type DriverOpArgs, type FakeOpBehavior, type FakeOpName, type HealthCheckArgs } from './driver.js';
 import { createDynamicTools } from '../dynamicTools.js';
 import { nowIso } from '../tools.js';
 
@@ -81,12 +81,12 @@ afterEach(() => {
  * Hace fallar solo el PRIMER health check live (el del candidato): simula
  * un candidato sin salud cuya versión anterior sí responde tras el restore.
  */
-function failFirstLiveHealth() {
+function failFirstLiveHealth(): (op: FakeOpName, args: DriverOpArgs) => FakeOpBehavior | undefined {
   let failedOnce = false;
-  return (op: string, args: { runtime?: string }) => {
+  return (op, args) => {
     if (op === 'runHealthCheck' && (args as HealthCheckArgs).runtime === 'live' && !failedOnce) {
       failedOnce = true;
-      return 'fail' as const;
+      return 'fail';
     }
     return undefined;
   };
@@ -130,10 +130,14 @@ describe('state machine (criterio 3)', () => {
   it('is idempotent when repeating an already-completed transition', () => {
     addProject('p1');
     const dep = createDeployment(db, { projectId: 'p1', target: 'oracle' });
-    const once = transitionDeployment(db, dep.id, 'building', { diagnostic: 'x' });
+    transitionDeployment(db, dep.id, 'building', { diagnostic: 'x' });
+    const afterOnce = getDeployment(db, dep.id)!;
+    const eventsBefore = listDeploymentEvents(db, dep.id).length;
     const twice = transitionDeployment(db, dep.id, 'building', { diagnostic: 'x' });
     expect(twice.status).toBe('building');
-    expect(once.updatedAt).toBe(twice.updatedAt);
+    // La repetición es un no-op total: ni updated_at, ni eventos nuevos.
+    expect(twice.updatedAt).toBe(afterOnce.updatedAt);
+    expect(listDeploymentEvents(db, dep.id).length).toBe(eventsBefore);
   });
 
   it('terminal states accept no further transitions', () => {
