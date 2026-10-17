@@ -221,6 +221,7 @@ d('docker integration (fase 7A)', () => {
       dockerBin: 'docker',
       socketPath: '/var/run/docker.sock',
       minDockerVersion: '24.0.0',
+      templatesDir: path.join(REPO, 'templates'),
     };
     const driver = new DockerDeploymentDriver(cfg, {
       runner,
