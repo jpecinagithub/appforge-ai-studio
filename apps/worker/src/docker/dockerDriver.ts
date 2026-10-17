@@ -43,6 +43,7 @@ import {
   labelArgs,
   assertLabelsMatch,
   assertUuid,
+  assertFingerprint,
   id8,
   inspectResource,
   resourceExists,
@@ -1932,7 +1933,52 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (await resourceExists(this.runner, 'container', names.liveContainer)) {
         return err('LIVE_EXISTS', 'live container already exists; refusing to create a second one');
       }
-      const labels = this.opLabels(args.projectId, args.deploymentId, 'live');
+      // Inspeccionar la imagen anterior ANTES de ejecutarla (revisión Codex,
+      // NO-GO 2, bloqueo 4): debe ser una imagen AppForge gestionada DE ESTE
+      // PROYECTO. Un nombre con formato válido no basta: una imagen de otro
+      // proyecto se rechaza aunque la referencia parezca correcta.
+      let prevLabels: Record<string, string>;
+      try {
+        const imgInfo = (await inspectResource(this.runner, 'image', prevImage)) as {
+          Config?: { Labels?: Record<string, string> };
+        };
+        prevLabels = imgInfo?.Config?.Labels ?? {};
+      } catch {
+        return err('PREVIOUS_IMAGE_MISSING', `previous image '${prevImage}' not found`);
+      }
+      const labelProblems: string[] = [];
+      if (prevLabels[MANAGED_LABEL] !== 'true') labelProblems.push(`${MANAGED_LABEL}!=true`);
+      if ((prevLabels[LABEL_PROJECT] ?? '').toLowerCase() !== args.projectId.toLowerCase()) {
+        labelProblems.push(`${LABEL_PROJECT} mismatch: image belongs to another project`);
+      }
+      try {
+        assertUuid(prevLabels[LABEL_DEPLOYMENT] ?? '', 'deployment-id');
+      } catch {
+        labelProblems.push(`${LABEL_DEPLOYMENT} missing or invalid`);
+      }
+      if (prevLabels[LABEL_ROLE] !== 'live') {
+        labelProblems.push(`${LABEL_ROLE} must be 'live'`);
+      }
+      try {
+        assertFingerprint(prevLabels[LABEL_FINGERPRINT] ?? '');
+      } catch {
+        labelProblems.push(`${LABEL_FINGERPRINT} missing or invalid`);
+      }
+      if (labelProblems.length > 0) {
+        return err(
+          'PREVIOUS_IMAGE_UNTRUSTED',
+          `refusing to run previous image with invalid labels: ${labelProblems.join(', ')}`,
+        );
+      }
+      // El nuevo contenedor live usa las labels REALES de la imagen anterior
+      // (deployment + fingerprint de cuando se construyó), no las del
+      // deployment fallido.
+      const labels: ManagedLabels = {
+        projectId: args.projectId,
+        deploymentId: prevLabels[LABEL_DEPLOYMENT]!,
+        role: 'live',
+        fingerprint: prevLabels[LABEL_FINGERPRINT]!,
+      };
       const runArgs = hardenedRunArgs({
         name: names.liveContainer,
         image: prevImage,

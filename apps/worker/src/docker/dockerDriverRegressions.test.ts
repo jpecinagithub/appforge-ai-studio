@@ -1353,3 +1353,159 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     expect(exists(ids[0])).toBe(false); // no protegido: se elimina por antigüedad
   });
 });
+
+describe('NO-GO2 B4: identidad de previousLiveVersion antes de ejecutar', () => {
+  const FP = 'c'.repeat(64);
+  const PREV_DID = 'cccccccc-dddd-4eee-8fff-000000000000';
+  const PREV_REF = `appforge/app-${PID.slice(0, 8)}:dep-${PREV_DID.slice(0, 8)}-${FP.slice(0, 12)}`;
+  const LIVE = `appforge-app-${PID.slice(0, 8)}`;
+
+  const goodLabels = (): Record<string, string> => ({
+    'com.appforge.managed': 'true',
+    'com.appforge.project-id': PID,
+    'com.appforge.deployment-id': PREV_DID,
+    'com.appforge.role': 'live',
+    'com.appforge.source-fingerprint': FP,
+  });
+
+  function seedPrevImage(stub: StubDocker, labels: Record<string, string>) {
+    const id = 'sha256:' + '9'.repeat(64);
+    const [repo, tag] = PREV_REF.split(':') as [string, string];
+    const img = { id, repo, tag, labels, os: 'linux', arch: 'amd64', user: '1001' };
+    stub.images.set(PREV_REF, img);
+    stub.images.set(id, img);
+  }
+
+  function liveInspect(labels: Record<string, string>, liveVolume: string) {
+    return {
+      Config: { Labels: labels, User: '1001', Image: PREV_REF },
+      State: { Running: true },
+      Mounts: [
+        { Type: 'volume', Name: liveVolume, Source: liveVolume, Destination: '/data' },
+        { Type: 'tmpfs', Destination: '/tmp' },
+      ],
+      NetworkSettings: { Networks: { 'appforge-apps': {} }, Ports: {} },
+      HostConfig: {
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 512 * 1024 * 1024,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 128,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        ReadonlyRootfs: true,
+        Privileged: false,
+        Devices: [],
+        PidMode: '',
+        IpcMode: 'private',
+        NetworkMode: 'appforge-apps',
+        RestartPolicy: { Name: 'unless-stopped' },
+      },
+    };
+  }
+
+  function prevArgs() {
+    return {
+      projectId: PID,
+      deploymentId: DID,
+      candidateId: `cand-${DID.slice(0, 8)}`,
+      previousLiveVersion: PREV_REF,
+    } as never;
+  }
+
+  async function setupWithBuild(dataDir: string, db: Database.Database, stub: StubDocker) {
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    return d;
+  }
+
+  function runLabels(stub: StubDocker): Record<string, string> {
+    const call = stub.calls.find((c) => c[0] === 'run')!;
+    const out: Record<string, string> = {};
+    for (let i = 0; i < call.length; i++) {
+      if (call[i] === '--label' && i + 1 < call.length) {
+        const v = call[i + 1]!;
+        out[v.slice(0, v.indexOf('='))] = v.slice(v.indexOf('=') + 1);
+      }
+    }
+    return out;
+  }
+
+  test('imagen de otro proyecto con nombre válido → rechazada, sin docker run', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    seedPrevImage(stub, { ...goodLabels(), 'com.appforge.project-id': '99999999-0000-4000-8000-000000000000' });
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_UNTRUSTED/);
+    expect(stub.calledWith('run')).toBe(false);
+  });
+
+  test('labels incompletas (sin fingerprint) → rechazada', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const labels = goodLabels();
+    delete labels['com.appforge.source-fingerprint'];
+    seedPrevImage(stub, labels);
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_UNTRUSTED/);
+    expect(stub.calledWith('run')).toBe(false);
+  });
+
+  test('deployment-id no UUID → rechazada', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    seedPrevImage(stub, { ...goodLabels(), 'com.appforge.deployment-id': 'no-es-uuid' });
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_UNTRUSTED/);
+  });
+
+  test('rol distinto de live → rechazada', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    seedPrevImage(stub, { ...goodLabels(), 'com.appforge.role': 'verify' });
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_UNTRUSTED/);
+  });
+
+  test('imagen inexistente → PREVIOUS_IMAGE_MISSING', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupWithBuild(dataDir, db, stub);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/PREVIOUS_IMAGE_MISSING/);
+  });
+
+  test('imagen válida: el contenedor usa las labels REALES de la imagen anterior', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    seedPrevImage(stub, goodLabels());
+    const d = await setupWithBuild(dataDir, db, stub);
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.containerTemplate = liveInspect(goodLabels(), liveVolume);
+    const r = await d.startPreviousVersion(prevArgs());
+    expect(r.ok).toBe(true);
+    const labels = runLabels(stub);
+    // Las labels del deployment anterior, NO las del deployment fallido (DID).
+    expect(labels['com.appforge.deployment-id']).toBe(PREV_DID);
+    expect(labels['com.appforge.source-fingerprint']).toBe(FP);
+    expect(labels['com.appforge.project-id']).toBe(PID);
+    expect(labels['com.appforge.role']).toBe('live');
+  });
+});
