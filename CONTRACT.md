@@ -574,12 +574,111 @@ registrar una comprobación invalida sus seguidoras canónicas, de modo que
 una ejecución desordenada nunca puede acumular receipts. Las definiciones
 `DYNAMIC_TOOL_DEFS` solo se exponen a proyectos dinámicos.
 
-Fase 5B (alcance acotado): `start_fullstack_preview` y
-`test_authenticated_flow` (register→login→me→CRUD→logout→401) contra el
-preview efímero. El despliegue live, `health_check_project`,
-`rollback_project` y `backup_project_database` pertenecen a las Fases 6–7.
-Todas confinadas al proyecto; ninguna ejecuta shell/Docker/SQL
-arbitrario: delegan en el módulo de orquestación (§9.10).
+### 9.17bis Herramientas del agente (Fase 5B: preview efímero + flujo autenticado)
+
+Fase 5B añade, con el mismo confinamiento (sin shell, sin entrada
+arbitraria del modelo, entorno hijo mínimo permitido):
+
+**Edición controlada por áreas** (`apps/worker/src/dynamicAreas.ts`): las
+herramientas de archivos aceptan `area` en proyectos dinámicos —
+`frontend` (`frontend/**/*`), `backend` (`backend/src/**/*`), `migrations`
+(`migrations/*.sql`), `tests` (`tests/*.test.mjs`) — y resuelven la ruta
+internamente dentro del proyecto activo. Siempre prohibidos:
+`.env*`, `data/`, `backups/`, `metadata/`, `logs/`, `node_modules/`,
+`dist/`, `.git/`, `Dockerfile`, `docker-compose.yml`, `package.json`,
+lockfiles y `scripts/`. Se rechazan rutas absolutas, `..`, null bytes y
+symlinks que escapen del área; solo texto UTF-8 con tamaño máximo.
+Los proyectos estáticos conservan exactamente su comportamiento anterior
+(`area` rechazado). Cualquier cambio invalida los receipts afectados y sus
+seguidores canónicos.
+
+**`start_fullstack_preview`** (`apps/worker/src/previewManager.ts`):
+precondición en código — los cuatro receipts 5A vigentes y en orden
+(`DYNAMIC_CHECKS_INCOMPLETE` si falta alguno). **Deshabilitado por defecto**:
+ejecutar código generado en el servidor exige la variable explícita
+`APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW=1`; sin ella el tool devuelve
+`PREVIEW_DISABLED` (la limpieza nunca está deshabilitada). Crea una SQLite
+temporal exclusiva, elige un puerto libre en loopback y arranca
+`node backend/dist/server.js` con entorno mínimo (`PORT`, `HOST=127.0.0.1`,
+`NODE_ENV=test`, `DB_PATH`, `PUBLIC_PATH=/a/:projectId/`, cookie de sesión
+específica del proyecto; nunca secretos del Studio). Espera `/healthz`
+con reintentos limitados, registra el preview en la tabla `previews`
+(único activo por proyecto; al reemplazar, el anterior se detiene por
+completo: árbol de procesos + espera de exit + limpieza de SQLite/WAL/SHM)
+y devuelve `{url: "/a/:projectId/", status: "ready"}`. Timeout/cancelación
+no dejan procesos ni puertos huérfanos. Si el backend muere después de
+`ready`, un vigilante marca el registro `failed`, limpia pid/puerto y la
+SQLite temporal de inmediato.
+
+**Proxy dinámico del Studio** (`GET|POST|… /a/:projectId/*` en
+`apps/server`): localiza únicamente el preview registrado para el
+proyecto, retira el prefijo, conserva método/query/body/cookies, soporta
+JSON y assets, nunca reenvía el `Authorization` del Studio, elimina
+headers hop-by-hop, aplica timeout (30 s) y límite de body (10 MiB),
+impide acceso cruzado entre proyectos y responde una página HTML de
+diagnóstico si no hay preview (con `projectName`/`projectId`/`status`
+escapados contra XSS). La URL destino procede siempre del
+registro interno: nunca es un proxy abierto. Las respuestas del upstream
+tienen límite de 10 MiB (rechazo rápido por `Content-Length` declarado +
+tope en streaming, protege contra gzip bombs); no se reenvían
+`content-length`/`content-encoding` del upstream (el proxy re-bufferiza)
+y los `Set-Cookie` múltiples se preservan. Si el upstream no responde, el
+proxy marca el preview `failed` en el registro (no confía solo en la fila
+`ready`) y responde 503.
+
+**`test_authenticated_flow`** (`apps/worker/src/authFlow.ts`): se ejecuta
+contra el preview publicado (nunca otro servidor) y exige el receipt de
+preview vigente sobre las fuentes actuales. Fase API determinista:
+`/healthz`, registro de A, cookie de sesión con exactamente
+`HttpOnly`, `SameSite=Lax` y `Path=/a/:projectId/` (`Secure` solo exigible
+en producción; en el preview HTTP local puede omitirse), sesión,
+crear+listar, registro de B, aislamiento (B recibe 404), vuelta a A,
+logout, `/api/auth/me` → 401. Fase Chromium real contra `/a/:projectId/`
+con selectores estables `data-testid` de la plantilla: registro desde la
+UI, contenido autenticado visible, crear registro y ver el resultado
+exacto, reload con recuperación de sesión, logout y vuelta a la pantalla
+de autenticación. No acepta URLs, selectores, credenciales ni comandos.
+
+**Gate de finalización 5B**: el orden canónico es ahora de seis —
+`frontendBuild → backendBuild → migrations → apiTests → fullstackPreview → authenticatedFlow`;
+`dynamicGateStatus()` exige los seis vigentes y en orden, ligados al
+fingerprint de las fuentes actuales. Los receipts de `fullstackPreview` y
+`authenticatedFlow` cubren la raíz del proyecto: cualquier cambio los
+invalida.
+
+**Estados y recuperación** (§9.14): la tabla `previews`
+(`starting|ready|failed|stopped`) se reconcilia al arrancar AppForge —
+ningún preview anterior se considera `ready`, los `starting` pasan a
+`stopped`, se limpian los directorios temporales y **ningún PID leído de
+SQLite se mata jamás**: el SO podría haberlo reutilizado para un proceso
+ajeno y su identidad no es verificable. `stopPreview` solo termina el
+árbol del `ChildProcess` que este worker generó (verificado por el mapa
+en memoria); sin hijo propio, se limita a limpiar el temporal verificado
+y cerrar la fila. Ante un backend inalcanzable, `failPreview` es una
+operación asíncrona de fallo/cierre que el proxy espera antes de
+responder 503: si el proceso es propio, mata su árbol, espera su
+terminación y solo después limpia y marca `failed` (sin huérfanos, sin
+borrar bajo un backend vivo); sin hijo propio, nunca mata el PID
+persistido. El borrado recursivo de `tmp_dir` solo acepta rutas
+estrictamente dentro de `os.tmpdir()`, distintas del propio
+`os.tmpdir()` y con el prefijo reservado `af-preview-`; cualquier otra
+ruta se rechaza. `delete_file` nunca permite borrar la raíz de un área
+(`"."`, `"./"`, `"a/.."` y equivalentes normalizados). Las lecturas
+decodifican los bytes originales con `TextDecoder('utf-8', {fatal: true})`:
+cualquier secuencia UTF-8 inválida se rechaza, nunca se sustituye por
+U+FFFD en silencio. Los previews son provisionales y no equivalen a
+despliegues.
+
+**Riesgo residual**: un cierre abrupto de AppForge puede dejar vivo un
+proceso detached anterior: `reconcilePreviews` ya no puede matarlo con
+seguridad. No se afirma "sin procesos huérfanos tras reinicio" hasta
+disponer de un supervisor con vínculo de vida al padre o del aislamiento
+de la Fase 7.
+
+El despliegue live, `health_check_project`, `rollback_project` y
+`backup_project_database` pertenecen a las Fases 6–7. Todas confinadas al
+proyecto; ninguna ejecuta shell/Docker/SQL arbitrario: delegan en el
+módulo de orquestación (§9.10).
 
 ### 9.18 Límites de recursos (defectos del piloto, configurables)
 

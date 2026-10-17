@@ -121,6 +121,63 @@ export async function checkBrowser(
   }
 }
 
+/**
+ * Fase 5B — drive real Chromium against a live URL (e.g. the dynamic
+ * preview published through the Studio proxy at /a/:projectId/).
+ * Same step language and diagnostics as checkBrowser.
+ */
+export async function checkBrowserAtUrl(
+  url: string,
+  steps: BrowserStep[] = [],
+  timeoutMs = 60_000,
+): Promise<ToolResult> {
+  const t0 = Date.now();
+  let browser;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const errors: string[] = [];
+  try {
+    browser = await chromium.launch({
+      executablePath: process.env.APPFORGE_BROWSER_EXECUTABLE || undefined,
+      headless: true, timeout: Math.min(timeoutMs, 15_000), args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const page = await context.newPage();
+    page.setDefaultTimeout(5000);
+    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('response', (response) => {
+      if (response.status() >= 400 && ['document', 'script', 'stylesheet', 'image'].includes(response.request().resourceType())) {
+        errors.push(`HTTP ${response.status()}: ${response.url()}`);
+      }
+    });
+    page.on('requestfailed', (request) => {
+      if (['document', 'script', 'stylesheet', 'image'].includes(request.resourceType())) errors.push(`Resource failed: ${request.url()}`);
+    });
+    const remaining = Math.max(1, timeoutMs - (Date.now() - t0));
+    const work = async () => {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: Math.min(remaining, 15_000) });
+      await page.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
+      await assertImagesLoaded(page);
+      for (const step of steps) await browserStep(page, step);
+      const text = (await page.locator('body').innerText()).slice(0, 6000);
+      const snapshot = (await page.locator('body').ariaSnapshot()).slice(0, 8000);
+      if (errors.length) throw new Error([...new Set(errors)].join('\n'));
+      await context.close();
+      return { text, snapshot, stepsPassed: steps.length };
+    };
+    const data = await Promise.race([
+      work(),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Browser verification timed out')), remaining); }),
+    ]);
+    return { ok: true, data, output: `Chromium verified the live preview. ${steps.length} interaction steps passed.\n${data.snapshot}`, durationMs: Date.now() - t0 };
+  } catch (error) {
+    const diagnostic = [...new Set([...errors, (error as Error).message])].join('\n');
+    return { ok: false, code: 'BROWSER_FAILED', error: diagnostic, output: diagnostic, durationMs: Date.now() - t0 };
+  } finally {
+    if (timer) clearTimeout(timer);
+    await browser?.close();
+  }
+}
+
 async function assertImagesLoaded(page: Page): Promise<void> {
   const broken = await page.locator('img').evaluateAll((images) => images
     .map((image) => image as unknown as { complete: boolean; naturalWidth: number; currentSrc: string; src: string; alt: string })

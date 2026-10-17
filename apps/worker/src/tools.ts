@@ -13,6 +13,7 @@ import type { FileNode, ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
 import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
+import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -43,16 +44,26 @@ export interface ToolContext {
     backendBuild?: string;
     migrations?: string;
     apiTests?: string;
+    fullstackPreview?: string;
+    authenticatedFlow?: string;
   };
   /**
    * Canonical completion order of the currently-valid dynamic checks
    * (a prefix of DYNAMIC_CHECK_ORDER). The completion gate requires all
-   * four in exact canonical order.
+   * six in exact canonical order (Fase 5B).
    */
-  dynamicChecksOrder?: Array<'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests'>;
+  dynamicChecksOrder?: Array<
+    'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests' | 'fullstackPreview' | 'authenticatedFlow'
+  >;
   browserSession?: BrowserSession;
   lastBrowserSteps?: BrowserStep[];
   lastBrowserStart?: BrowserSession;
+  /**
+   * Base URL of the Studio server (Fase 5B): the authenticated-flow
+   * Chromium checks run against `${studioBaseUrl}/a/:projectId/`
+   * (the published preview through the Studio proxy).
+   */
+  studioBaseUrl?: string;
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
@@ -106,21 +117,8 @@ function contentArg(args: Record<string, unknown>): string {
  * Resolve `p` inside `root`. Rejects absolute paths, null bytes and any
  * path escaping `root` (e.g. `../` traversal) with an INVALID_PATH error.
  */
-export function resolveIn(root: string, p: string): string {
-  if (typeof p !== 'string' || p.length === 0 || p.includes('\0')) {
-    const e = new Error(`invalid path: ${JSON.stringify(p)}`) as Error & { code: string };
-    e.code = 'INVALID_PATH';
-    throw e;
-  }
-  const absRoot = path.resolve(root);
-  const resolved = path.resolve(absRoot, p);
-  if (resolved !== absRoot && !resolved.startsWith(absRoot + path.sep)) {
-    const e = new Error(`path escapes project directory: ${p}`) as Error & { code: string };
-    e.code = 'INVALID_PATH';
-    throw e;
-  }
-  return resolved;
-}
+import { resolveIn } from './paths.js';
+export { resolveIn };
 
 /** Run a command without a shell, capturing output. Shared with the server (builds/git). */
 export async function runCmd(
@@ -180,10 +178,11 @@ async function listFiles(ctx: ToolContext, args: Record<string, unknown>): Promi
   const t0 = Date.now();
   try {
     const sub = args.path === undefined ? '.' : strArg(args, 'path');
-    const dir = resolveIn(ctx.frontendDir, sub);
+    const r = resolveAreaPath(ctx, args.area, sub);
+    const dir = r.abs;
     const st = fs.statSync(dir);
     if (!st.isDirectory()) return fail('NOT_A_DIRECTORY', `${sub} is not a directory`, Date.now() - t0);
-    return { ok: true, data: buildTree(ctx.frontendDir, dir, relPosix(ctx.frontendDir, dir) === '' ? '' : relPosix(ctx.frontendDir, dir)), durationMs: Date.now() - t0 };
+    return { ok: true, data: buildTree(r.root, dir, relPosix(r.root, dir) === '' ? '' : relPosix(r.root, dir)), durationMs: Date.now() - t0 };
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'LIST_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -193,11 +192,13 @@ async function readFile(ctx: ToolContext, args: Record<string, unknown>): Promis
   const t0 = Date.now();
   try {
     const p = strArg(args, 'path');
-    const abs = resolveIn(ctx.frontendDir, p);
+    const r = resolveAreaPath(ctx, args.area, p);
+    const abs = r.abs;
     const st = fs.statSync(abs);
     if (!st.isFile()) return fail('NOT_A_FILE', `${p} is not a file`, Date.now() - t0);
     if (st.size > MAX_FILE_BYTES) return fail('FILE_TOO_LARGE', `${p} exceeds ${MAX_FILE_BYTES} bytes`, Date.now() - t0);
-    return { ok: true, data: { content: fs.readFileSync(abs, 'utf8') }, durationMs: Date.now() - t0 };
+    const content = readAreaTextFile(abs, p);
+    return { ok: true, data: { content }, durationMs: Date.now() - t0 };
   } catch (e) {
     const code = (e as { code?: string }).code;
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
@@ -211,7 +212,9 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     const p = strArg(args, 'path');
     const content = contentArg(args);
     assertTextDestination(p);
-    const abs = resolveIn(ctx.frontendDir, p);
+    assertAreaText(content, p);
+    const r = resolveAreaPath(ctx, args.area, p);
+    const abs = r.abs;
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
     return { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
@@ -229,7 +232,8 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
       const p = strArg(file, 'path');
       const content = contentArg(file);
       assertTextDestination(p);
-      return { path: p, abs: resolveIn(ctx.frontendDir, p), content };
+      assertAreaText(content, p);
+      return { path: p, abs: resolveAreaPath(ctx, args.area, p).abs, content };
     });
     for (const file of files) {
       fs.mkdirSync(path.dirname(file.abs), { recursive: true });
@@ -248,10 +252,13 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     const p = strArg(args, 'path');
     const search = strArg(args, 'search');
     const replace = strArg(args, 'replace');
-    const abs = resolveIn(ctx.frontendDir, p);
-    const current = fs.readFileSync(abs, 'utf8');
+    const r = resolveAreaPath(ctx, args.area, p);
+    const abs = r.abs;
+    const current = readAreaTextFile(abs, p);
     if (!current.includes(search)) return fail('PATCH_NOT_FOUND', `search string not found in ${p}`, Date.now() - t0);
-    fs.writeFileSync(abs, current.replace(search, replace), 'utf8');
+    const next = current.replace(search, replace);
+    assertAreaText(next, p);
+    fs.writeFileSync(abs, next, 'utf8');
     return { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
@@ -263,7 +270,17 @@ async function deleteFile(ctx: ToolContext, args: Record<string, unknown>): Prom
   const t0 = Date.now();
   try {
     const p = strArg(args, 'path');
-    const abs = resolveIn(ctx.frontendDir, p);
+    const r = resolveAreaPath(ctx, args.area, p);
+    // Never delete the area root itself: path ".", "./", "a/.." and other
+    // normalized equivalents all resolve to rel === '.'.
+    if (r.rel === '.') {
+      return fail(
+        'AREA_ROOT_DELETE',
+        `refusing to delete the ${r.area ?? 'frontend'} area root ("${p}" resolves to the area root); delete individual files instead`,
+        Date.now() - t0,
+      );
+    }
+    const abs = r.abs;
     const st = fs.statSync(abs);
     fs.rmSync(abs, { recursive: st.isDirectory(), force: true });
     return { ok: true, data: { deleted: p }, durationMs: Date.now() - t0 };
@@ -277,7 +294,8 @@ async function createDirectory(ctx: ToolContext, args: Record<string, unknown>):
   const t0 = Date.now();
   try {
     const p = strArg(args, 'path');
-    fs.mkdirSync(resolveIn(ctx.frontendDir, p), { recursive: true });
+    const r = resolveAreaPath(ctx, args.area, p);
+    fs.mkdirSync(r.abs, { recursive: true });
     return { ok: true, durationMs: Date.now() - t0 };
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'MKDIR_FAILED', (e as Error).message, Date.now() - t0);
@@ -507,6 +525,9 @@ async function searchCode(ctx: ToolContext, args: Record<string, unknown>): Prom
   const t0 = Date.now();
   try {
     const pattern = strArg(args, 'pattern');
+    // The area root replaces frontend/ as the search root on dynamic projects.
+    const r = resolveAreaPath(ctx, args.area, '.');
+    const root = r.root;
     const matches: Array<{ file: string; line: number; text: string }> = [];
     const walk = (dir: string) => {
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -517,10 +538,10 @@ async function searchCode(ctx: ToolContext, args: Record<string, unknown>): Prom
         } else if (e.isFile()) {
           try {
             if (fs.statSync(abs).size > MAX_FILE_BYTES || !isTextFile(abs)) continue;
-            const lines = fs.readFileSync(abs, 'utf8').split('\n');
+            const lines = readAreaTextFile(abs, e.name).split('\n');
             lines.forEach((text, i) => {
               if (matches.length < 200 && text.includes(pattern)) {
-                matches.push({ file: relPosix(ctx.frontendDir, abs), line: i + 1, text: text.slice(0, 300) });
+                matches.push({ file: relPosix(root, abs), line: i + 1, text: text.slice(0, 300) });
               }
             });
           } catch {
@@ -529,7 +550,7 @@ async function searchCode(ctx: ToolContext, args: Record<string, unknown>): Prom
         }
       }
     };
-    walk(ctx.frontendDir);
+    walk(root);
     return { ok: true, data: { matches, truncated: matches.length >= 200 }, durationMs: Date.now() - t0 };
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'SEARCH_FAILED', (e as Error).message, Date.now() - t0);
@@ -728,16 +749,18 @@ async function runCommand(ctx: ToolContext, args: Record<string, unknown>): Prom
 
 const S = (description: string) => ({ type: 'string', description });
 
+const AREA_PARAM = { area: { type: 'string', enum: ['frontend', 'backend', 'migrations', 'tests'], description: 'Dynamic projects only: which area the path resolves in (default "frontend"). Static projects must not send this.' } };
+
 export const TOOL_DEFS: ToolDef[] = [
-  { name: 'write_files', description: 'Write a complete set of related files in ONE call. Preferred when implementing a new app; paths relative to frontend/.', parameters: { type: 'object', properties: { files: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { path: S('Relative path'), content: S('Complete file text') }, required: ['path', 'content'], additionalProperties: false } } }, required: ['files'], additionalProperties: false } },
-  { name: 'list_files', description: 'List the project file tree (frontend/ as root).', parameters: { type: 'object', properties: { path: S('Subdirectory relative to frontend/, default ".".') }, additionalProperties: false } },
-  { name: 'read_file', description: 'Read a text file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
-  { name: 'write_file', description: 'Write (create or overwrite) a TEXT file relative to frontend/. Creates parent dirs. For photos/raster images use acquire_image; never write SVG/XML text into .jpg/.png/.webp. content MUST be a string with the full file text.', parameters: { type: 'object', properties: { path: S('Text file path relative to frontend/.'), content: S('Full text content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
-  { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/.', parameters: { type: 'object', properties: { path: S('File path relative to frontend/.'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
-  { name: 'delete_file', description: 'Delete a file or directory relative to frontend/.', parameters: { type: 'object', properties: { path: S('Path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
-  { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/.', parameters: { type: 'object', properties: { path: S('Directory path relative to frontend/.') }, required: ['path'], additionalProperties: false } },
+  { name: 'write_files', description: 'Write a complete set of related files in ONE call. Preferred when implementing a new app; paths relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, files: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: { path: S('Relative path'), content: S('Complete file text') }, required: ['path', 'content'], additionalProperties: false } } }, required: ['files'], additionalProperties: false } },
+  { name: 'list_files', description: 'List the project file tree (frontend/ as root, or the chosen area root on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Subdirectory relative to frontend/ (or to the area root), default ".".') }, additionalProperties: false } },
+  { name: 'read_file', description: 'Read a text file relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('File path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
+  { name: 'write_file', description: 'Write (create or overwrite) a TEXT file relative to frontend/ (or to the chosen area on dynamic projects). Creates parent dirs. For photos/raster images use acquire_image; never write SVG/XML text into .jpg/.png/.webp. content MUST be a string with the full file text.', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Text file path relative to frontend/ (or to the area root).'), content: S('Full text content as a string.') }, required: ['path', 'content'], additionalProperties: false } },
+  { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('File path relative to frontend/ (or to the area root).'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
+  { name: 'delete_file', description: 'Delete a file or directory relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
+  { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Directory path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
   { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified.', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.') }, required: ['query', 'path'], additionalProperties: false } },
-  { name: 'search_code', description: 'Substring search across text files under frontend/ (skips node_modules, dist, .git).', parameters: { type: 'object', properties: { pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
+  { name: 'search_code', description: 'Substring search across text files under frontend/ (or the chosen area on dynamic projects; skips node_modules, dist, .git).', parameters: { type: 'object', properties: { ...AREA_PARAM, pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
   { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'test_preview', description: 'Build if needed, then run the current app in real Chromium on desktop/mobile. Use steps to test requested interactions. Selectors must identify ONE element: e.g. button:has-text("Añadir"), or button:has-text("Me gusta") >> nth=0 for the first repeated card. expect_text checks visible text; reload tests persistence. Returns accessible page snapshot and runtime errors.', parameters: { type: 'object', properties: { steps: { type: 'array', maxItems: 12, items: { type: 'object', properties: { action: { type: 'string', enum: ['click', 'fill', 'select', 'expect_text', 'reload'] }, selector: S('CSS selector for click/fill/select; append >> nth=0 for the first of repeated matches'), value: S('Input/select value or visible text to expect') }, required: ['action'], additionalProperties: false } } }, additionalProperties: false } },

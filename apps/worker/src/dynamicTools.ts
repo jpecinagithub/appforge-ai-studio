@@ -71,7 +71,7 @@ const ALLOWED_ENV_KEYS = new Set([
 ]);
 
 /** Extra per-call variables the tools may inject (auditable, closed list). */
-const ALLOWED_EXTRA_ENV_KEYS = new Set(['DB_PATH']);
+const ALLOWED_EXTRA_ENV_KEYS = new Set(['DB_PATH', 'PORT', 'HOST', 'NODE_ENV', 'PUBLIC_PATH', 'SESSION_COOKIE_NAME']);
 
 export function buildChildEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -94,9 +94,9 @@ export function buildChildEnv(extra: Record<string, string> = {}): NodeJS.Proces
 // Kill the whole tree, then wait for it to actually exit.
 // ---------------------------------------------------------------------------
 
-function killTree(child: ChildProcess): void {
-  const pid = child.pid;
-  if (pid === undefined) return;
+/** Kill a whole process tree by pid (POSIX process group / Windows taskkill /T). */
+export function killTreeByPid(pid: number | undefined | null): void {
+  if (pid === undefined || pid === null) return;
   try {
     if (process.platform === 'win32') {
       // /T terminates the tree rooted at pid.
@@ -107,11 +107,15 @@ function killTree(child: ChildProcess): void {
     }
   } catch {
     try {
-      child.kill('SIGKILL');
+      process.kill(pid, 'SIGKILL');
     } catch {
       /* already gone */
     }
   }
+}
+
+function killTree(child: ChildProcess): void {
+  killTreeByPid(child.pid);
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +289,7 @@ function fail(code: string, error: string, durationMs = 0, output?: string): Too
   return r;
 }
 
-function isDynamicProject(ctx: ToolContext): boolean {
+export function isDynamicProject(ctx: ToolContext): boolean {
   try {
     const row = ctx.db
       .prepare('SELECT type FROM projects WHERE id=?')
@@ -788,20 +792,36 @@ async function runApiTests(ctx: ToolContext, args: Record<string, unknown>): Pro
 // ---------------------------------------------------------------------------
 // Verification receipts (invalidated on source change)
 //
-// The four tools leave receipts in ctx.dynamicChecks: one fingerprint per
+// The dynamic tools leave receipts in ctx.dynamicChecks: one fingerprint per
 // check. A later source edit invalidates the earliest affected check AND
 // every check that canonically follows it — the valid checks always form a
 // PREFIX of DYNAMIC_CHECK_ORDER. Recording a check clears its canonical
 // followers, so out-of-order execution can never accumulate: the agent is
-// forced through frontend → backend → migrations → api_tests in order.
+// forced through the pipeline in order.
 // dynamicGateStatus() is the code-level completion gate (the agent loop
 // consults it, never just the prompt).
 // ---------------------------------------------------------------------------
 
-export type DynamicCheckKey = 'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests';
+export type DynamicCheckKey =
+  | 'frontendBuild'
+  | 'backendBuild'
+  | 'migrations'
+  | 'apiTests'
+  | 'fullstackPreview'
+  | 'authenticatedFlow';
 
 /** Canonical pipeline order. The completion gate requires exactly this. */
 export const DYNAMIC_CHECK_ORDER: readonly DynamicCheckKey[] = [
+  'frontendBuild',
+  'backendBuild',
+  'migrations',
+  'apiTests',
+  'fullstackPreview',
+  'authenticatedFlow',
+];
+
+/** The four 5A checks: the precondition for start_fullstack_preview. */
+export const DYNAMIC_CHECK_ORDER_5A: readonly DynamicCheckKey[] = [
   'frontendBuild',
   'backendBuild',
   'migrations',
@@ -812,6 +832,8 @@ export const DYNAMIC_CHECK_ORDER: readonly DynamicCheckKey[] = [
  * Source scopes each receipt covers. The migrations receipt covers
  * migrations/ + backend/ + the root package.json (whose scripts drive
  * `npm run migrate`), so a change to any of them forces re-verification.
+ * fullstackPreview and authenticatedFlow verify the whole app, so their
+ * receipts are bound to the project root: any source change invalidates them.
  */
 function checkScopes(projectDir: string): Record<DynamicCheckKey, string[]> {
   return {
@@ -823,6 +845,8 @@ function checkScopes(projectDir: string): Record<DynamicCheckKey, string[]> {
       path.join(projectDir, 'package.json'),
     ],
     apiTests: [projectDir],
+    fullstackPreview: [projectDir],
+    authenticatedFlow: [projectDir],
   };
 }
 
@@ -852,6 +876,11 @@ function scopeFingerprint(paths: string[]): string | null {
  * Record a successful check: store its fingerprint and drop the check itself
  * plus its canonical followers from the order (they must be re-run after it).
  */
+/** @internal exported for tests (dynamicAreas.test.ts). */
+export function recordDynamicCheckForTest(ctx: ToolContext, key: DynamicCheckKey): void {
+  recordDynamicCheck(ctx, key);
+}
+
 function recordDynamicCheck(ctx: ToolContext, key: DynamicCheckKey): void {
   const idx = DYNAMIC_CHECK_ORDER.indexOf(key);
   const followers = new Set(DYNAMIC_CHECK_ORDER.slice(idx + 1));
@@ -911,6 +940,44 @@ export function dynamicGateStatus(ctx: ToolContext): {
   return { complete: missing.length === 0 && orderValid, missing, orderValid };
 }
 
+/**
+ * Fase 5B — is the fullstackPreview receipt still valid on the current
+ * sources (and correctly ordered after the 5A prefix)? Used by
+ * test_authenticated_flow to refuse a stale preview.
+ */
+export function previewReceiptValid(ctx: ToolContext): boolean {
+  const stored = ctx.dynamicChecks?.fullstackPreview;
+  if (!stored) return false;
+  if (scopeFingerprint(checkScopes(ctx.projectDir).fullstackPreview) !== stored) return false;
+  const order = ctx.dynamicChecksOrder ?? [];
+  const idx = order.indexOf('fullstackPreview');
+  return idx >= DYNAMIC_CHECK_ORDER_5A.length &&
+    DYNAMIC_CHECK_ORDER_5A.every((k, i) => order[i] === k);
+}
+
+/**
+ * Fase 5B — precondition gate for start_fullstack_preview: the four 5A
+ * checks must be valid on the current sources and form the canonical
+ * 5A prefix. (The full dynamicGateStatus additionally requires
+ * fullstackPreview + authenticatedFlow.)
+ */
+export function previewGateStatus(ctx: ToolContext): {
+  ok: boolean;
+  missing: DynamicCheckKey[];
+} {
+  const scopes = checkScopes(ctx.projectDir);
+  const missing: DynamicCheckKey[] = [];
+  for (const key of DYNAMIC_CHECK_ORDER_5A) {
+    const stored = ctx.dynamicChecks?.[key];
+    if (stored === undefined || scopeFingerprint(scopes[key]) !== stored) missing.push(key);
+  }
+  const order = ctx.dynamicChecksOrder ?? [];
+  const orderValid =
+    order.length >= DYNAMIC_CHECK_ORDER_5A.length &&
+    DYNAMIC_CHECK_ORDER_5A.every((k, i) => order[i] === k);
+  return { ok: missing.length === 0 && orderValid, missing };
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -940,6 +1007,18 @@ export const DYNAMIC_TOOL_DEFS: ToolDef[] = [
       'Dynamic projects only: run the fixed `npm test` (authentication, session, CRUD, isolation) with a temporary SQLite database. Returns pass/fail counts. Takes no arguments.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
   },
+  {
+    name: 'start_fullstack_preview',
+    description:
+      'Dynamic projects only: launch an ephemeral full-stack preview of the CURRENT sources (no Docker, no production). Requires run_frontend_build, run_backend_build, run_migrations and run_api_tests to be valid and in order. Starts node backend/dist/server.js on a free loopback port with a temporary SQLite database, waits for /healthz, and publishes it at /a/:projectId/ through the Studio proxy. Replaces any previous preview (fully stopped first). Takes no arguments.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'test_authenticated_flow',
+    description:
+      'Dynamic projects only: verify the authenticated user journey against the published preview at /a/:projectId/ (never a different server). Runs deterministic API checks (register, HttpOnly+SameSite cookie, session, CRUD, cross-user isolation, logout, 401) then real Chromium against the preview UI using stable data-testid selectors. Requires a ready fullstack preview. Takes no arguments: no URLs, selectors, credentials or commands are accepted.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
 ];
 
 export function createDynamicTools(): Record<string, ToolHandler> {
@@ -948,5 +1027,18 @@ export function createDynamicTools(): Record<string, ToolHandler> {
     run_backend_build: runBackendBuild,
     run_migrations: runMigrations,
     run_api_tests: runApiTests,
+    start_fullstack_preview: startFullstackPreviewTool,
+    test_authenticated_flow: testAuthenticatedFlowTool,
   };
+}
+
+/** Thin wrappers: the preview/auth-flow tools live in their own modules. */
+async function startFullstackPreviewTool(ctx: ToolContext, _args: Record<string, unknown>): Promise<ToolResult> {
+  const { startFullstackPreview } = await import('./previewManager.js');
+  return startFullstackPreview(ctx);
+}
+
+async function testAuthenticatedFlowTool(ctx: ToolContext, _args: Record<string, unknown>): Promise<ToolResult> {
+  const { testAuthenticatedFlow } = await import('./authFlow.js');
+  return testAuthenticatedFlow(ctx);
 }

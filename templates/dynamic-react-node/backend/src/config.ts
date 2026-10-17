@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 const ConfigSchema = z.object({
   port: z.coerce.number().int().min(0).max(65535).default(8080),
+  host: z.string().min(1).default('0.0.0.0'),
   nodeEnv: z.enum(['development', 'production', 'test']).default('development'),
   dbPath: z.string().min(1).default('./data/app.db'),
   publicPath: z.string().min(1).default('/'),
@@ -15,6 +16,7 @@ export type AppConfig = z.infer<typeof ConfigSchema>;
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return ConfigSchema.parse({
     port: env.PORT,
+    host: env.HOST,
     nodeEnv: env.NODE_ENV,
     dbPath: env.DB_PATH,
     publicPath: env.PUBLIC_PATH,

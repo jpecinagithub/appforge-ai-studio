@@ -1,12 +1,18 @@
 /**
- * Agent-level tests for the dynamic completion gate (Fase 5A, Codex blocker 1).
+ * Agent-level tests for the dynamic completion gate (Fase 5A Codex blocker 1,
+ * extended to six checks in Fase 5B).
  *
  * The gate lives in code (dynamicGateStatus, consulted by verify()), never
  * just in the prompt. These tests drive runAgentOnce with a scripted LLM:
  *  - finishing without running the tools is blocked;
  *  - running the tools out of order is blocked (and recoverable);
  *  - modifying sources after the checks invalidates them;
- *  - running the four tools in order completes the run.
+ *  - running all six tools in order completes the run (full happy path);
+ *  - finishing with only the four 5A checks is blocked (5B not done).
+ *
+ * The fixture's backend build produces a runnable fake server (from
+ * previewFixture), and a DB-backed /a/:projectId proxy lets
+ * test_authenticated_flow run its browser phase end to end.
  */
 import { beforeAll, afterAll, beforeEach, expect, it, vi, describe } from 'vitest';
 import fs from 'node:fs';
@@ -22,10 +28,23 @@ vi.mock('./llm.js', async (importOriginal) => {
 });
 
 import { runAgentOnce, type AgentSettings } from './agent.js';
+import { FAKE_SERVER } from './previewFixture.js';
+import { getPreview } from './previewManager.js';
 
 // ---------------------------------------------------------------------------
 // Minimal dynamic fixture (working npm scripts, no network)
 // ---------------------------------------------------------------------------
+
+const BACKEND_BUILD_JS = `
+import { mkdirSync, copyFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+mkdirSync(join(root, 'dist'), { recursive: true });
+// The "compiled" server is a runnable fake implementing the template contract.
+copyFileSync(join(root, 'scripts', 'fake-server.js'), join(root, 'dist', 'server.js'));
+console.log('backend build ok');
+`;
 
 const BUILD_JS = `
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -87,7 +106,8 @@ function makeGateProject(): string {
   fs.writeFileSync(path.join(fe, 'package-lock.json'), LOCK('fx-fe'));
   fs.writeFileSync(path.join(be, 'package-lock.json'), LOCK('fx-be'));
   fs.writeFileSync(path.join(fe, 'scripts', 'build.mjs'), BUILD_JS);
-  fs.writeFileSync(path.join(be, 'scripts', 'build.mjs'), 'process.env.FAKE_OUT="server.js";\n' + BUILD_JS);
+  fs.writeFileSync(path.join(be, 'scripts', 'build.mjs'), BACKEND_BUILD_JS);
+  fs.writeFileSync(path.join(be, 'scripts', 'fake-server.js'), FAKE_SERVER);
   fs.writeFileSync(
     path.join(dir, 'package.json'),
     JSON.stringify({ name: 'fx', version: '0.1.0', scripts: { migrate: 'node scripts/migrate.mjs', test: 'node scripts/tests.mjs' } }),
@@ -133,6 +153,8 @@ const final = (content = 'Done.'): LlmResponse => ({ content, toolCalls: [], usa
 beforeAll(() => {
   vi.stubEnv('GROQ_API_KEY', 'test-key');
   vi.stubEnv('APPFORGE_LLM_STUB', '');
+  // The 6-check happy path runs a real preview: opt in explicitly.
+  vi.stubEnv('APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW', '1');
 });
 
 afterAll(() => {
@@ -174,6 +196,49 @@ function script(responses: LlmResponse[]): void {
   model.mockImplementation(async () => (queue.length > 0 ? queue.shift()! : final('Done, for real this time.')));
 }
 
+/**
+ * DB-backed /a/:projectId proxy for the gate tests: forwards to whatever
+ * port the preview registry holds for the project (the real Studio proxy
+ * is covered in server/src/proxy.test.ts).
+ */
+async function startGateProxy(): Promise<{ url: string; close: () => Promise<void> }> {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    const m = (req.url ?? '').match(/^\/a\/([^/]+)(\/.*)?$/);
+    if (!m) { res.writeHead(404); res.end(); return; }
+    const projectId = m[1]!;
+    const rest = m[2] || '/';
+    let port: number | null = null;
+    try {
+      const row = getPreview(db, projectId);
+      if (row?.status === 'ready') port = row.port;
+    } catch { /* no preview */ }
+    if (!port) { res.writeHead(503); res.end('no preview'); return; }
+    const proxy = http.request(
+      { host: '127.0.0.1', port, path: rest, method: req.method, headers: { ...req.headers, host: `127.0.0.1:${port}` } },
+      (upRes) => { res.writeHead(upRes.statusCode ?? 502, upRes.headers); upRes.pipe(res); },
+    );
+    proxy.on('error', () => { res.writeHead(502); res.end(); });
+    req.pipe(proxy);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** The six verification tools in canonical order. */
+const SIX_CHECKS = [
+  'run_frontend_build',
+  'run_backend_build',
+  'run_migrations',
+  'run_api_tests',
+  'start_fullstack_preview',
+  'test_authenticated_flow',
+];
+
 describe('dynamic completion gate', () => {
   it('blocks finishing when the model never runs the tools', async () => {
     const runId = setupRun(makeGateProject());
@@ -198,62 +263,91 @@ describe('dynamic completion gate', () => {
 
   it('blocks out-of-order execution and lets the model recover in order', async () => {
     const runId = setupRun(makeGateProject());
-    script([
-      toolCall('run_api_tests'),
-      toolCall('run_frontend_build'),
-      toolCall('run_backend_build'),
-      toolCall('run_migrations'),
-      final('All four checks ran, app is done.'),
-      // gate blocks: only frontendBuild survived the out-of-order run
-      toolCall('run_backend_build'),
-      toolCall('run_migrations'),
-      toolCall('run_api_tests'),
-      final('Now truly done.'),
-    ]);
-    await runAgentOnce(db, runId, { dataDir, settings });
-    const { status } = runStatus(runId);
-    expect(status).toBe('done');
-    // api_tests ran twice: once out of order (wiped), once in order
-    expect(toolCallCount(runId, 'run_api_tests')).toBe(2);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        toolCall('run_api_tests'),
+        toolCall('run_frontend_build'),
+        toolCall('run_backend_build'),
+        toolCall('run_migrations'),
+        toolCall('run_api_tests'),
+        toolCall('start_fullstack_preview'),
+        toolCall('test_authenticated_flow'),
+        final('All six checks ran, app is done.'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      const { status } = runStatus(runId);
+      expect(status).toBe('done');
+      // api_tests ran twice: once out of order (wiped), once in order
+      expect(toolCallCount(runId, 'run_api_tests')).toBe(2);
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+    }
     db.close();
   }, 240000);
 
   it('invalidates checks when sources change after verification', async () => {
     const runId = setupRun(makeGateProject());
-    script([
-      toolCall('run_frontend_build'),
-      toolCall('run_backend_build'),
-      toolCall('run_migrations'),
-      toolCall('run_api_tests'),
-      toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }),
-      final('Done after the tweak.'),
-      // gate blocks: the write invalidated everything from frontendBuild on
-      toolCall('run_frontend_build'),
-      toolCall('run_backend_build'),
-      toolCall('run_migrations'),
-      toolCall('run_api_tests'),
-      final('Done for real.'),
-    ]);
-    await runAgentOnce(db, runId, { dataDir, settings });
-    const { status } = runStatus(runId);
-    expect(status).toBe('done');
-    expect(toolCallCount(runId, 'run_frontend_build')).toBe(2);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        ...SIX_CHECKS.map((n) => toolCall(n)),
+        toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }),
+        final('Done after the tweak.'),
+        // gate blocks: the write invalidated everything from frontendBuild on
+        ...SIX_CHECKS.map((n) => toolCall(n)),
+        final('Done for real.'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      const { status } = runStatus(runId);
+      expect(status).toBe('done');
+      expect(toolCallCount(runId, 'run_frontend_build')).toBe(2);
+      expect(toolCallCount(runId, 'test_authenticated_flow')).toBe(2);
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+    }
     db.close();
   }, 240000);
 
-  it('completes when the four tools run in order', async () => {
+  it('completes when the six tools run in order (full happy path)', async () => {
+    const runId = setupRun(makeGateProject());
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        ...SIX_CHECKS.map((n) => toolCall(n)),
+        final('All checks green, app complete.'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      const { status, error } = runStatus(runId);
+      expect(error).toBeNull();
+      expect(status).toBe('done');
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+    }
+    db.close();
+  }, 240000);
+
+  it('blocks finishing with only the four 5A checks (5B not done)', async () => {
     const runId = setupRun(makeGateProject());
     script([
       toolCall('run_frontend_build'),
       toolCall('run_backend_build'),
       toolCall('run_migrations'),
       toolCall('run_api_tests'),
-      final('All checks green, app complete.'),
+      final('The four checks are done, app complete.'),
+      final('The four checks are done, app complete.'),
+      final('The four checks are done, app complete.'),
     ]);
     await runAgentOnce(db, runId, { dataDir, settings });
     const { status, error } = runStatus(runId);
-    expect(error).toBeNull();
-    expect(status).toBe('done');
+    expect(status).not.toBe('done');
+    expect(error ?? '').toMatch(/DYNAMIC CHECKS INCOMPLETE/);
     db.close();
   }, 240000);
 });

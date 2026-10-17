@@ -28,7 +28,7 @@ function AuthScreen({ onAuth }: { onAuth: (u: User) => void }) {
   }
 
   return (
-    <div className="card">
+    <div className="card" data-testid="auth-screen">
       <h1>{mode === 'login' ? 'Sign in' : 'Create account'}</h1>
       <p className="muted">
         {mode === 'login'
@@ -44,6 +44,7 @@ function AuthScreen({ onAuth }: { onAuth: (u: User) => void }) {
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             autoComplete="email"
+            data-testid="auth-email"
           />
         </label>
         <label>
@@ -55,15 +56,17 @@ function AuthScreen({ onAuth }: { onAuth: (u: User) => void }) {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            data-testid="auth-password"
           />
         </label>
-        {error && <p className="error">{error}</p>}
-        <button type="submit" disabled={busy}>
+        {error && <p className="error" data-testid="auth-error">{error}</p>}
+        <button type="submit" disabled={busy} data-testid="auth-submit">
           {busy ? '…' : mode === 'login' ? 'Sign in' : 'Register'}
         </button>
       </form>
       <button
         className="link"
+        data-testid="auth-toggle-mode"
         onClick={() => {
           setMode(mode === 'login' ? 'register' : 'login');
           setError(null);
@@ -127,13 +130,13 @@ function TasksScreen({ user, onLogout }: { user: User; onLogout: () => void }) {
   }
 
   return (
-    <div className="card wide">
+    <div className="card wide" data-testid="tasks-screen">
       <header className="topbar">
         <div>
           <h1>My tasks</h1>
-          <p className="muted">{user.email}</p>
+          <p className="muted" data-testid="user-email">{user.email}</p>
         </div>
-        <button className="ghost" onClick={onLogout}>
+        <button className="ghost" onClick={onLogout} data-testid="logout-button">
           Sign out
         </button>
       </header>
@@ -143,13 +146,14 @@ function TasksScreen({ user, onLogout }: { user: User; onLogout: () => void }) {
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           maxLength={200}
+          data-testid="new-todo-input"
         />
-        <button type="submit">Add</button>
+        <button type="submit" data-testid="add-todo-button">Add</button>
       </form>
-      {error && <p className="error">{error}</p>}
-      <ul className="todos">
+      {error && <p className="error" data-testid="tasks-error">{error}</p>}
+      <ul className="todos" data-testid="todo-list">
         {todos.map((t) => (
-          <li key={t.id} className={t.done ? 'done' : ''}>
+          <li key={t.id} className={t.done ? 'done' : ''} data-testid="todo-item">
             <button
               className="check"
               onClick={() => void toggle(t)}
@@ -157,7 +161,7 @@ function TasksScreen({ user, onLogout }: { user: User; onLogout: () => void }) {
             >
               {t.done ? '✓' : ''}
             </button>
-            <span>{t.title}</span>
+            <span data-testid="todo-title">{t.title}</span>
             <button className="ghost danger" onClick={() => void remove(t)}>
               Delete
             </button>
