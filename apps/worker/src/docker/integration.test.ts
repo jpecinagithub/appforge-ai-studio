@@ -393,7 +393,9 @@ d('docker integration (fase 7A)', () => {
     expect(info.Config?.Labels?.['com.appforge.project-id']).toBe(h.projectId);
     expect(info.Config?.Labels?.['com.appforge.deployment-id']).toBe(h.deploymentId);
     expect(info.Config?.Labels?.['com.appforge.role']).toBe('live');
-    expect(info.Config?.User).toBe('1001');
+    // El Dockerfile declara `USER appuser` (uid 1001): inspect muestra el
+    // nombre. El driver exige no-root (validateImage), no un formato concreto.
+    expect(['1001', 'appuser']).toContain(info.Config?.User);
     expect(JSON.stringify(info.Config?.Labels)).not.toContain('docker.sock');
   }, 900_000);
 

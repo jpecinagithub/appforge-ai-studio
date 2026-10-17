@@ -449,8 +449,13 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   // Operaciones de la interfaz DeploymentDriver (§10)
   // =======================================================================
 
+  /**
+   * runtime.env vive FUERA del snapshot (el snapshot es inmutable; escribir
+   * dentro lo invalidaría y expondría el env al contexto de build).
+   */
   private ensureEnvFile(projectId: string, deploymentId: string): string {
-    const dest = path.join(this.snapshotDir(deploymentId), 'runtime.env');
+    const dir = path.join(this.config.dataDir, 'deploy-env', deploymentId);
+    const dest = path.join(dir, 'runtime.env');
     if (!fs.existsSync(dest)) {
       writeValidatedEnvFile({
         projectEnvPath: path.join(this.projectDir(projectId), '.env'),
