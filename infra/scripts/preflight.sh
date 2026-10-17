@@ -59,6 +59,12 @@ case "$admin_token" in *$'\n'*|*$'\r'*) fail "APPFORGE_ADMIN_TOKEN contains a li
 
 stub="$(read_env APPFORGE_LLM_STUB || true)"
 [ "$stub" != 1 ] || fail "APPFORGE_LLM_STUB is forbidden in production"
+
+shutdown_ms="$(read_env APPFORGE_SHUTDOWN_TIMEOUT_MS || true)"
+shutdown_ms="${shutdown_ms:-30000}"
+[[ "$shutdown_ms" =~ ^[0-9]+$ ]] || fail "APPFORGE_SHUTDOWN_TIMEOUT_MS must be an integer"
+[ "$shutdown_ms" -ge 1000 ] && [ "$shutdown_ms" -le 300000 ] \
+  || fail "APPFORGE_SHUTDOWN_TIMEOUT_MS must be between 1000 and 300000"
 groq="$(read_env GROQ_API_KEY || true)"
 openrouter="$(read_env OPENROUTER_API_KEY || true)"
 [ "${#groq}" -ge 20 ] || [ "${#openrouter}" -ge 20 ] || fail "one LLM API key of at least 20 characters is required"

@@ -126,3 +126,9 @@ For a domain already pointing at the VM, also set
 `APPFORGE_SITE_ADDRESS=appforge.example.com` and use the corresponding HTTPS
 origin. Caddy then manages TLS automatically. A domain is not required for the
 Oracle/IP certification.
+
+On `SIGTERM`/`SIGINT`, Studio stops admitting work and gives owned agent runs,
+builds and deployments 30 seconds to finish (`APPFORGE_SHUTDOWN_TIMEOUT_MS`).
+Docker allows 40 seconds before forcing termination. Work that exceeds the
+budget is closed from persisted state by startup reconciliation; source files
+and the last healthy live deployment remain the recovery authority.

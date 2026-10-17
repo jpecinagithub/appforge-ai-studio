@@ -13,6 +13,8 @@ import { openDb } from './db.js';
 import {
   assertProductionConfiguration,
   buildServer,
+  createBackgroundTaskTracker,
+  parseShutdownTimeout,
   reconcileInterruptedBuilds,
   reconcileInterruptedMigrations,
   reconcileInterruptedRuns,
@@ -80,6 +82,38 @@ describe('production configuration', () => {
       APPFORGE_PRODUCTION: '1',
       APPFORGE_ADMIN_TOKEN: 'x'.repeat(32),
     }, '/data/appforge')).not.toThrow();
+  });
+
+  it('validates the bounded graceful-shutdown budget', () => {
+    expect(parseShutdownTimeout(undefined)).toBe(30_000);
+    expect(parseShutdownTimeout('45000')).toBe(45_000);
+    expect(() => parseShutdownTimeout('999')).toThrow(/SHUTDOWN_TIMEOUT/);
+    expect(() => parseShutdownTimeout('300001')).toThrow(/SHUTDOWN_TIMEOUT/);
+    expect(() => parseShutdownTimeout('1.5')).toThrow(/SHUTDOWN_TIMEOUT/);
+  });
+});
+
+describe('background task shutdown drain', () => {
+  it('tracks completion and drains within the budget', async () => {
+    const tracker = createBackgroundTaskTracker();
+    let release!: () => void;
+    const task = new Promise<void>((resolve) => { release = resolve; });
+    const tracked = tracker.track(task);
+    expect(tracker.size()).toBe(1);
+    setTimeout(release, 5);
+    await expect(tracker.drain(500)).resolves.toBe(true);
+    await tracked;
+    expect(tracker.size()).toBe(0);
+  });
+
+  it('reports budget exhaustion without cancelling the task', async () => {
+    const tracker = createBackgroundTaskTracker();
+    let release!: () => void;
+    const tracked = tracker.track(new Promise<void>((resolve) => { release = resolve; }));
+    await expect(tracker.drain(5)).resolves.toBe(false);
+    expect(tracker.size()).toBe(1);
+    release();
+    await tracked;
   });
 });
 

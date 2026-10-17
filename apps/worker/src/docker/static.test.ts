@@ -95,6 +95,7 @@ describe('plantillas y compose: socket Docker limitado al orquestador', () => {
     expect(mounts).toHaveLength(1);
     const studio = text.match(/\n  studio:\n([\s\S]*?)\n  caddy:/)?.[1] ?? '';
     expect(studio).toContain('/var/run/docker.sock:/var/run/docker.sock:rw');
+    expect(studio).toContain('stop_grace_period: 40s');
   });
 });
 
@@ -114,5 +115,13 @@ describe('instalación productiva 7C', () => {
     expect(preflight).toContain("[ \"$mode\" = 600 ]");
     expect(preflight).not.toMatch(/(?:^|\n)\s*(?:source|\.)\s+[^\n]*\.env/);
     expect(preflight).not.toContain('cat "$ENV_FILE"');
+  });
+
+  test('coordina un presupuesto de drenaje menor que la gracia del contenedor', () => {
+    const compose = fs.readFileSync(path.join(REPO, 'infra', 'docker-compose.yml'), 'utf8');
+    const example = fs.readFileSync(path.join(REPO, '.env.example'), 'utf8');
+    expect(example).toContain('APPFORGE_SHUTDOWN_TIMEOUT_MS=30000');
+    expect(preflight).toContain('APPFORGE_SHUTDOWN_TIMEOUT_MS must be between 1000 and 300000');
+    expect(compose).toContain('stop_grace_period: 40s');
   });
 });

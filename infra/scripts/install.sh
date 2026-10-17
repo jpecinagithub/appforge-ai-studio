@@ -77,6 +77,7 @@ if [ ! -e "$env_file" ]; then
     printf 'CORS_ORIGIN=%s\n' "$APPFORGE_PUBLIC_ORIGIN"
     echo 'APPFORGE_BROWSER_EXECUTABLE=/usr/bin/chromium'
     echo 'APPFORGE_PRODUCTION=1'
+    echo 'APPFORGE_SHUTDOWN_TIMEOUT_MS=30000'
     printf 'DOCKER_GID=%s\n' "$docker_gid"
     echo 'APPFORGE_MAX_CONCURRENT_DEPLOYS=1'
     printf 'APPFORGE_SITE_ADDRESS=%s\n' "$APPFORGE_SITE_ADDRESS"

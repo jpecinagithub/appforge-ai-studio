@@ -30,7 +30,7 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, waitForTaskSet, type AgentSettings, type ToolContext } from 'appforge-worker';
 // Fase 6 — orquestador persistente del pipeline de despliegue (CONTRACT.md §9.21)
 import {
   DeploymentError,
@@ -63,6 +63,17 @@ export function assertProductionConfiguration(env: NodeJS.ProcessEnv, dataDir: s
   if (env.APPFORGE_LLM_STUB === '1') {
     throw new Error('APPFORGE_LLM_STUB is forbidden in production');
   }
+  parseShutdownTimeout(env.APPFORGE_SHUTDOWN_TIMEOUT_MS);
+}
+
+export function parseShutdownTimeout(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return 30_000;
+  if (!/^\d+$/.test(raw)) throw new Error('APPFORGE_SHUTDOWN_TIMEOUT_MS must be an integer between 1000 and 300000');
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1_000 || value > 300_000) {
+    throw new Error('APPFORGE_SHUTDOWN_TIMEOUT_MS must be an integer between 1000 and 300000');
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +355,27 @@ export interface ServerOptions {
    * de parámetros HTTP ni de datos libres del usuario.
    */
   liveRuntimeOrigin?: (runtime: ProjectRuntime) => string | null;
+  /** 7C: process-owned background operations included in graceful shutdown. */
+  backgroundTasks?: BackgroundTaskTracker;
+}
+
+export interface BackgroundTaskTracker {
+  track: <T>(task: Promise<T>) => Promise<T>;
+  drain: (timeoutMs: number) => Promise<boolean>;
+  size: () => number;
+}
+
+export function createBackgroundTaskTracker(): BackgroundTaskTracker {
+  const tasks = new Set<Promise<unknown>>();
+  return {
+    track: <T>(task: Promise<T>): Promise<T> => {
+      const tracked = task.finally(() => tasks.delete(tracked));
+      tasks.add(tracked);
+      return tracked;
+    },
+    drain: (timeoutMs) => waitForTaskSet(tasks, timeoutMs),
+    size: () => tasks.size,
+  };
 }
 
 const err = (code: string, message: string): ApiError => ({ error: { code, message } });
@@ -721,7 +753,8 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     db.prepare('INSERT INTO builds(id, project_id, status, started_at, finished_at, duration_ms, logs, artifacts_json, error) VALUES (?,?,?,?,?,?,?,?,?)').run(
       buildId, id, 'pending', nowIso(), null, null, '', null, null,
     );
-    void executeBuild(db, dataDir, buildId);
+    const buildTask = executeBuild(db, dataDir, buildId);
+    void (opts.backgroundTasks ? opts.backgroundTasks.track(buildTask) : buildTask);
     const row = db.prepare('SELECT * FROM builds WHERE id=?').get(buildId) as Record<string, any>;
     reply.code(201);
     return rowToBuild(row);
@@ -855,7 +888,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     }
     // 202: el pipeline corre en segundo plano y persiste estados terminales
     // internamente (nunca rechaza por fallos del despliegue).
-    void runDeploymentPipeline(db, deployDriver, {
+    const deploymentTask = runDeploymentPipeline(db, deployDriver, {
       projectId: id,
       target: body.target,
       deploymentId: dep.id,
@@ -863,6 +896,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     })
       .catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message))
       .finally(releaseCapacity);
+    void (opts.backgroundTasks ? opts.backgroundTasks.track(deploymentTask) : deploymentTask);
     reply.code(202);
     return toDeploymentInfo(dep);
   });
@@ -1272,6 +1306,7 @@ async function main(): Promise<void> {
     }
   }
 
+  const backgroundTasks = createBackgroundTaskTracker();
   const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db), deploymentDriver });
   const app = buildServer({
     db,
@@ -1280,11 +1315,34 @@ async function main(): Promise<void> {
     adminToken: process.env.APPFORGE_ADMIN_TOKEN,
     corsOrigin: process.env.CORS_ORIGIN ?? '*',
     deploymentDriver,
+    backgroundTasks,
   });
 
+  const shutdownTimeoutMs = parseShutdownTimeout(process.env.APPFORGE_SHUTDOWN_TIMEOUT_MS);
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[server] shutdown requested; drain budget=${shutdownTimeoutMs}ms`);
     worker.stop();
-    try { await app.close(); } catch { /* ignore */ }
+    const closeTask = app.close().then(() => true).catch((e: unknown) => {
+      console.error('[server] HTTP close failed:', (e as Error)?.message ?? e);
+      return false;
+    });
+    const [httpClosed, workerDrained, backgroundDrained] = await Promise.all([
+      Promise.race([
+        closeTask,
+        new Promise<false>((resolve) => {
+          const timer = setTimeout(() => resolve(false), shutdownTimeoutMs);
+          timer.unref?.();
+        }),
+      ]),
+      worker.drain(shutdownTimeoutMs),
+      backgroundTasks.drain(shutdownTimeoutMs),
+    ]);
+    if (!httpClosed || !workerDrained || !backgroundDrained) {
+      console.warn('[server] drain budget exhausted; persistent reconciliation will close unfinished operations on restart');
+    }
     db.close();
     process.exit(0);
   };
