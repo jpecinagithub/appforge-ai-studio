@@ -30,9 +30,17 @@ import {
   FakeDeploymentDriver,
   getDeployment,
   reconcileDeployments,
+  DYNAMIC_CHECK_ORDER,
+  checkScopeFingerprint,
+  persistedDynamicGateStatus,
+  recordDynamicCheckForTest,
+  recordVerificationReceipt,
   type DeploymentRecord,
+  type DynamicCheckKey,
+  type ToolContext,
 } from 'appforge-worker';
 import { nowIso } from 'appforge-worker';
+import { projectDir } from './projects.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
@@ -48,8 +56,20 @@ function addProject(id: string, type: 'dynamic' | 'static' = 'dynamic'): void {
   );
 }
 
-/** Evidencia persistida para la puerta de verificación (build + migraciones ok). */
-function seedVerificationEvidence(projectId: string): void {
+/** Receipts persistidos autoritativos (revisión Codex, bloqueo 2): los seis checks. */
+function seedVerificationReceipts(projectId: string, skip?: DynamicCheckKey): void {
+  const dir = projectDir(dataDir, projectId);
+  fs.mkdirSync(dir, { recursive: true });
+  DYNAMIC_CHECK_ORDER.forEach((key, i) => {
+    if (key === skip) return;
+    recordVerificationReceipt(db, projectId, key, checkScopeFingerprint(dir, key) ?? 'missing', i);
+  });
+  // Sanity: la puerta debe estar vigente salvo que se pida lo contrario.
+  if (!skip) expect(persistedDynamicGateStatus(db, dir, projectId).ok).toBe(true);
+}
+
+/** Evidencia LEGACY (builds/migraciones): ya NO abre la puerta (bloqueo 2). */
+function seedLegacyEvidence(projectId: string): void {
   const now = nowIso();
   db.prepare(
     "INSERT INTO builds(id, project_id, status, started_at, finished_at, duration_ms, logs, artifacts_json, error) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -114,7 +134,7 @@ afterAll(async () => {
 describe('POST /api/projects/:id/deploy (criterios 1, 18, 19, 20)', () => {
   it('starts the pipeline (202) and reaches live (criterio 1)', async () => {
     addProject('h1');
-    seedVerificationEvidence('h1');
+    seedVerificationReceipts('h1');
     const res = await app.inject({ method: 'POST', url: '/api/projects/h1/deploy', payload: { target: 'oracle' } });
     expect(res.statusCode).toBe(202);
     const created = res.json() as { id: string; status: string; target: string };
@@ -149,14 +169,67 @@ describe('POST /api/projects/:id/deploy (criterios 1, 18, 19, 20)', () => {
   });
 
   it('requires the verification gate evidence (409 VERIFICATION_GATE)', async () => {
-    addProject('hg'); // sin builds/migraciones: la puerta no está vigente
+    addProject('hg'); // sin receipts: la puerta no está vigente
     const res = await app.inject({ method: 'POST', url: '/api/projects/hg/deploy', payload: { target: 'oracle' } });
     expect(res.statusCode).toBe(409);
     expect((res.json() as { error: { code: string } }).error.code).toBe('VERIFICATION_GATE');
   });
 
-  it('without a driver: 501 stable and nothing simulated (criterio 20)', async () => {
-    const plain = await buildApp(undefined);
+  it('legacy evidence (builds/migrations rows) no longer opens the gate (bloqueo 2)', async () => {
+    addProject('hl');
+    seedLegacyEvidence('hl'); // la aproximación antigua ya no basta
+    const res = await app.inject({ method: 'POST', url: '/api/projects/hl/deploy', payload: { target: 'oracle' } });
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('VERIFICATION_GATE');
+  });
+
+  it('five of six receipts → 409 VERIFICATION_GATE (bloqueo 2)', async () => {
+    addProject('h5');
+    seedVerificationReceipts('h5', 'authenticatedFlow');
+    const res = await app.inject({ method: 'POST', url: '/api/projects/h5/deploy', payload: { target: 'oracle' } });
+    expect(res.statusCode).toBe(409);
+    const body = res.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe('VERIFICATION_GATE');
+    expect(body.error.message).toMatch(/authenticatedFlow/);
+  });
+
+  it('stale receipt after a source change → 409 VERIFICATION_GATE (bloqueo 2)', async () => {
+    addProject('hst');
+    seedVerificationReceipts('hst');
+    fs.writeFileSync(path.join(projectDir(dataDir, 'hst'), 'changed.txt'), 'v2');
+    const res = await app.inject({ method: 'POST', url: '/api/projects/hst/deploy', payload: { target: 'oracle' } });
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('VERIFICATION_GATE');
+  });
+
+  it('driver error secrets are sanitized in the HTTP response (bloqueo 3)', async () => {
+    const leaky = new FakeDeploymentDriver({
+      db,
+      behavior: { buildCandidate: 'fail' },
+      failError: {
+        buildCandidate: 'boom: password=httpsecret9 Authorization: Bearer httpbearertoken9 Cookie: af_session=httpsession9',
+      },
+    });
+    const leakyApp = await buildApp(leaky);
+    try {
+      addProject('hsec');
+      seedVerificationReceipts('hsec');
+      const started = await leakyApp.inject({ method: 'POST', url: '/api/projects/hsec/deploy', payload: { target: 'oracle' } });
+      expect(started.statusCode).toBe(202);
+      const created = started.json() as { id: string };
+      const final = await waitForTerminal(leakyApp, created.id);
+      expect(final.status).toBe('failed');
+      const raw = JSON.stringify(final);
+      for (const s of ['httpsecret9', 'httpbearertoken9', 'httpsession9']) {
+        expect(raw).not.toContain(s);
+      }
+      expect((final.error as string) ?? '').toContain('[redacted]');
+    } finally {
+      await leakyApp.close();
+    }
+  });
+
+  it('without a driver: 501 stable and nothing simulated (criterio 20)', async () => {    const plain = await buildApp(undefined);
     try {
       const res = await plain.inject({ method: 'POST', url: '/api/projects/h1/deploy', payload: { target: 'oracle' } });
       expect(res.statusCode).toBe(501);
@@ -180,7 +253,7 @@ describe('concurrent deploys (criterio 4)', () => {
     const gatedApp = await buildApp(gated);
     try {
       addProject('hc');
-      seedVerificationEvidence('hc');
+      seedVerificationReceipts('hc');
       const first = await gatedApp.inject({ method: 'POST', url: '/api/projects/hc/deploy', payload: { target: 'oracle' } });
       expect(first.statusCode).toBe(202);
       const created = first.json() as { id: string };
@@ -206,7 +279,7 @@ describe('deployment queries and cancel (criterio 13)', () => {
     const gatedApp = await buildApp(driver);
     try {
       addProject('hx');
-      seedVerificationEvidence('hx');
+      seedVerificationReceipts('hx');
       const started = await gatedApp.inject({ method: 'POST', url: '/api/projects/hx/deploy', payload: { target: 'oracle' } });
       expect(started.statusCode).toBe(202);
       const created = started.json() as { id: string };
@@ -235,7 +308,7 @@ describe('deployment queries and cancel (criterio 13)', () => {
       const final = await waitForTerminal(gatedApp, created.id);
       expect(final.status).toBe('cancelled');
       // Limpieza ejecutada: el candidato se eliminó.
-      expect(driver.callsOf('removeCandidate').length).toBe(1);
+      expect(driver.callsOf('discardCandidate').length).toBe(1);
     } finally {
       release();
       await gatedApp.close();

@@ -270,7 +270,7 @@ describe('failures before promoting (criterios 6–9)', () => {
     });
     expect(final.status).toBe('failed');
     expect(final.error).toMatch(/building/);
-    expect(driver.callsOf('removeCandidate').length).toBe(1);
+    expect(driver.callsOf('discardCandidate').length).toBe(1);
     expect(driver.callsOf('runLiveMigrations').length).toBe(0);
     expect(driver.callsOf('startCandidateAsLive').length).toBe(0);
     expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
@@ -396,7 +396,7 @@ describe('cancellation before the critical section (criterio 13)', () => {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
     });
     expect(final.status).toBe('cancelled');
-    expect(driver.callsOf('removeCandidate').length).toBe(1);
+    expect(driver.callsOf('discardCandidate').length).toBe(1);
     expect(driver.callsOf('runLiveMigrations').length).toBe(0);
   });
 
