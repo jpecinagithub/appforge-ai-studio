@@ -1,12 +1,23 @@
-# AppForge AI Studio — Caddy reverse proxy
-# HTTP by default. Point a domain at this host and uncomment the TLS block
-# for automatic HTTPS (Let's Encrypt).
+# Default `:80` certifies the Oracle/IP flow without a domain. Set
+# APPFORGE_SITE_ADDRESS only after its DNS record resolves to this host.
+{$APPFORGE_SITE_ADDRESS::80} {
+	encode zstd gzip
 
-:80 {
-	reverse_proxy studio:3001
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		X-Frame-Options DENY
+		-Server
+	}
+
+	reverse_proxy studio:3001 {
+		health_uri /healthz
+		health_interval 15s
+		health_timeout 5s
+	}
+
+	log {
+		output stdout
+		format json
+	}
 }
-
-# --- TLS with your own domain (uncomment, set your domain) ---
-# appforge.example.com {
-# 	reverse_proxy studio:3001
-# }

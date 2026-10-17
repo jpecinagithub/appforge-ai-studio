@@ -10,7 +10,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type Database from 'better-sqlite3';
 import { openDb } from './db.js';
-import { buildServer, reconcileInterruptedBuilds, reconcileInterruptedMigrations, reconcileInterruptedRuns } from './index.js';
+import {
+  assertProductionConfiguration,
+  buildServer,
+  reconcileInterruptedBuilds,
+  reconcileInterruptedMigrations,
+  reconcileInterruptedRuns,
+} from './index.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
@@ -44,9 +50,36 @@ async function createProject(name = 'Test App') {
 
 describe('health', () => {
   it('responds ok', async () => {
+    const publicHealth = await app.inject({ method: 'GET', url: '/healthz' });
+    expect(publicHealth.statusCode).toBe(200);
+    expect(publicHealth.json()).toEqual({ ok: true, version: '0.1.0' });
     const res = await app.inject({ method: 'GET', url: '/api/health' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, version: '0.1.0' });
+  });
+});
+
+describe('production configuration', () => {
+  it('requires a strong admin token and absolute data directory', () => {
+    expect(() => assertProductionConfiguration({ APPFORGE_PRODUCTION: '1' }, '/data/appforge')).toThrow(
+      /APPFORGE_ADMIN_TOKEN/,
+    );
+    expect(() => assertProductionConfiguration({
+      APPFORGE_PRODUCTION: '1',
+      APPFORGE_ADMIN_TOKEN: 'x'.repeat(32),
+    }, 'relative/data')).toThrow(/DATA_DIR/);
+  });
+
+  it('rejects the fake LLM and accepts a safe production configuration', () => {
+    expect(() => assertProductionConfiguration({
+      APPFORGE_PRODUCTION: '1',
+      APPFORGE_ADMIN_TOKEN: 'x'.repeat(32),
+      APPFORGE_LLM_STUB: '1',
+    }, '/data/appforge')).toThrow(/LLM_STUB/);
+    expect(() => assertProductionConfiguration({
+      APPFORGE_PRODUCTION: '1',
+      APPFORGE_ADMIN_TOKEN: 'x'.repeat(32),
+    }, '/data/appforge')).not.toThrow();
   });
 });
 

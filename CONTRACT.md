@@ -1246,8 +1246,10 @@ por documentación o mocks: exige pruebas automatizadas y la evidencia indicada.
 3. `DATA_DIR`, base SQLite del Studio, snapshots, manifiestos, backups y env de
    runtime viven en almacenamiento persistente. Los secretos llegan mediante
    un fichero 0600 no versionado; no aparecen en imagen, Git, ZIP, logs, eventos
-   ni respuestas HTTP. El arranque falla cerrado si faltan token administrador,
-   rutas persistentes, permisos, red, volumen, socket o preflight 7A.
+   ni respuestas HTTP. El arranque productivo falla cerrado si faltan el token
+   administrador, las rutas persistentes o sus permisos. Un socket/daemon/red/
+   volumen no disponible conserva el Studio operativo, pero el driver queda
+   `unavailable` y todo despliegue devuelve 501 sin mutaciones.
 4. Healthchecks de Studio, proxy y runtime; política de reinicio; rotación y
    límites de logs; límites CPU/RAM/PIDs; `no-new-privileges`; filesystem de
    Studio de solo lectura salvo temporales y datos declarados. El apagado espera

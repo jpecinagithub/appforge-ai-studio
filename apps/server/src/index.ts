@@ -50,6 +50,21 @@ import {
 
 export const VERSION = '0.1.0';
 
+/** 7C: production refuses to start with an unauthenticated administrative API. */
+export function assertProductionConfiguration(env: NodeJS.ProcessEnv, dataDir: string): void {
+  if (env.APPFORGE_PRODUCTION !== '1') return;
+  const token = env.APPFORGE_ADMIN_TOKEN ?? '';
+  if (token.length < 32 || token.length > 512 || /[\r\n\0]/.test(token)) {
+    throw new Error('APPFORGE_ADMIN_TOKEN must contain 32-512 safe characters in production');
+  }
+  if (!path.isAbsolute(dataDir)) {
+    throw new Error('DATA_DIR must be absolute in production');
+  }
+  if (env.APPFORGE_LLM_STUB === '1') {
+    throw new Error('APPFORGE_LLM_STUB is forbidden in production');
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -471,6 +486,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   };
 
   // ------------------------------------------------------------------ system
+  app.get('/healthz', async () => ({ ok: true, version: VERSION }));
   app.get('/api/health', async () => ({ ok: true, version: VERSION }));
 
   // ---------------------------------------------------------------- projects
@@ -1221,6 +1237,7 @@ async function executeBuild(db: Database.Database, dataDir: string, buildId: str
 
 async function main(): Promise<void> {
   const dataDir = process.env.DATA_DIR ?? path.resolve(process.cwd(), 'data');
+  assertProductionConfiguration(process.env, dataDir);
   const templatesDir = process.env.TEMPLATES_DIR ?? path.resolve(process.cwd(), 'templates');
   const db = openDb(dataDir);
   ensureSettingsRow(db);

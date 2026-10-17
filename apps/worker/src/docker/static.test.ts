@@ -5,8 +5,8 @@
  * - `shell: true` (todo es ejecutable + argv);
  * - `--privileged` como argumento;
  * - puertos publicados (`-p`/`--publish` como argumentos);
- * - montaje del socket Docker en plantillas/proyectos y en el compose
- *   productivo (el socket solo se montará en 7C, de forma auditada);
+ * - montaje del socket Docker en plantillas/proyectos;
+ * - en 7C, más de un montaje o un montaje fuera del servicio Studio;
  * - subcomando `prune` (borrados globales prohibidos).
  */
 import { describe, test, expect } from 'vitest';
@@ -81,15 +81,19 @@ describe('driver: sin shell ni privilegios', () => {
   });
 });
 
-describe('plantillas y compose: sin socket Docker', () => {
+describe('plantillas y compose: socket Docker limitado al orquestador', () => {
   test('la plantilla no monta el socket', () => {
     const tpl = path.join(REPO, 'templates', 'dynamic-react-node');
     const bad = walkAll(tpl).filter((f) => fs.readFileSync(f, 'utf8').includes('/var/run/docker.sock'));
     expect(bad).toEqual([]);
   });
-  test('el compose productivo no monta el socket (7A)', () => {
+  test('el compose 7C lo monta exactamente una vez y solo en studio', () => {
     const compose = path.join(REPO, 'infra', 'docker-compose.yml');
     if (!fs.existsSync(compose)) return;
-    expect(fs.readFileSync(compose, 'utf8')).not.toContain('/var/run/docker.sock');
+    const text = fs.readFileSync(compose, 'utf8');
+    const mounts = text.match(/\/var\/run\/docker\.sock:\/var\/run\/docker\.sock:rw/g) ?? [];
+    expect(mounts).toHaveLength(1);
+    const studio = text.match(/\n  studio:\n([\s\S]*?)\n  caddy:/)?.[1] ?? '';
+    expect(studio).toContain('/var/run/docker.sock:/var/run/docker.sock:rw');
   });
 });
