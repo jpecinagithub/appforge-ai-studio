@@ -98,6 +98,11 @@ describe('labels', () => {
 });
 
 describe('operaciones contra el daemon (volúmenes)', () => {
+  test('inspect admite referencias imagen:tag (sin INVALID_NAME)', async () => {
+    const runner = new DockerCommandRunner();
+    // No debe lanzar INVALID_NAME por el ':'; si no existe → false.
+    expect(await resourceExists(runner, 'image', 'af-test-nonexistent-xyz:latest')).toBe(false);
+  });
   test('create/list/exists/rm con labels', async () => {
     if (!HAS_DOCKER) return;
     const runner = new DockerCommandRunner();

@@ -219,7 +219,7 @@ export async function inspectResource(
   name: string,
   timeoutMs = 30_000,
 ): Promise<unknown> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.\-/]{0,255}$/.test(name)) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.\-/:@]{0,255}$/.test(name)) {
     throw new ResourceError('INVALID_NAME', `invalid resource name for inspect: '${name}'`);
   }
   const r = await runner.run({ args: ['inspect', name], timeoutMs });
