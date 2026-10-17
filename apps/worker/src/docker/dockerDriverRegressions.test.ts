@@ -1042,3 +1042,49 @@ describe('B8: validación posterior completa vía docker inspect', () => {
     expect(r.code).toMatch(/CONTAINER_NETWORKMODE_MISMATCH/);
   });
 });
+
+describe('NO-GO2 B6: verified_source_fingerprint fail closed en reuseSnapshot', () => {
+  async function setupPersisted() {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    return { dataDir, db, stub, d };
+  }
+
+  test.each([
+    ['NULL', null],
+    ['vacío', ''],
+    ['malformado (no hex)', 'xyz-no-es-un-fingerprint'],
+    ['malformado (63 chars)', 'a'.repeat(63)],
+    ['malformado (65 chars)', 'a'.repeat(65)],
+  ])('fingerprint %s → rechazado (SNAPSHOT_SOURCE_FP_INVALID)', async (_label, bad) => {
+    const { db, d } = await setupPersisted();
+    db.prepare('UPDATE deployments SET verified_source_fingerprint=? WHERE id=?').run(bad, DID);
+    const r = await d.buildCandidate(opArgs(PID, DID));
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/SNAPSHOT_SOURCE_FP_INVALID/);
+  });
+
+  test('fingerprint distinto (bien formado) → SNAPSHOT_SOURCE_MISMATCH', async () => {
+    const { db, d } = await setupPersisted();
+    db.prepare('UPDATE deployments SET verified_source_fingerprint=? WHERE id=?').run('b'.repeat(64), DID);
+    const r = await d.buildCandidate(opArgs(PID, DID));
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/SNAPSHOT_SOURCE_MISMATCH/);
+  });
+
+  test('fingerprint válido e igual (distinto case) → reutilización ok', async () => {
+    const { db, d } = await setupPersisted();
+    const row = db
+      .prepare('SELECT verified_source_fingerprint AS f FROM deployments WHERE id=?')
+      .get(DID) as { f: string };
+    db.prepare('UPDATE deployments SET verified_source_fingerprint=? WHERE id=?').run(row.f.toUpperCase(), DID);
+    const r = await d.buildCandidate(opArgs(PID, DID));
+    expect(r.ok).toBe(true);
+  });
+});

@@ -749,7 +749,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (fp !== rec.snapshotFingerprint) {
       return err('SNAPSHOT_DB_MISMATCH', 'snapshot content fingerprint does not match the persisted record');
     }
-    if (rec.verifiedSourceFingerprint && rec.verifiedSourceFingerprint !== rootFingerprint) {
+    // Revisión Codex (NO-GO 2, bloqueo 6): verified_source_fingerprint debe
+    // estar presente Y bien formado; no basta con comprobarlo solo cuando
+    // sea truthy. Ausente, NULL, vacío, malformado o distinto → fail closed.
+    const vsfp = rec.verifiedSourceFingerprint;
+    if (typeof vsfp !== 'string' || !/^[0-9a-f]{64}$/i.test(vsfp)) {
+      return err(
+        'SNAPSHOT_SOURCE_FP_INVALID',
+        'persisted verified_source_fingerprint is missing or malformed; refusing to reuse snapshot (fail closed)',
+      );
+    }
+    if (vsfp.toLowerCase() !== rootFingerprint.toLowerCase()) {
       return err('SNAPSHOT_SOURCE_MISMATCH', 'snapshot was built from different verified sources');
     }
     // El Dockerfile confiable y el .dockerignore controlado también se
