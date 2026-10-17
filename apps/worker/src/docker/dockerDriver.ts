@@ -580,6 +580,40 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       .run(verifiedSourceFingerprint, snapshotFingerprint, snapshotPath, deploymentId);
   }
 
+  /**
+   * Backup_ids que la retención NO debe eliminar (revisión Codex, NO-GO 2,
+   * bloqueo 1): backups referenciados por deployments activos (no
+   * terminales, incluido un rollback pendiente) y el backup del último
+   * despliegue `live` (objetivo de un eventual rollback). Se leen de
+   * SQLite; si la lectura falla (p. ej. columna ausente), no se protege
+   * nada extra y la retención conserva igualmente las 10 copias recientes.
+   */
+  private protectedBackupIds(projectId: string): Set<string> {
+    const ids = new Set<string>();
+    try {
+      const active = this.db
+        .prepare(
+          `SELECT backup_id FROM deployments WHERE project_id = ? AND backup_id IS NOT NULL
+           AND status IN ('pending','building','migrating','verifying','promoting')`,
+        )
+        .all(projectId) as Array<{ backup_id: string }>;
+      for (const r of active) {
+        if (isValidBackupId(r.backup_id)) ids.add(r.backup_id);
+      }
+      const lastLive = this.db
+        .prepare(
+          `SELECT backup_id FROM deployments WHERE project_id = ? AND status = 'live'
+           AND backup_id IS NOT NULL
+           ORDER BY COALESCE(finished_at, updated_at, started_at, '') DESC, id DESC LIMIT 1`,
+        )
+        .get(projectId) as { backup_id: string } | undefined;
+      if (lastLive && isValidBackupId(lastLive.backup_id)) ids.add(lastLive.backup_id);
+    } catch {
+      /* sin columnas/tabla legible: sin protegidos extra */
+    }
+    return ids;
+  }
+
   /** Registro persistido del snapshot para verificar reutilizaciones. */
   private readPersistedSnapshot(deploymentId: string): {
     verifiedSourceFingerprint: string | null;
@@ -1514,7 +1548,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
       }
       writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied });
-      enforceRetention({ dataDir: this.config.dataDir, projectId });
+      // Retención real (revisión Codex, NO-GO 2, bloqueo 1): se protegen los
+      // backups referenciados por deployments activos y por el último live.
+      enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
       return ok({ backupId, backupValidated: 'true' });
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {

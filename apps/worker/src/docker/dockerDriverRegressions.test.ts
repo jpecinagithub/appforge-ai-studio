@@ -853,7 +853,7 @@ describe('B7: pruneManagedImages con scope y protegidos', () => {
     expect(failures.some((f) => f.includes('incomplete labels'))).toBe(true);
   });
 
-  test('backups protegidos sobreviven: live_image y previous_image nunca se podan', async () => {
+  test('imágenes protegidas sobreviven a la poda: live_image y previous_image nunca se podan', async () => {
     const { d, stub, liveRef, oldRef } = await setupPrune();
     const { removed } = await d.pruneManagedImages(PID);
     expect(removed).not.toContain(liveRef);
@@ -1231,5 +1231,125 @@ describe('NO-GO2 B5: normalización de arquitectura', () => {
     server.close();
     expect(r.ok).toBe(true);
     expect(r.diagnostics.join(' ')).toMatch(/daemon architecture: arm64/);
+  });
+});
+
+describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', () => {
+  const LIVE = `appforge-app-${PID.slice(0, 8)}`;
+
+  /** Live en marcha con labels válidas para que createLiveBackup copie de verdad. */
+  function seedLiveContainer(stub: StubDocker) {
+    stub.containers.set(LIVE, {
+      Config: {
+        Labels: {
+          'com.appforge.managed': 'true',
+          'com.appforge.project-id': PID,
+          'com.appforge.role': 'live',
+        },
+        User: '1001',
+        Image: 'appforge/app-11111111:dep-aaaaaaaa-000000000000',
+      },
+      State: { Running: true },
+    });
+  }
+
+  /** Bytes de una SQLite real (quick_check debe pasar). */
+  function realDbBytes(): Buffer {
+    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'af-db-')), 'app.db');
+    const sdb = new Database(p);
+    sdb.exec('CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES (\'x\');');
+    sdb.close();
+    return fs.readFileSync(p);
+  }
+
+  async function setupWithBackups(backupCount: number) {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.exec('ALTER TABLE deployments ADD COLUMN project_id TEXT');
+    db.exec('ALTER TABLE deployments ADD COLUMN status TEXT');
+    db.exec('ALTER TABLE deployments ADD COLUMN backup_id TEXT');
+    db.exec('ALTER TABLE deployments ADD COLUMN finished_at TEXT');
+    db.exec('ALTER TABLE deployments ADD COLUMN updated_at TEXT');
+    db.exec('ALTER TABLE deployments ADD COLUMN started_at TEXT');
+    db.prepare('INSERT INTO deployments(id, project_id, status) VALUES (?,?,?)').run(DID, PID, 'building');
+    const stub = new StubDocker();
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const ids: string[] = [];
+    for (let i = 0; i < backupCount; i++) {
+      const id = `bk_old_${String(i).padStart(2, '0')}`;
+      ids.push(id);
+      const bdir = backupDirFor(dataDir, PID, id);
+      const manifest: BackupManifest = {
+        backupId: id,
+        projectId: PID,
+        deploymentId: DID,
+        createdAt: new Date().toISOString(),
+        hadDatabase: false,
+        files: [],
+      };
+      writeBackupManifest(bdir, manifest);
+      // mtime escalonado: bk_old_00 el más antiguo.
+      const t = new Date(Date.now() - (backupCount - i) * 3_600_000);
+      fs.utimesSync(path.join(bdir, 'backup.json'), t, t);
+    }
+    seedLiveContainer(stub);
+    stub.hostFiles.set('app.db', realDbBytes());
+    return { dataDir, db, stub, d, ids };
+  }
+
+  test('protegidos sobreviven (deployment activo + último live); el antiguo no protegido se elimina', async () => {
+    const { dataDir, db, stub, d, ids } = await setupWithBackups(12);
+    // bk_old_00 protegido por un deployment activo; bk_old_01 por el último live.
+    db.prepare('INSERT INTO deployments(id, project_id, status, backup_id) VALUES (?,?,?,?)').run(
+      DID2, PID, 'promoting', ids[0],
+    );
+    db.prepare(
+      "INSERT INTO deployments(id, project_id, status, backup_id, finished_at) VALUES (?,?,?,?,datetime('now'))",
+    ).run('bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', PID, 'live', ids[1]);
+    const r = await d.createLiveBackup({ projectId: PID, deploymentId: DID, candidateId: `cand-${DID.slice(0, 8)}`, previousLiveVersion: null } as never);
+    expect(r.ok).toBe(true);
+    expect(r.data?.backupValidated).toBe('true');
+    const exists = (id: string) => fs.existsSync(path.join(dataDir, 'project-backups', PID, id));
+    // Protegidos: sobreviven aunque sean los más antiguos.
+    expect(exists(ids[0])).toBe(true);
+    expect(exists(ids[1])).toBe(true);
+    // Antiguo no protegido más allá de keep=10: eliminado.
+    expect(exists(ids[2])).toBe(false);
+    // Los 9 más recientes + el nuevo backup: conservados.
+    for (const id of ids.slice(3)) expect(exists(id)).toBe(true);
+    const created = (r.data as Record<string, string>).backupId;
+    expect(exists(created)).toBe(true);
+    const m = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'project-backups', PID, created, 'backup.json'), 'utf8'),
+    ) as BackupManifest;
+    expect(m.hadDatabase).toBe(true);
+    expect(m.files.map((f) => f.name)).toContain('app.db');
+    expect(stub.calls.some((c) => c[0] === 'stop')).toBe(true); // el live se detuvo para copiar
+  });
+
+  test('sin filas en deployments: la retención conserva las 10 recientes sin protegidos', async () => {
+    const { dataDir, d, ids } = await setupWithBackups(12);
+    const r = await d.createLiveBackup({ projectId: PID, deploymentId: DID, candidateId: `cand-${DID.slice(0, 8)}`, previousLiveVersion: null } as never);
+    expect(r.ok).toBe(true);
+    const exists = (id: string) => fs.existsSync(path.join(dataDir, 'project-backups', PID, id));
+    // 12 antiguos + 1 nuevo = 13; keep=10 → se eliminan los 3 más antiguos.
+    expect(exists(ids[0])).toBe(false);
+    expect(exists(ids[1])).toBe(false);
+    expect(exists(ids[2])).toBe(false);
+    for (const id of ids.slice(3)) expect(exists(id)).toBe(true);
+  });
+
+  test('backup_id con formato inválido en deployments no rompe la retención', async () => {
+    const { dataDir, db, d, ids } = await setupWithBackups(12);
+    db.prepare('INSERT INTO deployments(id, project_id, status, backup_id) VALUES (?,?,?,?)').run(
+      DID2, PID, 'promoting', 'no-es-un-backup-id',
+    );
+    const r = await d.createLiveBackup({ projectId: PID, deploymentId: DID, candidateId: `cand-${DID.slice(0, 8)}`, previousLiveVersion: null } as never);
+    expect(r.ok).toBe(true);
+    const exists = (id: string) => fs.existsSync(path.join(dataDir, 'project-backups', PID, id));
+    expect(exists(ids[0])).toBe(false); // no protegido: se elimina por antigüedad
   });
 });
