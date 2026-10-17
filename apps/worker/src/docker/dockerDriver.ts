@@ -1060,7 +1060,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       }
       fs.mkdirSync(dir, { recursive: true });
       const copied: Array<{ name: string; size: number; sha256: string }> = [];
-      for (const f of ['app.db', 'app.db-wal', 'app.db-shm']) {
+      // Solo app.db + app.db-wal: el -shm es memoria compartida transitoria
+      // (SQLite lo recrea al abrir); su checksum no es estable entre copias.
+      for (const f of ['app.db', 'app.db-wal']) {
         const dest = path.join(dir, f);
         const cp = await this.sh(['cp', `${names.liveContainer}:/data/${f}`, dest], {
           timeoutMs: 120_000,

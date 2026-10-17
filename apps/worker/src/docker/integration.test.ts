@@ -484,7 +484,10 @@ d('docker integration (fase 7A)', () => {
     });
     expect(t1.status).toBe(201);
     const todoId = (t1.json as { id?: string }).id!;
-    const rs = await runner.run({ args: ['restart', h.names.liveContainer], timeoutMs: 60_000 });
+    // Reinicio: stop + start (el runner no expone 'restart' a propósito).
+    const st = await runner.run({ args: ['stop', '-t', '10', h.names.liveContainer], timeoutMs: 60_000 });
+    expect(st.code).toBe(0);
+    const rs = await runner.run({ args: ['start', h.names.liveContainer], timeoutMs: 60_000 });
     expect(rs.code).toBe(0);
     okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
     const ip2 = await containerIp(h.names.liveContainer);
@@ -603,13 +606,14 @@ d('docker integration (fase 7A)', () => {
     expect(mig.ok).toBe(false);
     expect(mig.code).toBe('MIGRATION_FAILED');
 
-    // Rollback físico: v1 sigue live y sana; v2 nunca se promocionó.
+    // Rollback físico: v1 sigue live y sana; v2 nunca se promocionó
+    // (el nombre del contenedor live solo depende del proyecto: sigue
+    // siendo el de v1, con la imagen v1).
     okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
     const rec = await h.driver.reconcileRuntime(h.args);
     okRes(rec);
     expect(rec.data?.liveRunning).toBe('true');
     expect(rec.data?.liveImage).toContain(v1Image);
-    expect(await resourceExists(runner, 'container', v2names.liveContainer)).toBe(false);
     // Limpieza de v2.
     okRes(await h.driver.discardVerificationDatabase(args2));
     okRes(await h.driver.discardCandidate(args2));
@@ -619,6 +623,13 @@ d('docker integration (fase 7A)', () => {
   test('abort durante el build: sin imagen parcial ni contenedores colgados', async () => {
     if (!haveImage) return;
     const h = await sharedHarness();
+    // Cache-busting: el build debe tardar (si no, la caché lo completa
+    // antes del abort y el test no prueba nada). No es una migración
+    // (no coincide con el patrón \d+_*.sql).
+    fs.writeFileSync(path.join(h.projectDir, 'migrations', 'cachebust.txt'), `bust ${Date.now()}\n`);
+    h.db.prepare('UPDATE verification_receipts SET fingerprint=? WHERE project_id=?').run(
+      sourceFingerprint(h.projectDir), h.projectId,
+    );
     const dep3 = randomUUID();
     h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep3);
     const ctl = new AbortController();
