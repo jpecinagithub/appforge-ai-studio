@@ -277,11 +277,20 @@ describe('restart reconciliation (Test E)', () => {
   });
 });
 
-describe('deploy (Phase 1)', () => {
-  it('returns 501 PHASE_3', async () => {
+describe('deploy (Fase 6)', () => {
+  it('rejects static projects with 400 INVALID_TYPE', async () => {
     const p = await createProject('Deploy app');
-    const res = await app.inject({ method: 'POST', url: `/api/projects/${p.id}/deploy` });
-    expect(res.statusCode).toBe(501);
-    expect(res.json().error.code).toBe('PHASE_3');
+    const res = await app.inject({ method: 'POST', url: `/api/projects/${p.id}/deploy`, payload: { target: 'oracle' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('INVALID_TYPE');
+  });
+
+  it('returns 501 DEPLOYMENT_DRIVER_NOT_CONFIGURED without a driver', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/projects', payload: { name: 'Dyn', type: 'dynamic' } });
+    expect(res.statusCode).toBe(201);
+    const p = res.json() as { id: string };
+    const dep = await app.inject({ method: 'POST', url: `/api/projects/${p.id}/deploy`, payload: { target: 'oracle' } });
+    expect(dep.statusCode).toBe(501);
+    expect(dep.json().error.code).toBe('DEPLOYMENT_DRIVER_NOT_CONFIGURED');
   });
 });
