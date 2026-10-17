@@ -924,7 +924,7 @@ fake. El límite de concurrencia es configurable y se aplica durante la vida del
 proceso (semáforo), además del bloqueo por proyecto de Fase 6.
 
 **Preflight**: Linux, CLI Docker ≥ 24.0, socket Unix real (`stat` confirma
-socket), `docker info` OK, red y volumen (se crean etiquetados si faltan),
+socket), `docker version` OK, red y volumen (se crean etiquetados si faltan),
 directorio de datos escribible. Fallo → 501 con diagnóstico sanitizado; el
 Studio sigue funcionando.
 
@@ -944,11 +944,15 @@ segura que rechaza symlinks (fail closed); exclusiones fijas (`.git/`,
 `node_modules/`, `dist/`, `.env*`, `*.db*`, `backups/`, `data/`, `*.log`);
 manifiesto ordenado `ruta + tamaño + SHA-256` + hash global; fingerprint
 persistido aditivamente en `deployments` (`snapshot_fingerprint`,
-`snapshot_path`); el fingerprint de los receipts se compara con el del
-proyecto antes de crear el snapshot; el hash del snapshot se re-verifica
-inmediatamente antes del `docker build`. `.dockerignore` controlado por
-AppForge con las mismas exclusiones. Docker construye exclusivamente desde el
-snapshot.
+`snapshot_path`); antes del snapshot, si los receipts del proyecto comparten
+un único fingerprint, debe coincidir con `sourceFingerprint(projectDir)`
+(`RECEIPT_FINGERPRINT_MISMATCH` si las fuentes cambiaron tras el gate; los
+receipts por-scope de Fase 6 los re-verifica el orquestador); el hash del
+snapshot se re-verifica inmediatamente antes del `docker build` y también al
+reutilizar un snapshot existente. `.dockerignore` controlado por AppForge con
+las mismas exclusiones. Docker construye exclusivamente desde el snapshot.
+El build es idempotente: snapshot verificado + imagen con labels exactas →
+se reutiliza sin reconstruir.
 
 **Endurecimiento** (live y verify): usuario 1001, `--read-only`, `/tmp` en
 tmpfs con límites, único montaje escribible (volumen propio en `/data`),
@@ -972,6 +976,15 @@ confiable); `backupId` con formato `bk_[A-Za-z0-9_-]{1,64}` y
 retención 10 sin borrar backups requeridos; restauración verificada
 (checksum tras copiar).
 
+**Runner**: spawn sin shell (ejecutable + argv validado contra lista cerrada);
+abort/timeout matan TODO el grupo de procesos (`detached: true` + SIGKILL al
+grupo: cero huérfanos aunque el hijo haga fork); captura limitada (1 MiB) y
+sanitizada; entorno mínimo explícito (nunca `process.env` en bloque).
+
+**Volumen live**: se crea con labels antes del primer uso (`ensureLiveVolume`
+en `runLiveMigrations`/`startCandidateAsLive`/`restoreBackup`); sin esto,
+`docker run -v` lo autocrearía sin labels y quedaría fuera del inventario.
+
 **Archivos de 7A** (inventario):
 `apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
 `apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),
@@ -979,7 +992,7 @@ retención 10 sin borrar backups requeridos; restauración verificada
 `apps/worker/src/docker/hardening.ts` (+ `.test.ts`),
 `apps/worker/src/docker/env.ts` (+ `.test.ts`),
 `apps/worker/src/docker/sqliteBackup.ts` (+ `.test.ts`),
-`apps/worker/src/docker/dockerDriver.ts`,
+`apps/worker/src/docker/dockerDriver.ts` (+ `.test.ts`),
 `apps/worker/src/docker/integration.test.ts` (puerta `APPFORGE_DOCKER_INTEGRATION`),
 `apps/worker/src/docker/static.test.ts`,
 `apps/worker/src/docker/index.ts`.
