@@ -651,9 +651,16 @@ invalida.
 ningún preview anterior se considera `ready`, los `starting` pasan a
 `stopped`, se limpian los directorios temporales y **ningún PID leído de
 SQLite se mata jamás**: el SO podría haberlo reutilizado para un proceso
-ajeno y su identidad no es verificable; solo el worker que generó el
-proceso puede terminarlo. El borrado recursivo de `tmp_dir` solo acepta
-rutas estrictamente dentro de `os.tmpdir()`, distintas del propio
+ajeno y su identidad no es verificable. `stopPreview` solo termina el
+árbol del `ChildProcess` que este worker generó (verificado por el mapa
+en memoria); sin hijo propio, se limita a limpiar el temporal verificado
+y cerrar la fila. Ante un backend inalcanzable, `failPreview` es una
+operación asíncrona de fallo/cierre que el proxy espera antes de
+responder 503: si el proceso es propio, mata su árbol, espera su
+terminación y solo después limpia y marca `failed` (sin huérfanos, sin
+borrar bajo un backend vivo); sin hijo propio, nunca mata el PID
+persistido. El borrado recursivo de `tmp_dir` solo acepta rutas
+estrictamente dentro de `os.tmpdir()`, distintas del propio
 `os.tmpdir()` y con el prefijo reservado `af-preview-`; cualquier otra
 ruta se rechaza. `delete_file` nunca permite borrar la raíz de un área
 (`"."`, `"./"`, `"a/.."` y equivalentes normalizados). Las lecturas
@@ -661,6 +668,12 @@ decodifican los bytes originales con `TextDecoder('utf-8', {fatal: true})`:
 cualquier secuencia UTF-8 inválida se rechaza, nunca se sustituye por
 U+FFFD en silencio. Los previews son provisionales y no equivalen a
 despliegues.
+
+**Riesgo residual**: un cierre abrupto de AppForge puede dejar vivo un
+proceso detached anterior: `reconcilePreviews` ya no puede matarlo con
+seguridad. No se afirma "sin procesos huérfanos tras reinicio" hasta
+disponer de un supervisor con vínculo de vida al padre o del aislamiento
+de la Fase 7.
 
 El despliegue live, `health_check_project`, `rollback_project` y
 `backup_project_database` pertenecen a las Fases 6–7. Todas confinadas al

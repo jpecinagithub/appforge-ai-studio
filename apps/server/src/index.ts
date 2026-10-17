@@ -28,7 +28,7 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, markPreviewFailed, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -897,11 +897,12 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
         duplex: body ? 'half' : undefined,
       });
     } catch (e) {
-      // The proxy never trusts a `ready` SQLite row alone: an unreachable
-      // backend is immediately marked failed (pid/port cleared, temp DB
-      // removed) so later requests get the 503 diagnostic, not another
-      // attempt against a dead port.
-      markPreviewFailed(db, projectId, `preview backend unreachable: ${(e as Error).message}`.slice(0, 500));
+      // Fail-close BEFORE answering 503: when this process owns the backend,
+      // its tree is killed and reaped first (no orphan, no deletion under a
+      // live backend); otherwise only the registry row is closed and verified
+      // temp paths cleaned — a persisted PID is never killed. The proxy never
+      // trusts a `ready` SQLite row alone.
+      await failPreview(db, projectId, `preview backend unreachable: ${(e as Error).message}`.slice(0, 500));
       reply.code(503).type('text/html; charset=utf-8');
       return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
     }

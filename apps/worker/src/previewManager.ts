@@ -15,15 +15,22 @@
  *
  * Invariants:
  * - Only one active preview per project; starting a new one fully stops the
- *   old one first (whole process tree, wait for exit).
+ *   old one first (whole process tree, wait for exit) — but only when this
+ *   worker process owns the ChildProcess (verified via the in-memory handle
+ *   map). A PID read from SQLite is never a kill target.
  * - The child never receives Studio secrets (buildChildEnv allowlist).
  * - The child listens on 127.0.0.1 only.
- * - On timeout/cancel/replace/shutdown the whole process tree is killed and
- *   the temp SQLite (+WAL/SHM) is removed: no orphaned processes or ports.
+ * - On timeout/cancel/replace the whole owned process tree is killed and
+ *   the temp SQLite (+WAL/SHM) is removed.
  * - After an AppForge restart no previous preview is considered ready.
  *   reconcilePreviews() marks them stopped WITHOUT killing any PID:
  *   a PID read from SQLite after a restart may have been reused by the OS
  *   for an unrelated process, so it must never be trusted.
+ *
+ * RESIDUAL RISK: an abrupt AppForge shutdown can leave a previously detached
+ * backend process alive: reconcilePreviews can no longer kill it safely.
+ * Do not claim "no orphaned processes after restart" until a supervisor
+ * with a parent-lifetime bond or the Phase 7 isolation exists.
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -176,8 +183,14 @@ export function previewCookieName(projectId: string): string {
 }
 
 /**
- * Fully stop a preview: kill the whole process tree, wait for exit,
- * remove the temp SQLite (+WAL/SHM) and mark the registry row stopped.
+ * Fully stop a preview.
+ *
+ * Only kills when THIS worker process owns the ChildProcess: ownership is
+ * verified through the in-memory `children` map (the handle we spawned).
+ * A PID read from the SQLite row is NEVER a kill or wait target — after a
+ * restart the OS may have reused it for an unrelated process. With no owned
+ * child, the operation is limited to safely cleaning the verified temp dir
+ * and closing the registry row.
  */
 export async function stopPreview(
   db: ToolContext['db'],
@@ -185,19 +198,15 @@ export async function stopPreview(
   reason: string,
 ): Promise<void> {
   const child = children.get(projectId);
-  const row = getPreview(db, projectId);
-  const pid = child?.pid ?? row?.pid ?? null;
-
   if (child) {
-    killTreeByPid(child.pid);
+    // Take ownership first: the exit watcher becomes a no-op for this child,
+    // so stop/replace/proxy-failure cannot double-kill it.
     children.delete(projectId);
-  } else if (pid) {
-    killTreeByPid(pid);
+    killTreeByPid(child.pid);
+    if (child.pid) await waitPidGone(child.pid);
   }
-  if (pid) await waitPidGone(pid);
-
-  const tmpDir = row?.tmp_dir ?? null;
-  cleanupTmpDir(tmpDir);
+  const row = getPreview(db, projectId);
+  cleanupTmpDir(row?.tmp_dir ?? null);
   setPreview(db, {
     project_id: projectId,
     port: null,
@@ -210,17 +219,45 @@ export async function stopPreview(
 }
 
 /**
- * Mark a preview as failed because its backend is unreachable (called by the
- * Studio proxy when the upstream connection fails, and by the exit watcher
- * inside the owning worker). Clears pid/port, removes the temp SQLite
- * (+WAL/SHM). NEVER kills a process: only the owning worker lifetime may
- * kill, and here the backend is already known-dead.
+ * Fail-close a preview whose backend is believed unreachable: the Studio
+ * proxy calls this on upstream fetch failure, and the exit watcher calls it
+ * when the owned backend dies after going ready.
+ *
+ * This is async and MUST be awaited before reporting the preview as failed:
+ *
+ * - When this process owns the ChildProcess, its whole tree is killed and
+ *   termination is awaited BEFORE the temp SQLite (+WAL/SHM) is cleaned and
+ *   the row is marked failed: no orphaned process, no deletion under a live
+ *   backend, and the kill handle is never lost.
+ * - When there is no owned ChildProcess, the persisted PID is untrusted and
+ *   is never killed or waited on: the operation is limited to closing the
+ *   registry row and cleaning verified temp paths.
+ *
+ * Race safety: ownership is taken synchronously through the `children` map,
+ * so the exit watcher, stopPreview, replace and proxy failure cannot
+ * double-kill the same child. The row is re-read after the wait: if it was
+ * replaced meanwhile (different pid), it is left alone.
  */
-export function markPreviewFailed(db: ToolContext['db'], projectId: string, reason: string): void {
+export async function failPreview(
+  db: ToolContext['db'],
+  projectId: string,
+  reason: string,
+): Promise<void> {
+  const child = children.get(projectId);
   const row = getPreview(db, projectId);
+  const tmpDir = row?.tmp_dir ?? null;
+  const rowPid = row?.pid ?? null;
+  if (child) {
+    // Take ownership first: the exit watcher becomes a no-op for this child.
+    children.delete(projectId);
+    killTreeByPid(child.pid);
+    if (child.pid) await waitPidGone(child.pid);
+  }
   if (!row) return;
-  children.delete(projectId); // drop any stale handle; no kill from here
-  cleanupTmpDir(row.tmp_dir);
+  const current = getPreview(db, projectId);
+  // Replaced while we waited (different pid): leave the new preview alone.
+  if (current && current.pid !== rowPid) return;
+  cleanupTmpDir(tmpDir);
   setPreview(db, {
     project_id: projectId,
     port: null,
@@ -345,23 +382,19 @@ export async function startFullstackPreview(ctx: ToolContext): Promise<ToolResul
   let exitCode: number | null = null;
   child.on('exit', (code, signal) => {
     exitCode = code;
-    // If the backend dies at any point after going ready, the registry must
-    // stop claiming a live preview: mark failed, clear pid/port, clean the
-    // temp SQLite (+WAL/SHM) and drop the process handle. Intentional stops
-    // (stopPreview) remove the handle from the map first, so this is a no-op
-    // for them.
-    const current = children.get(projectId);
-    if (current === child) {
-      const row = getPreview(ctx.db, projectId);
-      if (row && row.status === 'ready') {
-        markPreviewFailed(
-          ctx.db,
-          projectId,
-          sanitizeSecrets(`preview backend exited unexpectedly (code=${code} signal=${signal}) stdout=${stdout} stderr=${stderr}`.slice(0, 2000)),
-        );
-      } else {
-        children.delete(projectId);
-      }
+    // Hand the failure to failPreview: it takes ownership synchronously, so
+    // stopPreview, replace and proxy-failure cannot double-handle this child.
+    // Intentional stops delete the handle from the map first: no-op for them.
+    if (children.get(projectId) !== child) return;
+    const row = getPreview(ctx.db, projectId);
+    if (row && row.status === 'ready') {
+      failPreview(
+        ctx.db,
+        projectId,
+        sanitizeSecrets(`preview backend exited unexpectedly (code=${code} signal=${signal}) stdout=${stdout} stderr=${stderr}`.slice(0, 2000)),
+      ).catch(() => { /* best effort: the row keeps its last state */ });
+    } else {
+      children.delete(projectId);
     }
   });
   child.on('error', () => { if (exitCode === null) exitCode = -1; });

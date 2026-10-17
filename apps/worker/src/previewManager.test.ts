@@ -11,9 +11,11 @@ import {
   readdirSync,
   rmSync,
   writeFileSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { describe, expect, test, afterEach, beforeEach } from 'vitest';
 import {
@@ -21,6 +23,7 @@ import {
   getPreview,
   startFullstackPreview,
   stopPreview,
+  failPreview,
   reconcilePreviews,
   previewCookieName,
   validatePreviewTmpDir,
@@ -264,8 +267,7 @@ srv.listen(Number(process.env.PORT || '0'), '127.0.0.1');\n`,
     expect(/exited unexpectedly/.test(crashed?.error ?? '')).toBe(true);
   });
 
-  test('validatePreviewTmpDir only allows af-preview-* dirs inside os.tmpdir()', () => {
-    const base = tmpdir();
+  test('validatePreviewTmpDir only allows af-preview-* dirs inside os.tmpdir()', () => {    const base = tmpdir();
     const good = path.join(base, 'af-preview-123-xyz');
     expect(validatePreviewTmpDir(good)).toBe(path.resolve(good));
     // os.tmpdir() itself: refused.
@@ -284,5 +286,79 @@ srv.listen(Number(process.env.PORT || '0'), '127.0.0.1');\n`,
     expect(name).toMatch(/^af_preview_[A-Za-z0-9]+$/);
     expect(previewCookieName('abc-123_DEF')).toBe(name);
     expect(previewCookieName('other')).not.toBe(name);
+  });
+
+  test('stopPreview never kills a PID read from SQLite (foreign live process)', async () => {
+    const db = makeDb();
+    const ctx = makeCtx(db, makeProject());
+    // Simulate a stale row from a previous AppForge lifetime: a live PID this
+    // worker never spawned, so there is no ChildProcess in the map.
+    const foreign = spawn('node', ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const foreignPid = foreign.pid!;
+    expect(pidAlive(foreignPid)).toBe(true);
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'af-preview-foreign-'));
+    db.prepare(`INSERT INTO previews(project_id, port, pid, status, db_path, tmp_dir, error, updated_at)
+      VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)`)
+      .run(ctx.projectId, 45678, foreignPid, path.join(tmpDir, 'preview.db'), tmpDir, null, new Date().toISOString());
+    try {
+      await stopPreview(db, ctx.projectId, 'test');
+      const row = getPreview(db, ctx.projectId)!;
+      expect(row.status).toBe('stopped');
+      expect(row.pid).toBeNull();
+      expect(row.port).toBeNull();
+      // The foreign process is untouched...
+      expect(pidAlive(foreignPid)).toBe(true);
+      // ...but the verified temp dir was still cleaned and the row closed.
+      expect(existsSync(tmpDir)).toBe(false);
+    } finally {
+      try { foreign.kill('SIGKILL'); } catch { /* ignore */ }
+    }
+  });
+
+  test('failPreview kills an owned live backend and leaves no orphan', async () => {
+    const db = makeDb();
+    const ctx = makeCtx(db, makeProject());
+    mark5AValid(ctx);
+    const r = await startFullstackPreview(ctx);
+    expect(r.ok).toBe(true);
+    const row = getPreview(db, ctx.projectId)!;
+    const pid = row.pid!;
+    const tmpDir = row.tmp_dir!;
+    expect(pidAlive(pid)).toBe(true);
+
+    // Simulate a proxy timeout against a backend that is still alive:
+    // fail-close must kill the owned tree and wait for it BEFORE cleaning
+    // the temp dir and marking the row failed.
+    await failPreview(db, ctx.projectId, 'simulated proxy timeout');
+    expect(pidAlive(pid)).toBe(false);
+    const failed = getPreview(db, ctx.projectId)!;
+    expect(failed.status).toBe('failed');
+    expect(failed.pid).toBeNull();
+    expect(failed.port).toBeNull();
+    expect(failed.db_path).toBeNull();
+    expect(existsSync(tmpDir)).toBe(false);
+    expect(/simulated proxy timeout/.test(failed.error ?? '')).toBe(true);
+  });
+
+  test('failPreview with no owned child never kills the persisted PID', async () => {
+    const db = makeDb();
+    const ctx = makeCtx(db, makeProject());
+    const foreign = spawn('node', ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const foreignPid = foreign.pid!;
+    expect(pidAlive(foreignPid)).toBe(true);
+    db.prepare(`INSERT INTO previews(project_id, port, pid, status, db_path, tmp_dir, error, updated_at)
+      VALUES (?, ?, ?, 'ready', ?, ?, ?, ?)`)
+      .run(ctx.projectId, 45679, foreignPid, null, null, null, new Date().toISOString());
+    try {
+      await failPreview(db, ctx.projectId, 'simulated proxy error');
+      // The foreign process is untouched: only the row is closed.
+      expect(pidAlive(foreignPid)).toBe(true);
+      const row = getPreview(db, ctx.projectId)!;
+      expect(row.status).toBe('failed');
+      expect(row.pid).toBeNull();
+      expect(row.port).toBeNull();
+    } finally {
+      try { foreign.kill('SIGKILL'); } catch { /* ignore */ }
+    }
   });
 });
