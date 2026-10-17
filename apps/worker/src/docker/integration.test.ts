@@ -39,6 +39,8 @@ import {
 import { createSnapshot } from './snapshot.js';
 import { sourceFingerprint } from '../fingerprint.js';
 import { isValidBackupId } from './sqliteBackup.js';
+import { DYNAMIC_CHECK_ORDER, checkScopeFingerprint, type DynamicCheckKey } from '../dynamicTools.js';
+import { recordVerificationReceipt } from '../deploy/receipts.js';
 import type { DriverResult } from '../deploy/driver.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +60,19 @@ const d = ENABLED ? describe : describe.skip;
 
 function okRes(r: DriverResult): void {
   expect(r.ok, `expected ok, got ${r.code}: ${(r.error ?? '').slice(0, 300)}`).toBe(true);
+}
+
+/**
+ * Registra los SEIS receipts canónicos reales sobre las fuentes actuales
+ * (misma semántica que `recordDynamicCheck` de Fase 6). Tras mutar fuentes,
+ * llamar de nuevo para re-verificar.
+ */
+function recordSixReceipts(db: Database.Database, projectId: string, projectDir: string): void {
+  DYNAMIC_CHECK_ORDER.forEach((key: DynamicCheckKey, idx: number) => {
+    const fp = checkScopeFingerprint(projectDir, key);
+    expect(fp, `no scope fingerprint for ${key}`).toBeTruthy();
+    recordVerificationReceipt(db, projectId, key, fp!, idx);
+  });
 }
 
 interface Harness {
@@ -187,12 +202,17 @@ d('docker integration (fase 7A)', () => {
     }
     const db = new DatabaseSync(path.join(dataDir, 'studio.db'));
     db.exec('CREATE TABLE deployments(id TEXT PRIMARY KEY)');
-    db.exec('CREATE TABLE verification_receipts(project_id TEXT NOT NULL, check_key TEXT NOT NULL, fingerprint TEXT NOT NULL)');
+    db.exec(`CREATE TABLE IF NOT EXISTS verification_receipts(
+       project_id TEXT NOT NULL,
+       check_key TEXT NOT NULL,
+       fingerprint TEXT NOT NULL,
+       seq INTEGER NOT NULL,
+       created_at TEXT NOT NULL,
+       PRIMARY KEY (project_id, check_key))`);
     db.prepare('INSERT INTO deployments(id) VALUES (?)').run(deploymentId);
-    // Receipt único: vincula las fuentes verificadas con el build.
-    db.prepare('INSERT INTO verification_receipts(project_id, check_key, fingerprint) VALUES (?,?,?)').run(
-      projectId, 'source', sourceFingerprint(projectDir),
-    );
+    // Seis receipts canónicos reales (Fase 6/7A): la puerta del driver los
+    // exige en orden canónico y vigentes sobre las fuentes actuales.
+    recordSixReceipts(db as never, projectId, projectDir);
     const cfg: DockerDriverConfig = {
       dataDir,
       network: testNet,
@@ -259,15 +279,16 @@ d('docker integration (fase 7A)', () => {
     const to = setTimeout(() => ctl.abort(), haveImage ? 600_000 : 45_000);
     const r1 = await h.driver.buildCandidate({ ...h.args, signal: ctl.signal });
     clearTimeout(to);
-    expect(r1.code).not.toBe('RECEIPT_FINGERPRINT_MISMATCH');
+    expect(r1.code).not.toMatch(/RECEIPT_GATE_FAILED/);
     if (haveImage) okRes(r1);
-    // Manipula las fuentes tras el gate.
+    // Manipula las fuentes tras el gate: los receipts quedan stale y la
+    // puerta persistida (Fase 6/7A) se cierra antes de tocar Docker.
     fs.appendFileSync(path.join(h.projectDir, 'backend', 'src', 'server.ts'), '\n// tamper\n');
     const dep2 = randomUUID();
     h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep2);
     const r2 = await h.driver.buildCandidate({ ...h.args, deploymentId: dep2 });
     expect(r2.ok).toBe(false);
-    expect(r2.code).toBe('RECEIPT_FINGERPRINT_MISMATCH');
+    expect(r2.code).toBe('RECEIPT_GATE_FAILED');
   }, 700_000);
 
   test('prepare/discardVerificationDatabase: volumen aislado con labels', async () => {
@@ -589,11 +610,9 @@ d('docker integration (fase 7A)', () => {
     const h = await sharedHarness();
     const v1Image = h.names.image;
 
-    // v2 con migración rota (re-verificada: se actualiza el receipt).
+    // v2 con migración rota (re-verificada: se re-registran los receipts).
     fs.writeFileSync(path.join(h.projectDir, 'migrations', '002_broken.sql'), 'THIS IS NOT VALID SQL;\n');
-    h.db.prepare('UPDATE verification_receipts SET fingerprint=? WHERE project_id=?').run(
-      sourceFingerprint(h.projectDir), h.projectId,
-    );
+    recordSixReceipts(h.db as never, h.projectId, h.projectDir);
     const dep2 = randomUUID();
     h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep2);
     const args2 = { ...h.args, deploymentId: dep2 };
@@ -626,14 +645,16 @@ d('docker integration (fase 7A)', () => {
   test('abort durante el build: sin imagen parcial ni contenedores colgados', async () => {
     if (!haveImage) return;
     const h = await sharedHarness();
-    // Build determinísticamente lento: se inyecta `RUN sleep 45` en la
-    // COPIA del Dockerfile (no en la plantilla del repo). Así el abort a
-    // los 5s siempre pilla el build a mitad, sin carreras con la caché.
-    const dockerfile = path.join(h.projectDir, 'Dockerfile');
-    fs.appendFileSync(dockerfile, '\n# test-only: slow down the build for abort testing\nRUN sleep 45\n');
-    h.db.prepare('UPDATE verification_receipts SET fingerprint=? WHERE project_id=?').run(
-      sourceFingerprint(h.projectDir), h.projectId,
-    );
+    // Build determinísticamente lento SIN tocar el Dockerfile (B3 exige el
+    // Dockerfile byte a byte igual a la plantilla): se inyecta `sleep 45`
+    // en el `preinstall` del frontend, que `npm ci` ejecuta en la primera
+    // etapa del build. Así el abort a los 5s siempre pilla el build a mitad,
+    // sin carreras con la caché.
+    const fpkgPath = path.join(h.projectDir, 'frontend', 'package.json');
+    const fpkg = JSON.parse(fs.readFileSync(fpkgPath, 'utf8')) as { scripts?: Record<string, string> };
+    fpkg.scripts = { ...(fpkg.scripts ?? {}), preinstall: 'sleep 45' };
+    fs.writeFileSync(fpkgPath, JSON.stringify(fpkg, null, 2));
+    recordSixReceipts(h.db as never, h.projectId, h.projectDir);
     const dep3 = randomUUID();
     h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep3);
     const ctl = new AbortController();
@@ -680,4 +701,174 @@ d('docker integration (fase 7A)', () => {
     }
     okRes(await h.driver.discardVerificationDatabase(h.args));
   }, 300_000);
+
+  test('B4: dos despliegues consecutivos comparten volumen live y datos', async () => {
+    if (!haveImage) return;
+    const h = await makeHarness();
+    // v1 live con datos.
+    okRes(await h.driver.buildCandidate(h.args));
+    snapshotFp(h);
+    const v1Image = h.names.image;
+    builtImages.add(v1Image);
+    okRes(await h.driver.runLiveMigrations(h.args));
+    okRes(await h.driver.startCandidateAsLive(h.args));
+    okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
+    const ip1 = await containerIp(h.names.liveContainer);
+    const email = `b4-${RUN_ID}@example.com`;
+    const password = 'B4-1234-xY9!';
+    const cookie1 = await registerAndLogin(ip1, email, password);
+    const t1 = await httpJsonDirect('POST', `http://${ip1}:8080/api/todos`, {
+      body: { title: 'b4-data' }, cookie: cookie1,
+    });
+    expect(t1.status).toBe(201);
+    const liveVolumeV1 = h.names.liveVolume;
+
+    // v2: mismo proyecto, deployment distinto, fuentes ligeramente distintas.
+    fs.appendFileSync(path.join(h.projectDir, 'backend', 'src', 'server.ts'), '\n// v2\n');
+    recordSixReceipts(h.db as never, h.projectId, h.projectDir);
+    const dep2 = randomUUID();
+    h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep2);
+    const args2 = { ...h.args, deploymentId: dep2 };
+    okRes(await h.driver.buildCandidate(args2));
+    const m2 = JSON.parse(
+      fs.readFileSync(path.join(h.dataDir, 'deploy-snapshots', dep2, '.appforge-manifest.json'), 'utf8'),
+    ) as { fingerprint: string };
+    const names2 = resourceNames(h.projectId, dep2, m2.fingerprint);
+    builtImages.add(names2.image);
+    okRes(await h.driver.runLiveMigrations(args2));
+    okRes(await h.driver.startCandidateAsLive(args2));
+    okRes(await h.driver.runHealthCheck({ ...args2, runtime: 'live' }));
+
+    // Mismo volumen live (identidad estable de proyecto, sin deployment ni
+    // fingerprint en las labels) y mismos datos.
+    expect(names2.liveVolume).toBe(liveVolumeV1);
+    const vinfo = (await inspectResource(runner, 'volume', liveVolumeV1)) as { Labels?: Record<string, string> };
+    expect(vinfo.Labels?.[MANAGED_LABEL]).toBe('true');
+    expect(vinfo.Labels?.['com.appforge.project-id']).toBe(h.projectId);
+    expect(vinfo.Labels?.['com.appforge.role']).toBe('live');
+    expect(vinfo.Labels?.['com.appforge.deployment-id']).toBeUndefined();
+    const ip2 = await containerIp(names2.liveContainer);
+    const login = await httpJsonDirect('POST', `http://${ip2}:8080/api/auth/login`, {
+      body: { email, password },
+    });
+    expect(login.status).toBe(200);
+    const cookie2 = (login.setCookies.find((c) => c.startsWith('af_session=')) ?? '').split(';')[0];
+    const list = await httpJsonDirect('GET', `http://${ip2}:8080/api/todos`, { cookie: cookie2 });
+    const titles = ((list.json as { items?: Array<{ title?: string }> }).items ?? []).map((t) => t.title);
+    expect(titles).toContain('b4-data');
+    // Solo existe UN volumen live para el proyecto.
+    const vols = await runner.run({
+      args: ['volume', 'ls', '--format', '{{.Name}}', '--filter', `label=com.appforge.project-id=${h.projectId}`],
+      timeoutMs: 30_000,
+    });
+    expect(vols.stdout.split('\n').map((s) => s.trim()).filter(Boolean)).toEqual([liveVolumeV1]);
+    // Limpieza: detener el live de v2 (el afterAll elimina el resto).
+    await runner.run({ args: ['stop', '-t', '5', names2.liveContainer], timeoutMs: 60_000 }).catch(() => undefined);
+    await runner.run({ args: ['rm', names2.liveContainer], timeoutMs: 60_000 }).catch(() => undefined);
+  }, 900_000);
+
+  test('B9: rollback físico real conserva versión y datos anteriores', async () => {
+    if (!haveImage) return;
+    const h = await makeHarness();
+    // v1 live con datos.
+    okRes(await h.driver.buildCandidate(h.args));
+    snapshotFp(h);
+    const v1Image = h.names.image;
+    builtImages.add(v1Image);
+    okRes(await h.driver.runLiveMigrations(h.args));
+    okRes(await h.driver.startCandidateAsLive(h.args));
+    okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
+    const ip1 = await containerIp(h.names.liveContainer);
+    const email = `b9-${RUN_ID}@example.com`;
+    const password = 'B9-1234-xY9!';
+    const cookie1 = await registerAndLogin(ip1, email, password);
+    const t1 = await httpJsonDirect('POST', `http://${ip1}:8080/api/todos`, {
+      body: { title: 'rollback-data' }, cookie: cookie1,
+    });
+    expect(t1.status).toBe(201);
+
+    // v2 verificada (migración válida).
+    fs.writeFileSync(path.join(h.projectDir, 'migrations', '002_v2.sql'), 'CREATE TABLE IF NOT EXISTS v2_marker(id INTEGER);\n');
+    recordSixReceipts(h.db as never, h.projectId, h.projectDir);
+    const dep2 = randomUUID();
+    h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep2);
+    const args2 = { ...h.args, deploymentId: dep2 };
+    okRes(await h.driver.buildCandidate(args2));
+    const m2 = JSON.parse(
+      fs.readFileSync(path.join(h.dataDir, 'deploy-snapshots', dep2, '.appforge-manifest.json'), 'utf8'),
+    ) as { fingerprint: string };
+    const names2 = resourceNames(h.projectId, dep2, m2.fingerprint);
+    builtImages.add(names2.image);
+    okRes(await h.driver.prepareVerificationDatabase(args2));
+    okRes(await h.driver.runVerificationMigrations(args2));
+    okRes(await h.driver.startVerificationRuntime(args2));
+    okRes(await h.driver.runHealthCheck({ ...args2, runtime: 'verify' }));
+    okRes(await h.driver.stopVerificationRuntime(args2));
+    okRes(await h.driver.discardVerificationDatabase(args2));
+
+    // Backup del live (v1 con datos). El backup detiene el live.
+    const bk = await h.driver.createLiveBackup({ ...h.args, previousLiveVersion: null });
+    okRes(bk);
+    const backupId = bk.data!.backupId;
+    expect(isValidBackupId(backupId)).toBe(true);
+
+    // Dato posterior al backup: debe DESAPARECER tras el restore (prueba
+    // física de que el volumen se sustituyó por el contenido del backup).
+    await runner.run({ args: ['start', h.names.liveContainer], timeoutMs: 30_000 });
+    okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
+    const ipPost = await containerIp(h.names.liveContainer);
+    const loginPost = await httpJsonDirect('POST', `http://${ipPost}:8080/api/auth/login`, {
+      body: { email, password },
+    });
+    expect(loginPost.status).toBe(200);
+    const cookiePost = (loginPost.setCookies.find((c) => c.startsWith('af_session=')) ?? '').split(';')[0];
+    const tPost = await httpJsonDirect('POST', `http://${ipPost}:8080/api/todos`, {
+      body: { title: 'post-backup' }, cookie: cookiePost,
+    });
+    expect(tPost.status).toBe(201);
+    await runner.run({ args: ['stop', '-t', '10', h.names.liveContainer], timeoutMs: 60_000 });
+
+    // v3 = v2 + migración rota → FALLO REAL durante la migración live
+    // (el contenedor de migración la ejecuta contra el volumen live).
+    fs.writeFileSync(path.join(h.projectDir, 'migrations', '003_broken.sql'), 'THIS IS NOT VALID SQL;\n');
+    recordSixReceipts(h.db as never, h.projectId, h.projectDir);
+    const dep3 = randomUUID();
+    h.db.prepare('INSERT INTO deployments(id) VALUES (?)').run(dep3);
+    const args3 = { ...h.args, deploymentId: dep3 };
+    okRes(await h.driver.buildCandidate(args3));
+    const m3 = JSON.parse(
+      fs.readFileSync(path.join(h.dataDir, 'deploy-snapshots', dep3, '.appforge-manifest.json'), 'utf8'),
+    ) as { fingerprint: string };
+    const names3 = resourceNames(h.projectId, dep3, m3.fingerprint);
+    builtImages.add(names3.image);
+    const mig = await h.driver.runLiveMigrations(args3);
+    expect(mig.ok).toBe(false);
+    expect(mig.code).toBe('MIGRATION_FAILED');
+
+    // Rollback físico: restore del backup + arranque de la versión anterior.
+    // Las operaciones físicas deben ejecutarse (staging → swap → start).
+    okRes(await h.driver.restoreBackup({ ...args3, backupId }));
+    okRes(await h.driver.startPreviousVersion({ ...args3, previousLiveVersion: v1Image }));
+    okRes(await h.driver.runHealthCheck({ ...args3, runtime: 'live' }));
+
+    // La versión anterior sirve y los datos anteriores están intactos.
+    const rec = await h.driver.reconcileRuntime(args3);
+    okRes(rec);
+    expect(rec.data?.liveImage).toContain(v1Image);
+    const ip3 = await containerIp(h.names.liveContainer);
+    const login3 = await httpJsonDirect('POST', `http://${ip3}:8080/api/auth/login`, {
+      body: { email, password },
+    });
+    expect(login3.status).toBe(200);
+    const cookie3 = (login3.setCookies.find((c) => c.startsWith('af_session=')) ?? '').split(';')[0];
+    const list = await httpJsonDirect('GET', `http://${ip3}:8080/api/todos`, { cookie: cookie3 });
+    const titles = ((list.json as { items?: Array<{ title?: string }> }).items ?? []).map((t) => t.title);
+    expect(titles).toContain('rollback-data');
+    expect(titles).not.toContain('post-backup');
+    // Limpieza de v2/v3 (el afterAll elimina el resto).
+    okRes(await h.driver.discardCandidate(args3));
+    builtImages.delete(names3.image);
+    okRes(await h.driver.discardCandidate(args2));
+    builtImages.delete(names2.image);
+  }, 900_000);
 });

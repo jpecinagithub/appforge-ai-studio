@@ -988,6 +988,70 @@ sanitizada; entorno mínimo explícito (nunca `process.env` en bloque).
 en `runLiveMigrations`/`startCandidateAsLive`/`restoreBackup`); sin esto,
 `docker run -v` lo autocrearía sin labels y quedaría fuera del inventario.
 
+**Revisión Codex (NO-GO) — 9 bloqueos corregidos** (rama
+`fase7-docker-oracle-driver`, sin merge/tag/7B):
+
+1. **Puerta de receipts real**: `verifyReceiptGate()` delega en
+   `persistedDynamicGateStatus` (Fase 6): exige la DB (el constructor lanza
+   `RECEIPT_DB_REQUIRED` sin ella) y los SEIS receipts canónicos de
+   `verification_receipts` en orden canónico, vigentes sobre las fuentes
+   actuales y con scopes del proyecto. Ausencia, stale u orden incorrecto o
+   error de lectura → fail closed, nunca puerta desactivada.
+2. **Fingerprints separados**: `deployments` guarda por separado
+   `verified_source_fingerprint` (fuentes verificadas) y
+   `snapshot_fingerprint` (columnas aditivas). Al reutilizar un snapshot se
+   comprueba contra SQLite la ruta registrada, el re-hash del contenido
+   (`verifySnapshot`) y el fingerprint de fuentes; el manifiesto (editable)
+   no basta. Mutación de fuentes durante la copia → snapshot descartado
+   (`SOURCE_MUTATED_DURING_SNAPSHOT`).
+3. **Dockerfile confiable**: el snapshot/Dockerfile se compara byte a byte
+   (`timingSafeEqual`) con `<templatesDir>/dynamic-react-node/Dockerfile`;
+   el `.dockerignore` controlado (`APPFORGE_DOCKERIGNORE`) forma parte de la
+   integridad. Sin `templatesDir` o con diferencias → fail closed antes del
+   build. Verificado también al reutilizar snapshot.
+4. **Volumen live con identidad estable**: `projectLiveVolumeName()`
+   (`appforge-project-<uuid>-data`) y labels estables (`managed`,
+   `project-id`, `role=live`; SIN `deployment-id` ni fingerprint).
+   `assertLiveVolumeLabels()` falla cerrado ante divergencia. Dos
+   despliegues consecutivos comparten volumen y datos (regresión B4).
+5. **Preflight con propiedad exacta**: si la red o el volumen ya existen, se
+   inspeccionan labels: la red debe ser interna y etiquetada
+   (`component=network`); el volumen debe llevar `component=studio-data`.
+   Colisión o labels ajenas/incompletas → falla SIN modificar el recurso.
+6. **`restoreBackup()` endurecido**: valida TODO antes de detener/eliminar
+   nada (manifiesto, `projectId`/`backupId`, nombres permitidos, unicidad,
+   tamaños, SHA-256 en disco, `PRAGMA quick_check`). Restaura primero en un
+   volumen staging validado y solo después sustituye el live; verifica las
+   labels estables del volumen actual antes de `volume rm` (un volumen ajeno
+   sobrevive). Staging siempre limpiado.
+7. **`pruneManagedImages(projectId, keepImages)` con scope**: lee
+   `live_image`/`previous_image` de `project_runtime` como protegidos ANTES
+   de la retención; solo actúa sobre imágenes del proyecto con labels
+   completas; re-inspecciona labels exactas inmediatamente antes de cada
+   `rmi`. Imágenes de otros proyectos intocables.
+8. **Validación posterior completa** (`validateRunningContainer`): además de
+   lo previo, arquitectura (`amd64`/`arm64`) y SO (`linux`) de la imagen,
+   usuario exactamente `1001`, `MemorySwap` topado a 512m, tmpfs en `/tmp`,
+   `Privileged=false`, `Devices` vacío, `PidMode`/`IpcMode` no host,
+   `NetworkMode` igual a la red configurada, mounts exactos (solo `/data` y
+   `/tmp`), ausencia del socket de Docker y del volumen de datos del Studio.
+9. **Rollback físico real** (test, no supuesto): v1 live con datos → v2
+   verificada → backup → fallo real durante la migración live →
+   `restoreBackup` → `startPreviousVersion` → health → datos anteriores
+   intactos; se demuestra con datos (un todo posterior al backup
+   desaparece, el anterior permanece) que las operaciones físicas se
+   ejecutaron.
+
+**Regresiones** (`dockerDriverRegressions.test.ts`, 35 tests con stub del
+runner, sin daemon): seis receipts vigentes abren / stale-orden-error
+cierran; driver sin DB → `RECEIPT_DB_REQUIRED`; snapshot/manifiesto/
+Dockerfile/`.dockerignore` manipulados → rechazados; red no interna y
+volumen sin labels → rechazados sin mutar; volumen live ajeno sobrevive a
+`restoreBackup`; backup corrupto → rechazado antes de tocar live;
+`discardCandidate` no elimina imagen ajena con el nombre esperado (verifica
+labels exactas antes del `rmi`); poda con scope no toca otros proyectos;
+`live_image`/`previous_image` sobreviven; validación `inspect` completa.
+
 **Archivos de 7A** (inventario):
 `apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
 `apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),
@@ -996,6 +1060,8 @@ en `runLiveMigrations`/`startCandidateAsLive`/`restoreBackup`); sin esto,
 `apps/worker/src/docker/env.ts` (+ `.test.ts`),
 `apps/worker/src/docker/sqliteBackup.ts` (+ `.test.ts`),
 `apps/worker/src/docker/dockerDriver.ts` (+ `.test.ts`),
+`apps/worker/src/docker/dockerDriverRegressions.test.ts` (35 regresiones de
+los 9 bloqueos, stub sin daemon),
 `apps/worker/src/docker/integration.test.ts` (puerta `APPFORGE_DOCKER_INTEGRATION`),
 `apps/worker/src/docker/static.test.ts`,
 `apps/worker/src/docker/index.ts`.
