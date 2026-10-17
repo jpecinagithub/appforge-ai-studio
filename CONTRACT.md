@@ -963,8 +963,10 @@ host PID-IPC-network, sin puertos publicados, solo red interna `appforge-apps`
 healthcheck real. Las pruebas inspeccionan `docker inspect`.
 
 **Variables y secretos**: `.env` del proyecto (0600, gitignored, fuera del
-snapshot/imagen/ZIP); el driver escribe una copia validada 0600 en el
-directorio privado del deployment y la pasa con `--env-file`; lista permitida
+snapshot/imagen/ZIP); el driver escribe una copia validada 0600 en
+`$DATA_DIR/deploy-env/<deploymentId>/runtime.env` — **fuera del snapshot**
+(el snapshot es inmutable; escribir dentro lo invalidaría y expondría el env
+al contexto de build) — y la pasa con `--env-file`; lista permitida
 de nombres; se rechazan claves inválidas, null bytes, saltos y duplicados
 ambiguos; ninguna variable del proceso del Studio se hereda en bloque.
 
