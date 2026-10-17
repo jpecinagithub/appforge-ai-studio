@@ -903,3 +903,83 @@ fake driver.
 **Sin UI de despliegue en Fase 6:** no hay botón que prometa despliegue
 real a Oracle. Cuando la infraestructura no está configurada, la API
 responde `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`.
+
+### 9.22 Driver Docker y pruebas aisladas (Fase 7A — decisiones cerradas)
+
+**Alcance 7A** (implementado en `apps/worker/src/docker/`): `DockerCommandRunner`
+(sin shell, abortable), `DockerDeploymentDriver` completo contra la interfaz de
+Fase 6, snapshot inmutable con manifiesto SHA-256, modelo de recursos
+(labels `com.appforge.*`, nombres §5 de la especificación de Fase 7),
+endurecimiento de contenedores, variables/secretos, backup/restauración SQLite
+real, pruebas unitarias + integración Docker desechable. **Excluido de 7A**
+(para 7B/7C): activación en servidor/worker, proxy live, reconciliación tras
+reinicio, endpoints 7B, UI, socket en el compose productivo, Oracle/producción.
+
+**Kill switches** (todos obligatorios, §4 de la especificación de Fase 7):
+`APPFORGE_DEPLOY_DRIVER=docker` + `APPFORGE_ENABLE_DOCKER_DEPLOY=1` +
+`APPFORGE_DOCKER_NETWORK` + `APPFORGE_DOCKER_DATA_VOLUME` +
+`APPFORGE_MAX_CONCURRENT_DEPLOYS` (defecto 1). Sin ellos el driver no existe y
+la API conserva `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`; nunca hay fallback al
+fake. El límite de concurrencia es configurable y se aplica durante la vida del
+proceso (semáforo), además del bloqueo por proyecto de Fase 6.
+
+**Preflight**: Linux, CLI Docker ≥ 24.0, socket Unix real (`stat` confirma
+socket), `docker info` OK, red y volumen (se crean etiquetados si faltan),
+directorio de datos escribible. Fallo → 501 con diagnóstico sanitizado; el
+Studio sigue funcionando.
+
+**Identidad de recursos**: labels completas obligatorias
+(`com.appforge.managed=true`, `project-id`, `deployment-id`, `role`,
+`source-fingerprint`); nombres según §5 de la especificación de Fase 7
+(imagen `appforge/app-<id8>:dep-<dep8>-<sha12>`, live `appforge-app-<id8>`,
+verify `appforge-app-<id8>-verify-<dep8>`, volúmenes `appforge-project-<uuid>-data`
+y `appforge-verify-<deploymentId>-data`, red `appforge-apps` interna). Antes de
+reutilizar/eliminar un nombre se comparan las labels con los UUID completos;
+colisión o recurso sin labels → error estable. Solo se enumeran/limpian
+recursos con `com.appforge.managed=true`; prohibido `docker system prune` y
+borrados globales o por prefijo sin comprobar labels.
+
+**Snapshot inmutable**: `$DATA_DIR/deploy-snapshots/<deploymentId>/`; copia
+segura que rechaza symlinks (fail closed); exclusiones fijas (`.git/`,
+`node_modules/`, `dist/`, `.env*`, `*.db*`, `backups/`, `data/`, `*.log`);
+manifiesto ordenado `ruta + tamaño + SHA-256` + hash global; fingerprint
+persistido aditivamente en `deployments` (`snapshot_fingerprint`,
+`snapshot_path`); el fingerprint de los receipts se compara con el del
+proyecto antes de crear el snapshot; el hash del snapshot se re-verifica
+inmediatamente antes del `docker build`. `.dockerignore` controlado por
+AppForge con las mismas exclusiones. Docker construye exclusivamente desde el
+snapshot.
+
+**Endurecimiento** (live y verify): usuario 1001, `--read-only`, `/tmp` en
+tmpfs con límites, único montaje escribible (volumen propio en `/data`),
+`--cap-drop=ALL`, `--security-opt=no-new-privileges:true`, `--pids-limit=128`,
+`--cpus=1.0`, `--memory=512m` (+swap igualado), sin privileged/dispositivos/
+host PID-IPC-network, sin puertos publicados, solo red interna `appforge-apps`
+(migraciones con `--network=none`), restart `unless-stopped` solo en live,
+healthcheck real. Las pruebas inspeccionan `docker inspect`.
+
+**Variables y secretos**: `.env` del proyecto (0600, gitignored, fuera del
+snapshot/imagen/ZIP); el driver escribe una copia validada 0600 en el
+directorio privado del deployment y la pasa con `--env-file`; lista permitida
+de nombres; se rechazan claves inválidas, null bytes, saltos y duplicados
+ambiguos; ninguna variable del proceso del Studio se hereda en bloque.
+
+**Backup SQLite real**: `docker cp` desde el live detenido (operación fija);
+SHA-256 + manifiesto + `PRAGMA quick_check` con `node:sqlite` (código
+confiable); `backupId` con formato `bk_[A-Za-z0-9_-]{1,64}` y
+`backupValidated='true'` solo tras validar todos los pasos; primer despliegue
+→ backup validado con `hadDatabase=false` (restaurar = volumen vacío);
+retención 10 sin borrar backups requeridos; restauración verificada
+(checksum tras copiar).
+
+**Archivos de 7A** (inventario):
+`apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
+`apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),
+`apps/worker/src/docker/resources.ts` (+ `.test.ts`),
+`apps/worker/src/docker/hardening.ts` (+ `.test.ts`),
+`apps/worker/src/docker/env.ts` (+ `.test.ts`),
+`apps/worker/src/docker/sqliteBackup.ts` (+ `.test.ts`),
+`apps/worker/src/docker/dockerDriver.ts`,
+`apps/worker/src/docker/integration.test.ts` (puerta `APPFORGE_DOCKER_INTEGRATION`),
+`apps/worker/src/docker/static.test.ts`,
+`apps/worker/src/docker/index.ts`.
