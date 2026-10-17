@@ -19,7 +19,9 @@ import type {
   ApiError,
   BuildRecord,
   ChatMessage,
+  DeploymentInfo,
   Project,
+  ProjectRuntime,
   RevisionInfo,
   Run,
   RunStats,
@@ -29,6 +31,20 @@ import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
 import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
+// Fase 6 — orquestador persistente del pipeline de despliegue (CONTRACT.md §9.21)
+import {
+  DeploymentError,
+  createDeployment,
+  getDeployment as getDeploymentRecord,
+  getProjectRuntime as getProjectRuntimeRecord,
+  listDeployments as listDeploymentRecords,
+  persistedVerificationGate,
+  reconcileDeployments,
+  requestDeploymentCancel,
+  runDeploymentPipeline,
+  type DeploymentDriver,
+  type DeploymentRecord,
+} from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -195,6 +211,44 @@ function rowToRevision(r: Record<string, any>): RevisionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Fase 6 — deploy pipeline (CONTRACT.md §9.21)
+// ---------------------------------------------------------------------------
+
+/** Las respuestas nunca exponen rutas internas, secretos ni comandos. */
+function toDeploymentInfo(r: DeploymentRecord): DeploymentInfo {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    target: r.target,
+    status: r.status,
+    url: r.url,
+    createdAt: r.createdAt,
+    logs: r.logs,
+    candidateId: r.candidateId,
+    previousLiveVersion: r.previousLiveVersion,
+    backupId: r.backupId,
+    cancelRequested: r.cancelRequested,
+    startedAt: r.startedAt,
+    updatedAt: r.updatedAt,
+    finishedAt: r.finishedAt,
+    error: r.error,
+  };
+}
+
+function toProjectRuntime(r: { projectId: string; containerName: string; liveImage: string; previousImage: string | null; status: string; updatedAt: string }): ProjectRuntime {
+  return {
+    projectId: r.projectId,
+    containerName: r.containerName,
+    liveImage: r.liveImage,
+    previousImage: r.previousImage,
+    status: r.status as ProjectRuntime['status'],
+    updatedAt: r.updatedAt,
+  };
+}
+
+const DeployCreate = z.object({ target: z.string().min(1).max(40) });
+
+// ---------------------------------------------------------------------------
 // Validation schemas
 // ---------------------------------------------------------------------------
 
@@ -261,6 +315,12 @@ export interface ServerOptions {
   corsOrigin?: string;
   /** apps/studio/dist — served at / when it exists (single-server mode) */
   studioDistDir?: string;
+  /**
+   * Fase 6: driver de despliegue configurado explícitamente. Sin él, el
+   * endpoint de deploy responde 501 DEPLOYMENT_DRIVER_NOT_CONFIGURED y no
+   * se simula ningún despliegue real. El fake solo se inyecta en tests.
+   */
+  deploymentDriver?: DeploymentDriver;
 }
 
 const err = (code: string, message: string): ApiError => ({ error: { code, message } });
@@ -724,11 +784,84 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   });
 
   // ----------------------------------------------------------------- deploy
+  // Fase 6 — pipeline persistente (CONTRACT.md §9.21). Sin driver real
+  // configurado: 501 estable, sin simular despliegues. El fake solo se
+  // inyecta vía ServerOptions en tests; nunca por defecto en producción.
+  const deployDriver = opts.deploymentDriver;
+
   app.post('/api/projects/:id/deploy', async (req, reply) => {
     const { id } = req.params as { id: string };
+    const project = needProject(id);
+    if (project.type !== 'dynamic') {
+      reply.code(400);
+      return err('INVALID_TYPE', 'This deployment pipeline only supports dynamic projects');
+    }
+    const body = DeployCreate.parse(req.body);
+    if (body.target !== 'oracle') {
+      reply.code(400);
+      return err('INVALID_TARGET', `Unsupported deploy target '${body.target}' (only 'oracle' is supported)`);
+    }
+    if (!deployDriver) {
+      reply.code(501);
+      return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
+    }
+    let dep: DeploymentRecord;
+    try {
+      dep = createDeployment(db, { projectId: id, target: body.target });
+    } catch (e) {
+      if (e instanceof DeploymentError) {
+        reply.code(e.statusCode);
+        return err(e.code, e.message);
+      }
+      throw e;
+    }
+    // 202: el pipeline corre en segundo plano y persiste estados terminales
+    // internamente (nunca rechaza por fallos del despliegue).
+    void runDeploymentPipeline(db, deployDriver, {
+      projectId: id,
+      target: body.target,
+      deploymentId: dep.id,
+      verificationGate: () => persistedVerificationGate(db, id),
+    }).catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message));
+    reply.code(202);
+    return toDeploymentInfo(dep);
+  });
+
+  app.get('/api/projects/:id/deployments', async (req) => {
+    const { id } = req.params as { id: string };
     needProject(id);
-    reply.code(501);
-    return err('PHASE_3', 'Deployments are planned for Phase 3 and are not implemented yet');
+    return { items: listDeploymentRecords(db, id).map(toDeploymentInfo) };
+  });
+
+  app.get('/api/deployments/:deploymentId', async (req, reply) => {
+    const { deploymentId } = req.params as { deploymentId: string };
+    const dep = getDeploymentRecord(db, deploymentId);
+    if (!dep) {
+      reply.code(404);
+      return err('DEPLOYMENT_NOT_FOUND', 'deployment not found');
+    }
+    return toDeploymentInfo(dep);
+  });
+
+  app.post('/api/deployments/:deploymentId/cancel', async (req, reply) => {
+    const { deploymentId } = req.params as { deploymentId: string };
+    const dep = requestDeploymentCancel(db, deploymentId);
+    if (!dep) {
+      reply.code(404);
+      return err('DEPLOYMENT_NOT_FOUND', 'deployment not found');
+    }
+    return toDeploymentInfo(dep);
+  });
+
+  app.get('/api/projects/:id/runtime', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    needProject(id);
+    const rt = getProjectRuntimeRecord(db, id);
+    if (!rt) {
+      reply.code(404);
+      return err('RUNTIME_NOT_FOUND', 'project has no runtime record (never deployed)');
+    }
+    return toProjectRuntime(rt);
   });
 
   // ----------------------------------------------------------------- preview
@@ -1028,6 +1161,11 @@ async function main(): Promise<void> {
   // Fase 5B: ephemeral previews never survive a restart.
   const stalePreviews = reconcilePreviews(db);
   if (stalePreviews > 0) console.log(`[server] discarded ${stalePreviews} stale preview(s)`);
+  // Fase 6: non-terminal deployments cannot survive a restart either.
+  // No real driver is configured in Fase 6: states are marked failed and
+  // the abstract driver reconciliation runs only when a driver exists.
+  const interruptedDeployments = await reconcileDeployments(db);
+  if (interruptedDeployments > 0) console.log(`[server] marked ${interruptedDeployments} interrupted deployment(s) as failed`);
 
   const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db) });
   const app = buildServer({
