@@ -153,6 +153,8 @@ const final = (content = 'Done.'): LlmResponse => ({ content, toolCalls: [], usa
 beforeAll(() => {
   vi.stubEnv('GROQ_API_KEY', 'test-key');
   vi.stubEnv('APPFORGE_LLM_STUB', '');
+  // The 6-check happy path runs a real preview: opt in explicitly.
+  vi.stubEnv('APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW', '1');
 });
 
 afterAll(() => {

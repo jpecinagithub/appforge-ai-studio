@@ -13,7 +13,7 @@ import type { FileNode, ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
 import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
-import { resolveAreaPath, assertAreaText } from './dynamicAreas.js';
+import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -197,8 +197,7 @@ async function readFile(ctx: ToolContext, args: Record<string, unknown>): Promis
     const st = fs.statSync(abs);
     if (!st.isFile()) return fail('NOT_A_FILE', `${p} is not a file`, Date.now() - t0);
     if (st.size > MAX_FILE_BYTES) return fail('FILE_TOO_LARGE', `${p} exceeds ${MAX_FILE_BYTES} bytes`, Date.now() - t0);
-    const content = fs.readFileSync(abs, 'utf8');
-    assertAreaText(content, p);
+    const content = readAreaTextFile(abs, p);
     return { ok: true, data: { content }, durationMs: Date.now() - t0 };
   } catch (e) {
     const code = (e as { code?: string }).code;
@@ -255,7 +254,7 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     const replace = strArg(args, 'replace');
     const r = resolveAreaPath(ctx, args.area, p);
     const abs = r.abs;
-    const current = fs.readFileSync(abs, 'utf8');
+    const current = readAreaTextFile(abs, p);
     if (!current.includes(search)) return fail('PATCH_NOT_FOUND', `search string not found in ${p}`, Date.now() - t0);
     const next = current.replace(search, replace);
     assertAreaText(next, p);
@@ -272,6 +271,15 @@ async function deleteFile(ctx: ToolContext, args: Record<string, unknown>): Prom
   try {
     const p = strArg(args, 'path');
     const r = resolveAreaPath(ctx, args.area, p);
+    // Never delete the area root itself: path ".", "./", "a/.." and other
+    // normalized equivalents all resolve to rel === '.'.
+    if (r.rel === '.') {
+      return fail(
+        'AREA_ROOT_DELETE',
+        `refusing to delete the ${r.area ?? 'frontend'} area root ("${p}" resolves to the area root); delete individual files instead`,
+        Date.now() - t0,
+      );
+    }
     const abs = r.abs;
     const st = fs.statSync(abs);
     fs.rmSync(abs, { recursive: st.isDirectory(), force: true });
@@ -530,7 +538,7 @@ async function searchCode(ctx: ToolContext, args: Record<string, unknown>): Prom
         } else if (e.isFile()) {
           try {
             if (fs.statSync(abs).size > MAX_FILE_BYTES || !isTextFile(abs)) continue;
-            const lines = fs.readFileSync(abs, 'utf8').split('\n');
+            const lines = readAreaTextFile(abs, e.name).split('\n');
             lines.forEach((text, i) => {
               if (matches.length < 200 && text.includes(pattern)) {
                 matches.push({ file: relPosix(root, abs), line: i + 1, text: text.slice(0, 300) });

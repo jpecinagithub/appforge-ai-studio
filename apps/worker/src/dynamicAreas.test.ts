@@ -250,4 +250,41 @@ describe('dynamic editing areas', () => {
     expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
     expect(ctx.dynamicChecksOrder).toEqual(['frontendBuild']);
   });
+
+  test('delete_file refuses the area root (".", "./", "a/..")', async () => {
+    const db = makeDb();
+    const dir = makeProject('dynamic');
+    const ctx = makeCtx(db, dir, 'dynamic');
+    const tools = createTools();
+
+    for (const p of ['.', './', 'src/..', 'src/../', './/']) {
+      const r = await tools.delete_file(ctx, { area: 'backend', path: p });
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('AREA_ROOT_DELETE');
+    }
+    // The area root is intact and deleting a real file still works.
+    expect(existsSync(path.join(dir, 'backend', 'src', 'server.ts'))).toBe(true);
+    const ok = await tools.delete_file(ctx, { area: 'backend', path: 'src/server.ts' });
+    expect(ok.ok).toBe(true);
+    expect(existsSync(path.join(dir, 'backend', 'src', 'server.ts'))).toBe(false);
+  });
+
+  test('read_file rejects invalid UTF-8 bytes (strict decoding)', async () => {
+    const db = makeDb();
+    const dir = makeProject('dynamic');
+    const ctx = makeCtx(db, dir, 'dynamic');
+    const tools = createTools();
+
+    // 0xFF 0xFE are never valid UTF-8: must fail, not silently become U+FFFD.
+    writeFileSync(path.join(dir, 'backend', 'src', 'bad.bin.ts'), Buffer.from([0x68, 0x69, 0xff, 0xfe, 0x0a]));
+    const r = await tools.read_file(ctx, { area: 'backend', path: 'src/bad.bin.ts' });
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('NOT_UTF8_TEXT');
+
+    // Valid UTF-8 (incl. multibyte) still reads fine.
+    writeFileSync(path.join(dir, 'backend', 'src', 'good.ts'), 'héllo wörld ✓\n');
+    const ok = await tools.read_file(ctx, { area: 'backend', path: 'src/good.ts' });
+    expect(ok.ok).toBe(true);
+    expect((ok.data as { content: string }).content).toContain('héllo');
+  });
 });

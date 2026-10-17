@@ -26,7 +26,7 @@
  *   logout, back to the auth screen.
  */
 
-import { getPreview } from './previewManager.js';
+import { getPreview, previewCookieName } from './previewManager.js';
 import { recordDynamicCheckForTest, previewReceiptValid, previewGateStatus } from './dynamicTools.js';
 import { checkBrowserAtUrl, type BrowserStep } from './browser.js';
 import type { ToolContext } from './tools.js';
@@ -105,10 +105,45 @@ function check(cond: boolean, label: string, detail?: string): void {
 const TEST_PASSWORD = 'PreviewFlow123!';
 const emailFor = (who: string) => `flow-${who}-${Date.now()}@example.com`;
 
+/** Parse one Set-Cookie header into name + lower-cased attributes. */
+export function parseSetCookie(sc: string): { name: string; attrs: Map<string, string | true> } {
+  const parts = sc.split(';');
+  const nameValue = parts[0] ?? '';
+  const eq = nameValue.indexOf('=');
+  const attrs = new Map<string, string | true>();
+  for (const ap of parts.slice(1)) {
+    const aeq = ap.indexOf('=');
+    if (aeq < 0) attrs.set(ap.trim().toLowerCase(), true);
+    else attrs.set(ap.slice(0, aeq).trim().toLowerCase(), ap.slice(aeq + 1).trim());
+  }
+  return { name: (eq > 0 ? nameValue.slice(0, eq) : nameValue).trim(), attrs };
+}
+
+/**
+ * Require the session cookie to carry exactly HttpOnly, SameSite=Lax and
+ * Path=<expectedPath>. Secure may be omitted only on the local HTTP preview
+ * (the template sets it in production). Throws on violation.
+ */
+export function assertSessionCookie(
+  setCookieHeaders: string[],
+  sessionCookieName: string,
+  expectedPath: string,
+): void {
+  const session = setCookieHeaders.map(parseSetCookie).find((c) => c.name === sessionCookieName);
+  check(!!session, 'session Set-Cookie present', setCookieHeaders.join(' | '));
+  const attrs = session!.attrs;
+  check(attrs.has('httponly'), 'cookie HttpOnly', setCookieHeaders.join(' | '));
+  // Attribute values are case-insensitive (template sends "Lax").
+  check(String(attrs.get('samesite') ?? '').toLowerCase() === 'lax', 'cookie SameSite=Lax', setCookieHeaders.join(' | '));
+  check(attrs.get('path') === expectedPath, `cookie Path=${expectedPath}`, setCookieHeaders.join(' | '));
+}
+
 /** Phase 1: deterministic API checks through the published preview. */
-export async function apiAuthFlow(base: string): Promise<{ userA: string; todoTitle: string }> {
+export async function apiAuthFlow(base: string, projectId: string): Promise<{ userA: string; todoTitle: string }> {
   const a: Api = { base, jar: new Jar() };
   const b: Api = { base, jar: new Jar() };
+  const expectedCookiePath = `/a/${projectId}/`;
+  const sessionCookieName = previewCookieName(projectId);
 
   // 1. /healthz
   {
@@ -130,12 +165,10 @@ export async function apiAuthFlow(base: string): Promise<{ userA: string; todoTi
     check(status === 200 || status === 201, 'register A', `status ${status}`);
   }
 
-  // 3. Set-Cookie carries HttpOnly and SameSite
-  {
-    const sc = a.jar.lastSetCookie.join('; ').toLowerCase();
-    check(/httponly/.test(sc), 'cookie HttpOnly', a.jar.lastSetCookie.join(' | '));
-    check(/samesite/.test(sc), 'cookie SameSite', a.jar.lastSetCookie.join(' | '));
-  }
+  // 3. The session Set-Cookie carries exactly HttpOnly, SameSite=Lax and
+  //    Path=/a/:projectId/. Secure may be omitted only on the local HTTP
+  //    preview (the template sets it in production).
+  assertSessionCookie(a.jar.lastSetCookie, sessionCookieName, expectedCookiePath);
 
   // 4. session recovery as A
   {
@@ -262,7 +295,7 @@ export async function testAuthenticatedFlow(ctx: ToolContext): Promise<ToolResul
   const uiUrl = `${publishedBase}/`;
 
   try {
-    const { userA, todoTitle } = await apiAuthFlow(publishedBase);
+    const { userA, todoTitle } = await apiAuthFlow(publishedBase, projectId);
     // The browser registers its own user (fresh session through the UI).
     await browserAuthFlow(uiUrl, emailFor('ui'), `ui-todo-${Date.now()}`);
     recordDynamicCheckForTest(ctx, 'authenticatedFlow');

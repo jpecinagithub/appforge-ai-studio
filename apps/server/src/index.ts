@@ -28,7 +28,7 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, markPreviewFailed, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
 
 export const VERSION = '0.1.0';
 
@@ -316,18 +316,33 @@ if(r.ok)setTimeout(()=>location.reload(),20000);}catch(e){msg.textContent='Error
 </body></html>`;
 }
 
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => {
+    switch (c) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      default: return '&#39;';
+    }
+  });
+}
+
 function dynamicPreviewDiagnosticHtml(projectId: string, projectName: string, status: string): string {
+  const safeId = escapeHtml(projectId);
+  const safeName = escapeHtml(projectName);
+  const safeStatus = escapeHtml(status);
   const reason =
     status === 'unreachable'
       ? 'The preview process is not responding. It may have crashed; start a new one with the <code>start_fullstack_preview</code> agent tool.'
       : 'This dynamic project has no active full-stack preview. Launch one with the <code>start_fullstack_preview</code> agent tool (requires the four verification checks in order).';
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sin preview dinámico — ${projectName}</title>
+<title>Sin preview dinámico — ${safeName}</title>
 <style>body{background:#0b0f14;color:#e6edf3;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
 .card{max-width:560px;padding:32px;border:1px solid #1f2937;border-radius:12px;background:#111827;text-align:center}
 h1{font-size:20px;margin:0 0 8px}p{color:#9ca3af;font-size:14px}code{color:#06b6d4}</style></head><body>
 <div class="card"><h1>Preview dinámico no disponible</h1>
-<p>El proyecto <b>${projectName}</b> (${projectId}) no tiene un preview full-stack activo${status !== 'none' ? ` (estado: ${status})` : ''}.</p>
+<p>El proyecto <b>${safeName}</b> (${safeId}) no tiene un preview full-stack activo${status !== 'none' ? ` (estado: ${safeStatus})` : ''}.</p>
 <p>${reason}</p></div></body></html>`;
 }
 
@@ -882,7 +897,12 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
         duplex: body ? 'half' : undefined,
       });
     } catch (e) {
-      reply.code(502).type('text/html; charset=utf-8');
+      // The proxy never trusts a `ready` SQLite row alone: an unreachable
+      // backend is immediately marked failed (pid/port cleared, temp DB
+      // removed) so later requests get the 503 diagnostic, not another
+      // attempt against a dead port.
+      markPreviewFailed(db, projectId, `preview backend unreachable: ${(e as Error).message}`.slice(0, 500));
+      reply.code(503).type('text/html; charset=utf-8');
       return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
     }
 
@@ -890,13 +910,52 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     upstream.headers.forEach((v, k) => {
       const lk = k.toLowerCase();
       if (HOP_BY_HOP.has(lk)) return;
+      // We re-buffer the body below, so the upstream framing headers must not
+      // be forwarded: Fastify sets its own content-length, and fetch may have
+      // decompressed a gzipped body (forwarding content-encoding would corrupt
+      // the response).
+      if (lk === 'content-length' || lk === 'content-encoding' || lk === 'set-cookie') return;
       outHeaders[k] = v;
     });
-    // getSetCookie preserves multiple Set-Cookie headers.
+    // getSetCookie preserves multiple Set-Cookie headers (forEach would merge
+    // them into one comma-joined value).
     const setCookies = (upstream.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
     if (setCookies.length > 0) outHeaders['set-cookie'] = setCookies;
 
-    const buf = Buffer.from(await upstream.arrayBuffer());
+    // Never load an unbounded upstream body: fast-reject on a declared
+    // Content-Length, then stream with a hard cap (also guards against
+    // gzip bombs, since fetch decompresses before we count bytes).
+    const MAX_UPSTREAM_BYTES = 10 * 1024 * 1024;
+    const declared = upstream.headers.get('content-length');
+    if (declared !== null) {
+      const n = Number(declared);
+      if (!Number.isFinite(n) || n < 0 || n > MAX_UPSTREAM_BYTES) {
+        reply.code(502).type('text/html; charset=utf-8');
+        return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
+      }
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let tooLarge = false;
+    const reader = upstream.body?.getReader();
+    if (reader) {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_UPSTREAM_BYTES) {
+          tooLarge = true;
+          await reader.cancel().catch(() => null);
+          break;
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+    if (tooLarge) {
+      reply.code(502).type('text/html; charset=utf-8');
+      return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
+    }
+    const buf = Buffer.concat(chunks);
     reply.code(upstream.status);
     for (const [k, v] of Object.entries(outHeaders)) reply.header(k, v);
     return reply.send(buf);

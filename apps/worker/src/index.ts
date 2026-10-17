@@ -29,6 +29,7 @@ export {
   getPreview,
   stopPreview,
   reconcilePreviews,
+  markPreviewFailed,
   previewCookieName,
 } from './previewManager.js';
 export type { PreviewStatus, PreviewRow } from './previewManager.js';

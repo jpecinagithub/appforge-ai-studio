@@ -13,7 +13,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { describe, expect, test, afterEach, beforeEach } from 'vitest';
 import { FAKE_SERVER } from './previewFixture.js';
-import { apiAuthFlow, testAuthenticatedFlow } from './authFlow.js';
+import { apiAuthFlow, testAuthenticatedFlow, assertSessionCookie } from './authFlow.js';
 import {
   ensurePreviewsTable,
   getPreview,
@@ -83,6 +83,7 @@ interface Fixture {
 let fx: Fixture | null = null;
 
 beforeEach(async () => {
+  process.env.APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW = '1';
   const db = makeDb();
   const projectId = 'authflow1';
   const dir = makeProject();
@@ -114,12 +115,13 @@ afterEach(async () => {
     await fx.proxy.close().catch(() => null);
     fx = null;
   }
+  delete process.env.APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW;
 });
 
 describe('test_authenticated_flow', () => {
   test('deterministic API phase: register, cookie, session, CRUD, isolation, logout, 401', async () => {
     const base = `${fx!.proxy.url}/a/${fx!.projectId}`;
-    const { userA, todoTitle } = await apiAuthFlow(base);
+    const { userA, todoTitle } = await apiAuthFlow(base, fx!.projectId);
     expect(userA).toContain('@example.com');
     expect(todoTitle).toContain('flow-todo-');
   });
@@ -144,5 +146,55 @@ describe('test_authenticated_flow', () => {
     const r = await testAuthenticatedFlow(fx!.ctx);
     expect(r.ok).toBe(false);
     expect(r.code).toBe('DYNAMIC_CHECKS_INCOMPLETE');
+  });
+});
+
+describe('assertSessionCookie', () => {
+  const NAME = 'af_preview_p1';
+  const PATH = '/a/p1/';
+  const good = [`${NAME}=tok123; Path=${PATH}; HttpOnly; SameSite=Lax`];
+
+  test('accepts the exact required attributes', () => {
+    expect(() => assertSessionCookie(good, NAME, PATH)).not.toThrow();
+  });
+
+  test('accepts Secure as an additional attribute (production)', () => {
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=${PATH}; HttpOnly; SameSite=Lax; Secure`], NAME, PATH,
+    )).not.toThrow();
+  });
+
+  test('rejects a missing session cookie', () => {
+    expect(() => assertSessionCookie(['other=x; Path=/; HttpOnly'], NAME, PATH)).toThrow(/session Set-Cookie present/);
+  });
+
+  test('rejects a missing HttpOnly', () => {
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=${PATH}; SameSite=Lax`], NAME, PATH,
+    )).toThrow(/HttpOnly/);
+  });
+
+  test('rejects SameSite != Lax', () => {
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=${PATH}; HttpOnly; SameSite=Strict`], NAME, PATH,
+    )).toThrow(/SameSite=Lax/);
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=${PATH}; HttpOnly`], NAME, PATH,
+    )).toThrow(/SameSite=Lax/);
+  });
+
+  test('rejects a wrong Path (must be exactly /a/:projectId/)', () => {
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=/; HttpOnly; SameSite=Lax`], NAME, PATH,
+    )).toThrow(/Path=\/a\/p1\//);
+    expect(() => assertSessionCookie(
+      [`${NAME}=tok123; Path=/a/other/; HttpOnly; SameSite=Lax`], NAME, PATH,
+    )).toThrow(/Path=\/a\/p1\//);
+  });
+
+  test('picks the session cookie among several Set-Cookie headers', () => {
+    expect(() => assertSessionCookie(
+      ['unrelated=y; Path=/', ...good], NAME, PATH,
+    )).not.toThrow();
   });
 });

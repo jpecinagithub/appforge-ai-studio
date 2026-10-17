@@ -201,9 +201,33 @@ export function assertAreaText(content: string, label: string): void {
   if (bytes > AREA_MAX_FILE_BYTES) {
     throw new AreaError('FILE_TOO_LARGE', `${label} exceeds ${AREA_MAX_FILE_BYTES} bytes`);
   }
-  // Round-trip check: content must be valid UTF-8 text.
+  // A JS string cannot hold invalid UTF-8 except lone surrogates; the
+  // round-trip catches those.
   const buf = Buffer.from(content, 'utf8');
   if (buf.toString('utf8') !== content) {
+    throw new AreaError('NOT_UTF8_TEXT', `${label} is not valid UTF-8 text`);
+  }
+}
+
+/**
+ * Read a file as strict UTF-8 text. Decodes the ORIGINAL bytes with a fatal
+ * TextDecoder: any invalid UTF-8 sequence throws NOT_UTF8_TEXT instead of
+ * being silently replaced with U+FFFD (which fs.readFileSync(path, 'utf8')
+ * does).
+ */
+export function readAreaTextFile(abs: string, label: string): string {
+  let raw: Buffer;
+  try {
+    raw = fs.readFileSync(abs);
+  } catch (e) {
+    throw e;
+  }
+  if (raw.length > AREA_MAX_FILE_BYTES) {
+    throw new AreaError('FILE_TOO_LARGE', `${label} exceeds ${AREA_MAX_FILE_BYTES} bytes`);
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  } catch {
     throw new AreaError('NOT_UTF8_TEXT', `${label} is not valid UTF-8 text`);
   }
 }

@@ -15,7 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { describe, expect, test, afterEach } from 'vitest';
+import { describe, expect, test, afterEach, beforeEach } from 'vitest';
 import {
   ensurePreviewsTable,
   getPreview,
@@ -23,6 +23,8 @@ import {
   stopPreview,
   reconcilePreviews,
   previewCookieName,
+  validatePreviewTmpDir,
+  PREVIEW_ENABLE_ENV,
 } from './previewManager.js';
 import { recordDynamicCheckForTest, previewGateStatus } from './dynamicTools.js';
 import type { ToolContext } from './tools.js';
@@ -31,10 +33,17 @@ import { FAKE_SERVER } from './previewFixture.js';
 
 
 const tmpDirs: string[] = [];
+const ENV_SAVED = process.env[PREVIEW_ENABLE_ENV];
+beforeEach(() => {
+  // Previews execute generated code: tests opt in explicitly.
+  process.env[PREVIEW_ENABLE_ENV] = '1';
+});
 afterEach(() => {
   for (const d of tmpDirs.splice(0)) {
     try { rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ }
   }
+  if (ENV_SAVED === undefined) delete process.env[PREVIEW_ENABLE_ENV];
+  else process.env[PREVIEW_ENABLE_ENV] = ENV_SAVED;
 });
 
 function makeDb(): Database.Database {
@@ -83,6 +92,17 @@ function pidAlive(pid: number): boolean {
 }
 
 describe('start_fullstack_preview', () => {
+  test('refuses without the opt-in env var (disabled by default)', async () => {
+    delete process.env[PREVIEW_ENABLE_ENV];
+    const db = makeDb();
+    const ctx = makeCtx(db, makeProject());
+    mark5AValid(ctx);
+    const r = await startFullstackPreview(ctx);
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('PREVIEW_DISABLED');
+    expect(getPreview(db, ctx.projectId)).toBeUndefined();
+  });
+
   test('refuses without the four 5A checks', async () => {
     const db = makeDb();
     const ctx = makeCtx(db, makeProject());
@@ -181,7 +201,7 @@ describe('start_fullstack_preview', () => {
     expect(existsSync(tmpDir)).toBe(false);
   });
 
-  test('reconcilePreviews discards stale previews on restart', async () => {
+  test('reconcilePreviews discards stale previews on restart WITHOUT killing PIDs', async () => {
     const db = makeDb();
     const ctx = makeCtx(db, makeProject());
     mark5AValid(ctx);
@@ -191,14 +211,72 @@ describe('start_fullstack_preview', () => {
     expect(pidAlive(pid)).toBe(true);
 
     // Simulate an AppForge restart: reconcile without the in-memory handles.
+    // The stale PID must NOT be killed: the OS may have reused it for an
+    // unrelated process, so its identity cannot be verified.
     const n = reconcilePreviews(db);
     expect(n).toBe(1);
     const row = getPreview(db, ctx.projectId)!;
     expect(row.status).toBe('stopped');
     expect(row.port).toBeNull();
-    // The stale process was killed (best effort), never trusted.
+    expect(row.pid).toBeNull();
     await new Promise((res) => setTimeout(res, 500));
-    expect(pidAlive(pid)).toBe(false);
+    expect(pidAlive(pid)).toBe(true); // untouched: not our process to kill
+    // Clean up the process we started (it is ours: we spawned it).
+    try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+  });
+
+  test('backend crash after ready marks the preview failed and cleans up', async () => {
+    const db = makeDb();
+    const dir = makeProject();
+    // Fake backend that answers /healthz once, then dies.
+    writeFileSync(
+      path.join(dir, 'backend', 'dist', 'server.js'),
+      `import http from 'node:http';
+const srv = http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(200); res.end('ok');
+    setTimeout(() => process.exit(1), 300);
+  } else { res.writeHead(404); res.end(); }
+});
+srv.listen(Number(process.env.PORT || '0'), '127.0.0.1');\n`,
+    );
+    const ctx = makeCtx(db, dir);
+    mark5AValid(ctx);
+    const r = await startFullstackPreview(ctx);
+    expect(r.ok).toBe(true);
+    const row = getPreview(db, ctx.projectId)!;
+    expect(row.status).toBe('ready');
+    const tmpDir = row.tmp_dir!;
+
+    // Wait for the exit watcher to observe the crash.
+    let crashed: typeof row | undefined;
+    for (let i = 0; i < 40 && (!crashed || crashed.status !== 'failed'); i++) {
+      await new Promise((res) => setTimeout(res, 250));
+      crashed = getPreview(db, ctx.projectId);
+    }
+    expect(crashed?.status).toBe('failed');
+    expect(crashed?.port).toBeNull();
+    expect(crashed?.pid).toBeNull();
+    expect(crashed?.db_path).toBeNull();
+    // Temp SQLite dir removed.
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(tmpDir)).toBe(false);
+    expect(/exited unexpectedly/.test(crashed?.error ?? '')).toBe(true);
+  });
+
+  test('validatePreviewTmpDir only allows af-preview-* dirs inside os.tmpdir()', () => {
+    const base = tmpdir();
+    const good = path.join(base, 'af-preview-123-xyz');
+    expect(validatePreviewTmpDir(good)).toBe(path.resolve(good));
+    // os.tmpdir() itself: refused.
+    expect(() => validatePreviewTmpDir(base)).toThrow(/os\.tmpdir\(\) itself/);
+    expect(() => validatePreviewTmpDir(base + path.sep)).toThrow();
+    // Outside os.tmpdir(): refused.
+    expect(() => validatePreviewTmpDir(path.join(base, '..', 'af-preview-x'))).toThrow(/outside/);
+    expect(() => validatePreviewTmpDir('/etc/af-preview-x')).toThrow(/outside/);
+    // Wrong prefix inside tmpdir: refused.
+    expect(() => validatePreviewTmpDir(path.join(base, 'other-dir'))).toThrow(/prefix/);
+    expect(() => validatePreviewTmpDir(path.join(base, 'af-preview'))).toThrow(/prefix/);
   });
 
   test('previewCookieName is project-scoped and cookie-safe', () => {

@@ -594,8 +594,11 @@ seguidores canónicos.
 
 **`start_fullstack_preview`** (`apps/worker/src/previewManager.ts`):
 precondición en código — los cuatro receipts 5A vigentes y en orden
-(`DYNAMIC_CHECKS_INCOMPLETE` si falta alguno). Crea una SQLite temporal
-exclusiva, elige un puerto libre en loopback y arranca
+(`DYNAMIC_CHECKS_INCOMPLETE` si falta alguno). **Deshabilitado por defecto**:
+ejecutar código generado en el servidor exige la variable explícita
+`APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW=1`; sin ella el tool devuelve
+`PREVIEW_DISABLED` (la limpieza nunca está deshabilitada). Crea una SQLite
+temporal exclusiva, elige un puerto libre en loopback y arranca
 `node backend/dist/server.js` con entorno mínimo (`PORT`, `HOST=127.0.0.1`,
 `NODE_ENV=test`, `DB_PATH`, `PUBLIC_PATH=/a/:projectId/`, cookie de sesión
 específica del proyecto; nunca secretos del Studio). Espera `/healthz`
@@ -603,7 +606,9 @@ con reintentos limitados, registra el preview en la tabla `previews`
 (único activo por proyecto; al reemplazar, el anterior se detiene por
 completo: árbol de procesos + espera de exit + limpieza de SQLite/WAL/SHM)
 y devuelve `{url: "/a/:projectId/", status: "ready"}`. Timeout/cancelación
-no dejan procesos ni puertos huérfanos.
+no dejan procesos ni puertos huérfanos. Si el backend muere después de
+`ready`, un vigilante marca el registro `failed`, limpia pid/puerto y la
+SQLite temporal de inmediato.
 
 **Proxy dinámico del Studio** (`GET|POST|… /a/:projectId/*` en
 `apps/server`): localiza únicamente el preview registrado para el
@@ -611,13 +616,22 @@ proyecto, retira el prefijo, conserva método/query/body/cookies, soporta
 JSON y assets, nunca reenvía el `Authorization` del Studio, elimina
 headers hop-by-hop, aplica timeout (30 s) y límite de body (10 MiB),
 impide acceso cruzado entre proyectos y responde una página HTML de
-diagnóstico si no hay preview. La URL destino procede siempre del
-registro interno: nunca es un proxy abierto.
+diagnóstico si no hay preview (con `projectName`/`projectId`/`status`
+escapados contra XSS). La URL destino procede siempre del
+registro interno: nunca es un proxy abierto. Las respuestas del upstream
+tienen límite de 10 MiB (rechazo rápido por `Content-Length` declarado +
+tope en streaming, protege contra gzip bombs); no se reenvían
+`content-length`/`content-encoding` del upstream (el proxy re-bufferiza)
+y los `Set-Cookie` múltiples se preservan. Si el upstream no responde, el
+proxy marca el preview `failed` en el registro (no confía solo en la fila
+`ready`) y responde 503.
 
 **`test_authenticated_flow`** (`apps/worker/src/authFlow.ts`): se ejecuta
 contra el preview publicado (nunca otro servidor) y exige el receipt de
 preview vigente sobre las fuentes actuales. Fase API determinista:
-`/healthz`, registro de A, cookie `HttpOnly`+`SameSite`, sesión,
+`/healthz`, registro de A, cookie de sesión con exactamente
+`HttpOnly`, `SameSite=Lax` y `Path=/a/:projectId/` (`Secure` solo exigible
+en producción; en el preview HTTP local puede omitirse), sesión,
 crear+listar, registro de B, aislamiento (B recibe 404), vuelta a A,
 logout, `/api/auth/me` → 401. Fase Chromium real contra `/a/:projectId/`
 con selectores estables `data-testid` de la plantilla: registro desde la
@@ -635,9 +649,18 @@ invalida.
 **Estados y recuperación** (§9.14): la tabla `previews`
 (`starting|ready|failed|stopped`) se reconcilia al arrancar AppForge —
 ningún preview anterior se considera `ready`, los `starting` pasan a
-`stopped`, se limpian registros huérfanos y PIDs antiguos nunca se
-reutilizan (se intentan terminar por best-effort). Los previews son
-provisionales y no equivalen a despliegues.
+`stopped`, se limpian los directorios temporales y **ningún PID leído de
+SQLite se mata jamás**: el SO podría haberlo reutilizado para un proceso
+ajeno y su identidad no es verificable; solo el worker que generó el
+proceso puede terminarlo. El borrado recursivo de `tmp_dir` solo acepta
+rutas estrictamente dentro de `os.tmpdir()`, distintas del propio
+`os.tmpdir()` y con el prefijo reservado `af-preview-`; cualquier otra
+ruta se rechaza. `delete_file` nunca permite borrar la raíz de un área
+(`"."`, `"./"`, `"a/.."` y equivalentes normalizados). Las lecturas
+decodifican los bytes originales con `TextDecoder('utf-8', {fatal: true})`:
+cualquier secuencia UTF-8 inválida se rechaza, nunca se sustituye por
+U+FFFD en silencio. Los previews son provisionales y no equivalen a
+despliegues.
 
 El despliegue live, `health_check_project`, `rollback_project` y
 `backup_project_database` pertenecen a las Fases 6–7. Todas confinadas al
