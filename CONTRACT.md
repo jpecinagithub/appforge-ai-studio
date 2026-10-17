@@ -783,10 +783,12 @@ Vercel ni modifica producción.
   `startVerificationRuntime`, `runHealthCheck`, `runAuthenticatedVerification`,
   `stopVerificationRuntime`, `createLiveBackup`, `runLiveMigrations`,
   `stopCurrentLiveRuntime`, `startCandidateAsLive`, `restoreBackup`,
-  `startPreviousVersion`, `removeCandidate`, `reconcileRuntime`). Sin
+  `startPreviousVersion`, `discardCandidate`, `reconcileRuntime`). Sin
   comandos/shell/rutas/nombres de contenedor del LLM: identificadores
   derivados internamente y validados. El adaptador nunca muta el estado;
   solo el orquestador decide transiciones. El LLM no accede al driver.
+  `discardCandidate` es SOLO para candidatos fallidos/no promocionados:
+  nunca se llama tras una promoción correcta (el candidato ES el live).
 - Solo existe `FakeDeploymentDriver`: configurable por operación
   (éxito/fallo/timeout), con retardos, hooks y compuertas manuales;
   observa el estado persistido durante cada llamada. No hay
@@ -804,7 +806,58 @@ Vercel ni modifica producción.
   toca el kill switch de 5B).
 - Logs sanitizados (`sanitizeSecrets`), tope por evento (4 000) y por
   deployment (20 000) con indicador explícito de truncado; sin secretos,
-  cookies, tokens, `.env` ni `Authorization`.
+  cookies, tokens, `.env` ni `Authorization`. `deployments.error`
+  (devuelto por la API) se sanitiza y limita a 4 000 caracteres: cubre
+  errores del driver, excepciones, rollback y reconciliación.
+
+**Revisión Codex (2026-10-17) — 10 bloqueos corregidos sobre el PR #10:**
+1. **Timeouts y cancelación real.** `DeploymentDriver` acepta
+   `AbortSignal` por operación; el driver debe abortar el trabajo real y
+   resolver su promesa al abortar. El orquestador crea un
+   `AbortController` por operación con timeout por operación (defecto
+   10 min), timeout total del pipeline (defecto 20 min, §9.18) y sondeo
+   de `cancel_requested`; tras el abort ESPERA a la operación (nunca
+   `Promise.race` con trabajo en segundo plano). Pre-promoting la
+   cancelación interrumpe operaciones bloqueadas → `cancelled`; en
+   `promoting` la cancelación no aborta (promoción segura o rollback) y
+   los timeouts disparan rollback. Todo termina en estado terminal con
+   limpieza y sin operaciones en vuelo.
+2. **Puerta persistida autoritativa.** Tabla `verification_receipts`
+   (`project_id, check_key, fingerprint, seq, created_at`). Las
+   herramientas 5A/5B persisten el receipt al completar (con `seq` =
+   índice canónico) y las mutaciones los invalidan igual que el gate en
+   memoria (también con el estado en memoria vacío). `POST
+   /api/projects/:id/deploy` exige los seis receipts vigentes sobre las
+   fuentes actuales y en orden canónico; si no → `409 VERIFICATION_GATE`.
+   La aproximación anterior (último build + migraciones) queda eliminada.
+3. **Sanitización de error.** Todo `deployments.error` se sanitiza y
+   limita antes de persistir.
+4. **Backup obligatorio y validado.** Antes de tocar live se exige:
+   resultado ok + `backupId` con formato interno `bk_[A-Za-z0-9_-]{1,64}`
+   + `backupValidated='true'` del driver. Si falta o es inválido →
+   `failed`, `runLiveMigrations` nunca se ejecuta, live intacto.
+5. **Rollback sin versión anterior.** `rolled_back` solo si existía
+   `previousLiveVersion`, fue arrancada y pasó health. Sin versión
+   anterior: se restaura el backup cuando corresponda, se limpia el
+   candidato y se termina en `failed` (nunca health ficticio).
+6. **Limpieza de recursos.** `cleanup()` inspecciona cada `DriverResult`,
+   registra los fallos de limpieza como eventos y los conserva en el
+   diagnóstico final. Matriz completa en migrating/verifying
+   (`stopVerificationRuntime` + `discardVerificationDatabase` +
+   `discardCandidate` según corresponda).
+7. **`discardCandidate`.** Renombrado desde `removeCandidate` con
+   semántica estricta documentada; tras rollback se descarta el candidato
+   fallido; tras promoción correcta jamás se elimina la versión live.
+8. **Atomicidad estado+eventos.** Creación `pending` + evento `created`,
+   transición + evento, `cancel_requested` + evento y recuperación tras
+   reinicio + evento van cada uno en UNA sola transacción.
+9. **CI flaky.** `runLive` chequea `isCancelled()` de forma síncrona
+   antes de spawnear: `cancellation produces BUILD_CANCELLED` ya no
+   depende del poll de 250 ms.
+10. **Documentación de Vercel.** El reporte corrige la afirmación: el PR
+   activó automáticamente el Vercel Preview Check (integración
+   GitHub→Vercel del repo); no hubo intervención manual ni promoción
+   consciente a producción.
 
 **Fase 7 — pendiente (exclusiones expresas de Fase 6):**
 `DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
