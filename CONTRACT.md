@@ -971,8 +971,9 @@ de nombres; se rechazan claves inválidas, null bytes, saltos y duplicados
 ambiguos; ninguna variable del proceso del Studio se hereda en bloque.
 
 **Backup SQLite real**: `docker cp` desde el live detenido (operación fija);
-SHA-256 + manifiesto + `PRAGMA quick_check` con `node:sqlite` (código
-confiable); `backupId` con formato `bk_[A-Za-z0-9_-]{1,64}` y
+se copian `app.db` + `app.db-wal` (el `-shm` es memoria compartida
+transitoria: SQLite lo recrea y su checksum no es estable); SHA-256 +
+manifiesto + `PRAGMA quick_check` con `node:sqlite` (código confiable); `backupId` con formato `bk_[A-Za-z0-9_-]{1,64}` y
 `backupValidated='true'` solo tras validar todos los pasos; primer despliegue
 → backup validado con `hadDatabase=false` (restaurar = volumen vacío);
 retención 10 sin borrar backups requeridos; restauración verificada
