@@ -95,6 +95,11 @@ export class DockerDriverError extends Error {
   }
 }
 
+/** Mensajes equivalentes emitidos por distintas versiones de `docker cp`. */
+function isMissingContainerPath(stderr: string): boolean {
+  return /(?:no such file|could not find the file)/i.test(stderr);
+}
+
 // ---------------------------------------------------------------------------
 // Configuración y kill switches (§4)
 // ---------------------------------------------------------------------------
@@ -758,7 +763,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         maxOutputBytes: 134_217_728,
       });
       if (raw.code !== 0) {
-        if (/no such file/i.test(raw.stderr)) return ok();
+        if (isMissingContainerPath(raw.stderr)) return ok();
         return err('SCAN_CP_FAILED', raw.stderr.slice(0, 300));
       }
       if (raw.truncated) return err('IMAGE_SCAN_TRUNCATED', 'image /app too large to scan');
@@ -1618,7 +1623,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (cp.aborted) throw new DockerDriverError('OPERATION_ABORTED', 'backup aborted during copy');
       if (cp.timedOut) throw new DockerDriverError('BACKUP_CP_TIMEOUT', `docker cp ${f} timed out`);
       if (cp.code !== 0) {
-        if (/no such file/i.test(cp.stderr)) continue;
+        if (isMissingContainerPath(cp.stderr)) continue;
         throw new DockerDriverError('BACKUP_CP_FAILED', `docker cp ${f}: ${cp.stderr.slice(0, 200)}`);
       }
       try {
@@ -1904,7 +1909,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         if (cp.aborted) throw new DockerDriverError('OPERATION_ABORTED', 'live rescue aborted');
         if (cp.timedOut) throw new DockerDriverError('RESTORE_RESCUE_TIMEOUT', `rescue cp ${f} timed out`);
         if (cp.code !== 0) {
-          if (/no such file/i.test(cp.stderr)) continue;
+          if (isMissingContainerPath(cp.stderr)) continue;
           throw new DockerDriverError('RESTORE_RESCUE_CP_FAILED', `rescue ${f}: ${cp.stderr.slice(0, 200)}`);
         }
         files.push({ name: f, ...sha256File(path.join(dir, f)) });

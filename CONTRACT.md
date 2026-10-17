@@ -1132,6 +1132,9 @@ vacío, malformado o distinto.
 - Las rutas absolutas de `--env-file` aceptan sintaxis POSIX y Windows, con
   límite de longitud y rechazo de NUL/CR/LF; se conserva la validación
   POSIX estricta para rutas internas del contenedor.
+- La ausencia normal de `app.db-wal` se reconoce tanto con `no such file`
+  como con `Could not find the file`, variantes reales de `docker cp`; un
+  WAL opcional ausente no invalida el rescate previo al rollback.
 
 **Archivos de 7A** (inventario):
 `apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),

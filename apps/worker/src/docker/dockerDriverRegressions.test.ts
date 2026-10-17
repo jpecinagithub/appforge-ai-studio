@@ -292,7 +292,7 @@ class StubDocker {
           const vol = this.containerVolumes.get(cname);
           buf = vol ? this.volumeFiles.get(vol)?.get(fname) : undefined;
         }
-        if (!buf) return this.failRes(1, `Error: No such file: ${src}`);
+        if (!buf) return this.failRes(1, `Error response from daemon: Could not find the file ${src.slice(mi)} in container ${cname}`);
         fs.mkdirSync(path.dirname(dst), { recursive: true });
         fs.writeFileSync(dst, buf);
       } else {
