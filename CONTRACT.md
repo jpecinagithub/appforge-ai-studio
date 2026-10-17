@@ -859,6 +859,36 @@ Vercel ni modifica producción.
    GitHub→Vercel del repo); no hubo intervención manual ni promoción
    consciente a producción.
 
+**Revisión final de Codex (NO-GO, 4 bloqueos; corregidos en el mismo
+PR #10, sin fusionar):**
+1. **`stopVerificationRuntime` como precondición obligatoria de
+   promoting.** Tras una verificación correcta, detener el runtime es
+   obligatorio: cualquier resultado no-ok (fallo, excepción, timeout o
+   abort —incluido por cancelación—) impide ejecutar el backup o tocar
+   live. Termina en `failed`, ejecuta la limpieza restante
+   (`discardVerificationDatabase` + `discardCandidate`) y conserva todos
+   los fallos en el diagnóstico, porque no se puede garantizar que el
+   runtime haya desaparecido. El warning-y-continúa queda eliminado.
+2. **Presupuesto de recuperación independiente para el rollback.**
+   `rollbackTimeoutMs` (defecto 5 min, configurable en
+   `RunDeploymentOptions`): el rollback ya no depende del deadline
+   global del pipeline (puede estar vencido). Mantiene `AbortSignal`
+   por operación y espera la terminación real; un timeout global
+   durante `promoting` permite igualmente restaurar una versión
+   anterior sana (causa de abort `rollback-timeout`).
+3. **Consumo total de `cleanup()`.** Un backup inválido (fallido, sin
+   `backupId`, ID inválido o sin validación) descarta el candidato
+   exactamente una vez; si el descarte falla, queda en
+   `deployments.error` y en los eventos. Si
+   `discardVerificationDatabase` falla tras una verificación correcta,
+   no se entra en `promoting`: `failed` con el fallo de limpieza en el
+   diagnóstico. Ningún resultado de limpieza se traga en silencio.
+4. **Finalización correcta atómica.** `finalizeLiveDeployment()`:
+   `project_runtime` + transición a `live` + evento, todo en UNA sola
+   transacción SQLite. Si falla cualquiera de las escrituras, el nuevo
+   runtime no queda publicado (revierte todo; el deployment termina en
+   `failed` vía catch-all). Idempotente si ya está en `live`.
+
 **Fase 7 — pendiente (exclusiones expresas de Fase 6):**
 `DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
 socket Docker; red `appforge-apps`; límites CPU/RAM/PIDs reales;
