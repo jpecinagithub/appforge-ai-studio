@@ -30,16 +30,18 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
-import { checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, type AgentSettings, type ToolContext } from 'appforge-worker';
 // Fase 6 — orquestador persistente del pipeline de despliegue (CONTRACT.md §9.21)
 import {
   DeploymentError,
+  acquireDeploymentCapacity,
   createDeployment,
   getDeployment as getDeploymentRecord,
   getProjectRuntime as getProjectRuntimeRecord,
   listDeployments as listDeploymentRecords,
   persistedDynamicGateStatus,
   reconcileDeployments,
+  reconcileProjectRuntimes,
   requestDeploymentCancel,
   runDeploymentPipeline,
   type DeploymentDriver,
@@ -321,6 +323,12 @@ export interface ServerOptions {
    * se simula ningún despliegue real. El fake solo se inyecta en tests.
    */
   deploymentDriver?: DeploymentDriver;
+  /**
+   * 7B: resolución interna del runtime live. Producción usa el nombre Docker
+   * derivado y puerto fijo; los tests pueden inyectar loopback. Nunca procede
+   * de parámetros HTTP ni de datos libres del usuario.
+   */
+  liveRuntimeOrigin?: (runtime: ProjectRuntime) => string | null;
 }
 
 const err = (code: string, message: string): ApiError => ({ error: { code, message } });
@@ -784,9 +792,9 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   });
 
   // ----------------------------------------------------------------- deploy
-  // Fase 6 — pipeline persistente (CONTRACT.md §9.21). Sin driver real
-  // configurado: 501 estable, sin simular despliegues. El fake solo se
-  // inyecta vía ServerOptions en tests; nunca por defecto en producción.
+  // Pipeline persistente (CONTRACT.md §9.21–9.23). Sin driver real listo:
+  // 501 estable, sin simular despliegues. El fake solo se inyecta vía
+  // ServerOptions en tests; nunca por defecto en producción.
   const deployDriver = opts.deploymentDriver;
 
   app.post('/api/projects/:id/deploy', async (req, reply) => {
@@ -813,10 +821,16 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       reply.code(409);
       return err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current');
     }
+    const releaseCapacity = acquireDeploymentCapacity(deployDriver);
+    if (!releaseCapacity) {
+      reply.code(409);
+      return err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted');
+    }
     let dep: DeploymentRecord;
     try {
       dep = createDeployment(db, { projectId: id, target: body.target });
     } catch (e) {
+      releaseCapacity();
       if (e instanceof DeploymentError) {
         reply.code(e.statusCode);
         return err(e.code, e.message);
@@ -830,7 +844,9 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       target: body.target,
       deploymentId: dep.id,
       verificationGate: () => persistedDynamicGateStatus(db, projectDir(dataDir, id), id),
-    }).catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message));
+    })
+      .catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message))
+      .finally(releaseCapacity);
     reply.code(202);
     return toDeploymentInfo(dep);
   });
@@ -875,7 +891,18 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   // ----------------------------------------------------------------- preview
   app.get('/api/projects/:id/preview', async (req) => {
     const { id } = req.params as { id: string };
-    needProject(id);
+    const project = needProject(id);
+    if (project.type === 'dynamic') {
+      const preview = getPreview(db, id);
+      if (preview?.status === 'ready') return { url: `/a/${id}/`, status: 'ready' };
+      if (preview?.status === 'starting') return { url: `/a/${id}/`, status: 'building' };
+      const runtime = getProjectRuntimeRecord(db, id);
+      if (runtime?.status === 'running') return { url: `/a/${id}/`, status: 'ready' };
+      const activeDeploy = db.prepare(
+        "SELECT id FROM deployments WHERE project_id=? AND status IN ('pending','building','migrating','verifying','promoting') LIMIT 1",
+      ).get(id);
+      return { url: `/a/${id}/`, status: activeDeploy ? 'building' : 'none' };
+    }
     const distIndex = path.join(frontendDir(dataDir, id), 'dist', 'index.html');
     let status: 'ready' | 'building' | 'none' = 'none';
     if (fs.existsSync(distIndex)) status = 'ready';
@@ -993,7 +1020,42 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       return '<h1>Project not found</h1>';
     }
     const preview = getPreview(db, projectId);
-    if (!preview || preview.status !== 'ready' || !preview.port) {
+    let targetBase: string | null = null;
+    let targetKind: 'preview' | 'live' = 'preview';
+    if (preview?.status === 'ready' && preview.port) {
+      targetBase = `http://127.0.0.1:${preview.port}`;
+    } else {
+      const runtimeRecord = getProjectRuntimeRecord(db, projectId);
+      const expectedContainer = `appforge-app-${projectId.slice(0, 8)}`;
+      const validRuntime =
+        runtimeRecord?.status === 'running' &&
+        runtimeRecord.containerName === expectedContainer &&
+        APPFORGE_IMAGE_REF_RE.test(runtimeRecord.liveImage);
+      if (validRuntime && runtimeRecord) {
+        targetKind = 'live';
+        const publicRuntime = toProjectRuntime(runtimeRecord);
+        if (opts.liveRuntimeOrigin) {
+          // El resolver inyectado existe solo para tests locales: incluso ahí
+          // se restringe a loopback HTTP para que nunca se convierta en SSRF.
+          const injected = opts.liveRuntimeOrigin(publicRuntime);
+          if (injected) {
+            try {
+              const parsed = new URL(injected);
+              if (
+                parsed.protocol === 'http:' &&
+                ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(parsed.hostname) &&
+                !parsed.username && !parsed.password && parsed.pathname === '/' && !parsed.search && !parsed.hash
+              ) targetBase = parsed.origin;
+            } catch {
+              targetBase = null;
+            }
+          }
+        } else {
+          targetBase = `http://${expectedContainer}:8080`;
+        }
+      }
+    }
+    if (!targetBase) {
       reply.code(503).type('text/html; charset=utf-8');
       return dynamicPreviewDiagnosticHtml(projectId, p.name, preview?.status ?? 'none');
     }
@@ -1002,7 +1064,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     const rawUrl = req.raw.url ?? '/';
     const qIndex = rawUrl.indexOf('?');
     const query = qIndex >= 0 ? rawUrl.slice(qIndex) : '';
-    const target = `http://127.0.0.1:${preview.port}/${rest}${query}`;
+    const target = `${targetBase}/${rest}${query}`;
 
     // Forward headers minus hop-by-hop and minus the Studio Authorization.
     const HOP_BY_HOP = new Set([
@@ -1043,7 +1105,9 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       // live backend); otherwise only the registry row is closed and verified
       // temp paths cleaned — a persisted PID is never killed. The proxy never
       // trusts a `ready` SQLite row alone.
-      await failPreview(db, projectId, `preview backend unreachable: ${(e as Error).message}`.slice(0, 500));
+      if (targetKind === 'preview') {
+        await failPreview(db, projectId, `preview backend unreachable: ${(e as Error).message}`.slice(0, 500));
+      }
       reply.code(503).type('text/html; charset=utf-8');
       return dynamicPreviewDiagnosticHtml(projectId, p.name, 'unreachable');
     }
@@ -1169,19 +1233,36 @@ async function main(): Promise<void> {
   // Fase 5B: ephemeral previews never survive a restart.
   const stalePreviews = reconcilePreviews(db);
   if (stalePreviews > 0) console.log(`[server] discarded ${stalePreviews} stale preview(s)`);
-  // Fase 6: non-terminal deployments cannot survive a restart either.
-  // No real driver is configured in Fase 6: states are marked failed and
-  // the abstract driver reconciliation runs only when a driver exists.
-  const interruptedDeployments = await reconcileDeployments(db);
+  // Fase 7B: una única instancia, fail closed, compartida por reconciliación,
+  // HTTP y worker. Si está disabled/unavailable el Studio sigue operativo y
+  // los endpoints conservan el 501; nunca se sustituye por un fake.
+  const dockerActivation = await activateDockerDeployment({
+    env: process.env,
+    dataDir,
+    templatesDir,
+    db,
+  });
+  const deploymentDriver = dockerActivation.driver ?? undefined;
+  console.log(`[server] docker deployment: ${dockerActivation.status}${dockerActivation.diagnostics.length ? ` (${dockerActivation.diagnostics.join('; ')})` : ''}`);
+  // Los estados no terminales no sobreviven a un reinicio. Con Docker listo,
+  // el driver inspecciona primero los recursos que realmente posee.
+  const interruptedDeployments = await reconcileDeployments(db, deploymentDriver);
   if (interruptedDeployments > 0) console.log(`[server] marked ${interruptedDeployments} interrupted deployment(s) as failed`);
+  if (deploymentDriver) {
+    const runtimes = await reconcileProjectRuntimes(db, deploymentDriver);
+    if (runtimes.checked > 0) {
+      console.log(`[server] reconciled ${runtimes.checked} runtime(s); unavailable=${runtimes.unavailable}`);
+    }
+  }
 
-  const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db) });
+  const worker = startWorker(db, { dataDir, pollMs: 2000, getSettings: () => getAgentSettings(db), deploymentDriver });
   const app = buildServer({
     db,
     dataDir,
     templatesDir,
     adminToken: process.env.APPFORGE_ADMIN_TOKEN,
     corsOrigin: process.env.CORS_ORIGIN ?? '*',
+    deploymentDriver,
   });
 
   const shutdown = async () => {

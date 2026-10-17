@@ -269,6 +269,34 @@ describe('concurrent deploys (criterio 4)', () => {
       await gatedApp.close();
     }
   });
+
+  it('applies the 7B driver capacity across different projects before creating work', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const limited = new FakeDeploymentDriver({ db, gates: { buildCandidate: () => gate } }) as
+      FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    limited.maxConcurrentDeploys = 1;
+    const limitedApp = await buildApp(limited);
+    try {
+      addProject('capacity-a');
+      addProject('capacity-b');
+      seedVerificationReceipts('capacity-a');
+      seedVerificationReceipts('capacity-b');
+      const first = await limitedApp.inject({ method: 'POST', url: '/api/projects/capacity-a/deploy', payload: { target: 'oracle' } });
+      expect(first.statusCode).toBe(202);
+      await waitForStatus(limitedApp, (first.json() as { id: string }).id, 'building');
+      const second = await limitedApp.inject({ method: 'POST', url: '/api/projects/capacity-b/deploy', payload: { target: 'oracle' } });
+      expect(second.statusCode).toBe(409);
+      expect((second.json() as { error: { code: string } }).error.code).toBe('DEPLOYMENT_CAPACITY');
+      const rows = db.prepare('SELECT COUNT(*) AS n FROM deployments WHERE project_id=?').get('capacity-b') as { n: number };
+      expect(rows.n).toBe(0);
+      release();
+      await waitForTerminal(limitedApp, (first.json() as { id: string }).id);
+    } finally {
+      release();
+      await limitedApp.close();
+    }
+  });
 });
 
 describe('deployment queries and cancel (criterio 13)', () => {

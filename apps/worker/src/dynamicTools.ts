@@ -1162,6 +1162,11 @@ async function deployProjectTool(ctx: ToolContext, args: Record<string, unknown>
     );
   }
   const { runDeploymentPipeline, DeploymentError } = await import('./deploy/orchestrator.js');
+  const { acquireDeploymentCapacity } = await import('./deploy/driver.js');
+  const releaseCapacity = acquireDeploymentCapacity(driver);
+  if (!releaseCapacity) {
+    return fail('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted', durationMs());
+  }
   try {
     const final = await runDeploymentPipeline(ctx.db, driver, {
       projectId: ctx.projectId,
@@ -1190,5 +1195,7 @@ async function deployProjectTool(ctx: ToolContext, args: Record<string, unknown>
       return fail(e.code, e.message, durationMs());
     }
     return fail('DEPLOY_ERROR', `deployment failed: ${(e as Error).message}`.slice(0, 2000), durationMs());
+  } finally {
+    releaseCapacity();
   }
 }

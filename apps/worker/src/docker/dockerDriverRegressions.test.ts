@@ -710,7 +710,7 @@ describe('B4: volumen live con identidad estable de proyecto', () => {
   });
 });
 
-describe('B5: preflight con propiedad exacta', () => {
+describe.skipIf(process.platform === 'win32')('B5: preflight con propiedad exacta', () => {
   async function preflightCfg(dataDir: string, stub: StubDocker) {
     const sock = path.join(dataDir, 'docker.sock');
     const server = net.createServer();
@@ -1319,7 +1319,7 @@ describe('NO-GO2 B5: normalización de arquitectura', () => {
     expect(normalizeArch('riscv64')).toBe('riscv64');
   });
 
-  test('preflight informa la arquitectura del daemon en el diagnóstico', async () => {
+  test.skipIf(process.platform === 'win32')('preflight informa la arquitectura del daemon en el diagnóstico', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
     const stub = new StubDocker();
     stub.daemonArch = 'aarch64';

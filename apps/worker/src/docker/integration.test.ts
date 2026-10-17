@@ -365,6 +365,9 @@ d('docker integration (fase 7A)', () => {
     const b = await h.driver.buildCandidate(h.args);
     okRes(b);
     snapshotFp(h);
+    // 7B: el orquestador persiste esta referencia inmutable en
+    // project_runtime; nunca el alias lógico cand-….
+    expect(b.data?.candidateVersion).toBe(h.names.image);
     builtImages.add(h.names.image);
     return h;
   }

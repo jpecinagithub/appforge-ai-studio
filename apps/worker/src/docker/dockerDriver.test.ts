@@ -1,14 +1,11 @@
 /**
  * Fase 7A — Tests unitarios del DockerDeploymentDriver que no necesitan
- * Docker: kill switches, preflight negativo, semáforo y validación de args.
+ * Docker: kill switches, preflight negativo y validación de args.
  */
 import { describe, test, expect } from 'vitest';
 import {
   resolveDockerDriverConfig,
   preflightDocker,
-  acquireDeploySlot,
-  releaseDeploySlot,
-  activeDeploySlots,
   DockerDeploymentDriver,
 } from './dockerDriver.js';
 import { DockerCommandRunner } from './commandRunner.js';
@@ -57,29 +54,13 @@ describe('kill switches (§4)', () => {
   });
 });
 
-describe('semáforo de despliegues', () => {
-  test('respeta el límite y libera', () => {
-    while (activeDeploySlots() > 0) releaseDeploySlot();
-    expect(acquireDeploySlot(1)).toBe(true);
-    expect(acquireDeploySlot(1)).toBe(false);
-    expect(activeDeploySlots()).toBe(1);
-    releaseDeploySlot();
-    expect(activeDeploySlots()).toBe(0);
-    expect(acquireDeploySlot(2)).toBe(true);
-    expect(acquireDeploySlot(2)).toBe(true);
-    expect(acquireDeploySlot(2)).toBe(false);
-    releaseDeploySlot();
-    releaseDeploySlot();
-  });
-});
-
 describe('preflight negativo', () => {
   test('falla sin socket', async () => {
     const cfg = resolveDockerDriverConfig(BASE_ENV, '/tmp/af-preflight-ut')!;
     const bad = { ...cfg, socketPath: '/tmp/af-no-such-socket-xyz.sock' };
     const r = await preflightDocker(new DockerCommandRunner(), bad);
     expect(r.ok).toBe(false);
-    expect(r.diagnostics.join(' ')).toMatch(/socket/);
+    expect(r.diagnostics.join(' ')).toMatch(process.platform === 'linux' ? /socket/ : /linux/);
   });
 });
 

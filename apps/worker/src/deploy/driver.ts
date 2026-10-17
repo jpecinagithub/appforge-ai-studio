@@ -12,8 +12,8 @@
  *   orquestador decide transiciones (vía la máquina de estados).
  * - El LLM nunca recibe acceso directo al driver.
  *
- * En Fase 6 solo existe `FakeDeploymentDriver` (determinista, para
- * pruebas). `DockerDeploymentDriver` se añadirá en Fase 7.
+ * `FakeDeploymentDriver` es exclusivo de pruebas. Desde 7B el Studio puede
+ * inyectar el `DockerDeploymentDriver` real tras kill switches + preflight.
  *
  * Este módulo no ejecuta shell, no abre red y no importa Docker.
  */
@@ -136,6 +136,14 @@ export function assertDriverArgs(args: DriverOpArgs): void {
 
 export interface DeploymentDriver {
   readonly name: string;
+  /**
+   * Límite de pipelines completos que puede atender esta instancia. Ausente
+   * significa que el driver no impone límite (fakes y adaptadores de tests).
+   * 7B comparte una sola instancia entre HTTP y worker.
+   */
+  readonly maxConcurrentDeploys?: number;
+  /** Drivers reales pueden exigir una versión inmutable devuelta por build. */
+  readonly requiresCandidateVersion?: boolean;
   buildCandidate(args: DriverOpArgs): Promise<DriverResult>;
   prepareVerificationDatabase(args: DriverOpArgs): Promise<DriverResult>;
   runVerificationMigrations(args: DriverOpArgs): Promise<DriverResult>;
@@ -163,6 +171,36 @@ export interface DeploymentDriver {
    */
   discardCandidate(args: DriverOpArgs): Promise<DriverResult>;
   reconcileRuntime(args: ReconcileArgs): Promise<DriverResult>;
+  /** Limpieza post-live opcional; jamás puede invalidar una promoción sana. */
+  pruneManagedImages?(projectId: string, keepImages?: string[]): Promise<{ removed: string[]; failures: string[] }>;
+}
+
+const activeByDriver = new WeakMap<DeploymentDriver, number>();
+
+/**
+ * Reserva capacidad para un pipeline completo. Devuelve una liberación
+ * idempotente, o null antes de que se cree/persista ningún deployment.
+ */
+export function acquireDeploymentCapacity(driver: DeploymentDriver): (() => void) | null {
+  const configured = driver.maxConcurrentDeploys;
+  if (configured === undefined) return () => undefined;
+  const max = Math.max(1, Math.floor(configured));
+  const active = activeByDriver.get(driver) ?? 0;
+  if (active >= max) return null;
+  activeByDriver.set(driver, active + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const current = activeByDriver.get(driver) ?? 0;
+    if (current <= 1) activeByDriver.delete(driver);
+    else activeByDriver.set(driver, current - 1);
+  };
+}
+
+/** Solo para diagnóstico/pruebas; no muta el contador. */
+export function activeDeploymentCapacity(driver: DeploymentDriver): number {
+  return activeByDriver.get(driver) ?? 0;
 }
 
 // ---------------------------------------------------------------------------

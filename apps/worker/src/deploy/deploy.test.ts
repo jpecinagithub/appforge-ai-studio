@@ -44,12 +44,15 @@ import {
   listDeploymentEvents,
   recordEvent,
   reconcileDeployments,
+  reconcileProjectRuntimes,
   requestDeploymentCancel,
   runDeploymentPipeline,
   transitionDeployment,
   upsertProjectRuntime,
   MAX_EVENT_OUTPUT_CHARS,
   MAX_DEPLOYMENT_LOGS_CHARS,
+  acquireDeploymentCapacity,
+  activeDeploymentCapacity,
 } from '../index.js';
 import { FakeDeploymentDriver, type DriverOpArgs, type FakeOpBehavior, type FakeOpName, type HealthCheckArgs } from './driver.js';
 import { createDynamicTools } from '../dynamicTools.js';
@@ -173,6 +176,100 @@ describe('state machine (criterio 3)', () => {
       expect((e as DeploymentError).code).toBe('DEPLOYMENT_ACTIVE');
       expect((e as DeploymentError).statusCode).toBe(409);
     }
+  });
+});
+
+describe('Fase 7B wiring', () => {
+  it('persists the immutable candidate version reported by a real driver', async () => {
+    addProject('p7b-image');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      requiresCandidateVersion: boolean;
+    };
+    driver.requiresCandidateVersion = true;
+    const originalBuild = driver.buildCandidate.bind(driver);
+    driver.buildCandidate = async (args) => ({
+      ...(await originalBuild(args)),
+      data: { candidateVersion: 'appforge/app-1234abcd:dep-5678abcd-0123456789ab' },
+    });
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-image', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('live');
+    expect(getProjectRuntime(db, 'p7b-image')?.liveImage)
+      .toBe('appforge/app-1234abcd:dep-5678abcd-0123456789ab');
+  });
+
+  it('fails closed when a real driver omits the immutable candidate version', async () => {
+    addProject('p7b-missing-image');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      requiresCandidateVersion: boolean;
+    };
+    driver.requiresCandidateVersion = true;
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-missing-image', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('failed');
+    expect(final.error).toMatch(/immutable candidate version/i);
+    expect(getProjectRuntime(db, 'p7b-missing-image')).toBeNull();
+  });
+
+  it('prunes only after live and preserves a healthy deployment when pruning reports failures', async () => {
+    addProject('p7b-prune');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      pruneManagedImages: (projectId: string, keep?: string[]) => Promise<{ removed: string[]; failures: string[] }>;
+    };
+    let protectedImages: string[] = [];
+    driver.pruneManagedImages = async (_projectId, keep = []) => {
+      protectedImages = keep;
+      return { removed: ['old-image'], failures: ['one stale image stayed busy'] };
+    };
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-prune', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('live');
+    expect(protectedImages).toContain(final.candidateId);
+    const prune = listDeploymentEvents(db, final.id).find((event) => event.event === 'prune_managed_images');
+    expect(prune?.status).toBe('failed');
+    expect(prune?.error).toMatch(/stale image/i);
+  });
+
+  it('shares and releases deployment capacity per driver instance', () => {
+    const driver = new FakeDeploymentDriver() as FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    driver.maxConcurrentDeploys = 1;
+    const release = acquireDeploymentCapacity(driver);
+    expect(release).not.toBeNull();
+    expect(activeDeploymentCapacity(driver)).toBe(1);
+    expect(acquireDeploymentCapacity(driver)).toBeNull();
+    release?.();
+    release?.();
+    expect(activeDeploymentCapacity(driver)).toBe(0);
+    expect(acquireDeploymentCapacity(driver)).not.toBeNull();
+  });
+
+  it('reconciles persisted runtime as stopped and fails closed on image mismatch', async () => {
+    addProject('p7b-runtime');
+    const dep = createDeployment(db, { projectId: 'p7b-runtime', target: 'oracle' });
+    transitionDeployment(db, dep.id, 'building');
+    transitionDeployment(db, dep.id, 'migrating');
+    transitionDeployment(db, dep.id, 'verifying');
+    transitionDeployment(db, dep.id, 'promoting');
+    const image = 'appforge/app-1234abcd:dep-5678abcd-0123456789ab';
+    const { finalizeLiveDeployment } = await import('./stateMachine.js');
+    finalizeLiveDeployment(db, dep.id, {
+      runtime: { projectId: 'p7b-runtime', containerName: 'appforge-app-p7b-runt', liveImage: image, previousImage: null, status: 'running' },
+    });
+    let resultImage = image;
+    const driver = {
+      reconcileRuntime: async () => ({
+        ok: true,
+        data: { liveFound: 'true', liveRunning: 'false', liveImage: resultImage, volumeExists: 'true' },
+      }),
+    };
+    expect(await reconcileProjectRuntimes(db, driver)).toEqual({ checked: 1, unavailable: 0 });
+    expect(getProjectRuntime(db, 'p7b-runtime')?.status).toBe('stopped');
+    resultImage = 'appforge/app-deadbeef:dep-deadbeef-deadbeefdead';
+    expect((await reconcileProjectRuntimes(db, driver)).unavailable).toBe(1);
+    expect(getProjectRuntime(db, 'p7b-runtime')?.status).toBe('missing');
   });
 });
 
@@ -669,6 +766,23 @@ describe('deploy_project tool (criterio 20)', () => {
     expect(r.ok).toBe(false);
     expect(r.code).toBe('INVALID_TYPE');
   });
+
+  it('shares the 7B capacity guard with HTTP before creating a deployment', async () => {
+    addProject('capacity-tool');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    driver.maxConcurrentDeploys = 1;
+    const release = acquireDeploymentCapacity(driver);
+    expect(release).not.toBeNull();
+    try {
+      const r = await createDynamicTools().deploy_project(toolCtx('capacity-tool', driver), {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('DEPLOYMENT_CAPACITY');
+      const count = db.prepare('SELECT COUNT(*) AS c FROM deployments WHERE project_id=?').get('capacity-tool') as { c: number };
+      expect(count.c).toBe(0);
+    } finally {
+      release?.();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -696,7 +810,7 @@ describe('no docker, shell or network (criterio 21)', () => {
         expect(src, `forbidden token '${token}'`).not.toContain(token);
       }
     }
-    // El fake es la única implementación del driver exportada.
+    // El fake sigue siendo la implementación determinista de pruebas.
     expect(FakeDeploymentDriver.name).toBe('FakeDeploymentDriver');
   });
 

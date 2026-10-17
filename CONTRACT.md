@@ -1149,3 +1149,72 @@ los 9 bloqueos, stub sin daemon),
 `apps/worker/src/docker/integration.test.ts` (puerta `APPFORGE_DOCKER_INTEGRATION`),
 `apps/worker/src/docker/static.test.ts`,
 `apps/worker/src/docker/index.ts`.
+
+### 9.23 Integración del driver Docker (Fase 7B — alcance cerrado)
+
+**Objetivo:** conectar el driver certificado en 7A al Studio sin habilitarlo
+por defecto y sin tocar todavía Oracle, el compose productivo, DNS, TLS, nginx
+ni la UI de despliegue. 7B no cambia la secuencia ni las garantías del
+orquestador de Fase 6.
+
+**Incluido en 7B:**
+
+1. Una única factoría de arranque resuelve los kill switches de §9.22, ejecuta
+   el preflight antes de crear el driver y devuelve un estado tipado
+   `disabled|ready|unavailable`. `disabled` y `unavailable` conservan el
+   `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`; no hay fallback al fake. Los
+   diagnósticos se sanitizan y nunca exponen variables de entorno.
+2. El mismo `DockerDeploymentDriver` listo se inyecta en HTTP, worker/agente y
+   reconciliación de arranque. No se crean instancias independientes ni
+   semáforos separados.
+3. `APPFORGE_MAX_CONCURRENT_DEPLOYS` limita pipelines completos (HTTP y tool),
+   no operaciones individuales. El slot se adquiere antes de crear trabajo y
+   se libera en `finally`, incluso ante excepción/cancelación.
+4. `buildCandidate` devuelve la referencia inmutable real de imagen. El
+   orquestador persiste esa referencia —no `cand-…`— como `live_image` y mueve
+   el anterior `live_image` a `previous_image`, de forma atómica con el estado
+   `live`. Una respuesta Docker sin referencia válida falla cerrada antes de
+   tocar el live.
+5. Al arrancar, `reconcileDeployments` usa el driver real antes de cerrar
+   ejecuciones interrumpidas. Después reconcilia cada `project_runtime` contra
+   el contenedor administrado real y persiste solo `running|stopped|missing`;
+   una colisión de identidad o error del daemon no se convierte en `running`.
+6. Tras una promoción correcta se ejecuta la poda segura de imágenes de 7A;
+   sus fallos se registran como diagnóstico/evento y no convierten un live sano
+   en fallido. Live y previous permanecen siempre protegidas.
+7. `/api/projects/:id/runtime` y `/api/projects/:id/preview` reflejan el runtime
+   persistido para proyectos dinámicos desplegados. El acceso live reutiliza
+   `/a/:projectId/*`: primero el preview efímero listo de 5B; si no existe,
+   únicamente el `container_name` validado de `project_runtime`. Nunca acepta
+   host/URL del cliente, elimina `Authorization` y hop-by-hop, limita cuerpo y
+   respuesta a 10 MiB, preserva múltiples `Set-Cookie` y devuelve 503 estable
+   si el runtime no está disponible. El proxy se prueba con un destino interno
+   inyectado; 7B no conecta aún el servidor productivo a la red Docker.
+
+**Criterios de aceptación:**
+
+- Kill switches ausentes/incompletos, plataforma no Linux, socket inválido,
+  daemon/red/volumen no válidos: Studio operativo y deploy 501, sin recursos
+  simulados ni mutaciones de deployment.
+- Con factoría `ready`, HTTP y `deploy_project` recorren el driver real
+  compartido; el límite global devuelve `409 DEPLOYMENT_CAPACITY` antes de
+  crear un deployment adicional.
+- Dos despliegues consecutivos demuestran referencias de imagen completas y
+  rollback a la anterior; reinicio demuestra reconciliación real de
+  `running`, `stopped` y `missing`.
+- Pruebas unitarias y HTTP cubren configuración, capacidad, identidad,
+  reconciliación y proxy (incluidos SSRF, cabeceras, cookies y límites). El job
+  Docker estricto amplía el recorrido real 7A con wiring y pasa en el primer
+  intento junto al resto de CI.
+- PR independiente desde `fase7a-stable`, sin merge ni tag hasta revisión
+  final. Sin secretos, Docker socket productivo, Oracle, Vercel manual ni
+  cambios de producción.
+
+**Excluido y reservado a 7C:** compose/socket/red productivos, despliegue en
+Oracle, proxy expuesto por nginx, dominio/DNS/TLS, observabilidad/alertas de
+producción, UI de despliegue y recorrido final en infraestructura real.
+También quedan fuera de 7B los endpoints operativos aún no implementados de
+§9.20 (`POST migrations`, rollback manual y backup manual): requieren definir
+autorización operativa, idempotencia y retención en el entorno real; no se
+simulan ni se publican a medias. Los endpoints de deploy/listado/cancel/runtime
+y preview ya existentes sí quedan conectados y cubiertos en 7B.

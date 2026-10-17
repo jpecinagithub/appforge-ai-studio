@@ -89,6 +89,7 @@ import type {
   DriverOpArgs,
   DriverResult,
 } from './driver.js';
+import { APPFORGE_IMAGE_REF_RE } from './driver.js';
 
 export interface VerificationGateResult {
   ok: boolean;
@@ -381,6 +382,21 @@ export async function runDeploymentPipeline(
       `candidate build failed (${describeResult(r)}); no rollback; live untouched`,
     );
     if (terminal) return terminal;
+    // 7B: el runtime debe persistir la versión inmutable que construyó el
+    // driver. El fake conserva candidateId para pruebas; el driver Docker
+    // devuelve la referencia completa appforge/...:dep-...-<sha>.
+    const reportedCandidateVersion = outcome.result.data?.candidateVersion;
+    if (
+      driver.requiresCandidateVersion &&
+      (typeof reportedCandidateVersion !== 'string' || !APPFORGE_IMAGE_REF_RE.test(reportedCandidateVersion))
+    ) {
+      const failures = await cleanup('building', 'candidateVersion', [discardCandidateFn]);
+      return finishFailed(
+        'building',
+        withCleanupFailures('real driver did not return a valid immutable candidate version; live untouched', failures),
+      );
+    }
+    const candidateVersion = reportedCandidateVersion ?? candidateId;
 
     // ---- 2. building → migrating (BD de verificación; nunca live) ---------
     if (cancelledNow()) {
@@ -650,16 +666,36 @@ export async function runDeploymentPipeline(
     // con el diagnóstico). project_runtime SOLO se actualiza tras el
     // health live correcto. El candidato ES ahora la versión live: nunca
     // se descarta aquí (podar artefactos viejos queda para Fase 7).
-    return finalizeLiveDeployment(db, depId, {
+    const live = finalizeLiveDeployment(db, depId, {
       runtime: {
         projectId,
         containerName: containerNameFor(projectId),
-        liveImage: candidateId,
+        liveImage: candidateVersion,
         previousImage: previousLiveVersion,
         status: 'running',
       },
-      diagnostic: `live=${candidateId} previous=${previousLiveVersion ?? '(none)'}`,
+      diagnostic: `live=${candidateVersion} previous=${previousLiveVersion ?? '(none)'}`,
     });
+    if (driver.pruneManagedImages) {
+      try {
+        const pruned = await driver.pruneManagedImages(projectId, [candidateVersion, previousLiveVersion ?? ''].filter(Boolean));
+        recordEvent(db, depId, {
+          phase: 'live',
+          event: 'prune_managed_images',
+          status: pruned.failures.length > 0 ? 'failed' : 'ok',
+          output: `removed=${pruned.removed.length}`,
+          error: pruned.failures.length > 0 ? pruned.failures.join('; ').slice(0, 2000) : null,
+        });
+      } catch (e) {
+        recordEvent(db, depId, {
+          phase: 'live',
+          event: 'prune_managed_images',
+          status: 'failed',
+          error: `post-live prune failed: ${(e as Error).message}`.slice(0, 2000),
+        });
+      }
+    }
+    return live;
   } catch (e) {
     // Catch-all: ningún camino deja un deployment eternamente no terminal.
     const message = e instanceof DeploymentError ? `${e.code}: ${e.message}` : `unexpected: ${(e as Error).message}`;
