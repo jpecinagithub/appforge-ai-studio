@@ -38,7 +38,7 @@ import {
   getDeployment as getDeploymentRecord,
   getProjectRuntime as getProjectRuntimeRecord,
   listDeployments as listDeploymentRecords,
-  persistedVerificationGate,
+  persistedDynamicGateStatus,
   reconcileDeployments,
   requestDeploymentCancel,
   runDeploymentPipeline,
@@ -805,8 +805,10 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       reply.code(501);
       return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
     }
-    // Puerta de verificación: síncrona para responder 409 antes de crear nada.
-    const gate = persistedVerificationGate(db, id);
+    // Puerta de verificación autoritativa (revisión Codex): los seis
+    // receipts persistidos deben estar vigentes sobre las fuentes actuales
+    // y en orden canónico. Síncrona para responder 409 antes de crear nada.
+    const gate = persistedDynamicGateStatus(db, projectDir(dataDir, id), id);
     if (!gate.ok) {
       reply.code(409);
       return err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current');
@@ -827,7 +829,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       projectId: id,
       target: body.target,
       deploymentId: dep.id,
-      verificationGate: () => persistedVerificationGate(db, id),
+      verificationGate: () => persistedDynamicGateStatus(db, projectDir(dataDir, id), id),
     }).catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message));
     reply.code(202);
     return toDeploymentInfo(dep);

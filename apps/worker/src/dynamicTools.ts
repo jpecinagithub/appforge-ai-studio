@@ -23,10 +23,16 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import type Database from 'better-sqlite3';
 import type { ToolResult } from 'appforge-shared';
 import type { ToolDef } from './llm.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { nowIso, type ToolContext, type ToolHandler } from './tools.js';
+import {
+  deleteVerificationReceipts,
+  listVerificationReceipts,
+  recordVerificationReceipt,
+} from './deploy/receipts.js';
 
 // ---------------------------------------------------------------------------
 // Minimal allowlisted child environment.
@@ -155,6 +161,24 @@ export async function runLive(
   },
 ): Promise<ProcResult> {
   const t0 = Date.now();
+  // Revisión Codex (Fase 6): chequeo SÍNCRONO antes de spawnear. Sin él,
+  // una cancelación ya solicitada compite con el poll de 250 ms: si el
+  // proceso termina antes del primer tick, la cancelación se pierde (flake
+  // `cancellation produces BUILD_CANCELLED`). Ahora es determinista.
+  try {
+    if (opts.isCancelled?.() === true) {
+      return Promise.resolve({
+        code: 1,
+        stdout: '',
+        stderr: '',
+        durationMs: 0,
+        timedOut: false,
+        cancelled: true,
+      });
+    }
+  } catch {
+    /* un hook de cancelación roto no debe tumbar la herramienta */
+  }
   // Windows cannot execute npm.cmd/npx.cmd with shell:false. Invoke their
   // JavaScript entry point with the current Node binary instead (same as
   // runCmd in tools.ts).
@@ -879,6 +903,15 @@ function recordDynamicCheck(ctx: ToolContext, key: DynamicCheckKey): void {
   const fp = scopeFingerprint(checkScopes(ctx.projectDir)[key]);
   if (fp !== null) checks[key] = fp;
   ctx.dynamicChecks = checks;
+  // Revisión Codex (Fase 6): receipt persistido autoritativo con la MISMA
+  // semántica (borra el check y sus seguidores canónicos, inserta con
+  // seq = índice canónico). La ruta HTTP lo exige para desplegar.
+  try {
+    deleteVerificationReceipts(ctx.db, ctx.projectId, [key, ...followers]);
+    if (fp !== null) recordVerificationReceipt(ctx.db, ctx.projectId, key, fp, idx);
+  } catch {
+    /* la observabilidad persistida nunca rompe la herramienta */
+  }
 }
 
 /**
@@ -886,6 +919,24 @@ function recordDynamicCheck(ctx: ToolContext, key: DynamicCheckKey): void {
  * its followers. Call after any file mutation.
  */
 export function invalidateDynamicChecks(ctx: ToolContext): void {
+  // Revisión Codex (Fase 6): la invalidación persistida NO depende del
+  // estado en memoria (un proceso nuevo arranca con ctx.dynamicChecks
+  // vacío pero puede haber receipts de un proceso anterior).
+  try {
+    const persisted = listVerificationReceipts(ctx.db, ctx.projectId);
+    let firstBadSeq = -1;
+    for (const r of persisted) {
+      if (checkScopeFingerprint(ctx.projectDir, r.checkKey) !== r.fingerprint) {
+        firstBadSeq = r.seq;
+        break;
+      }
+    }
+    if (firstBadSeq >= 0) {
+      deleteVerificationReceipts(ctx.db, ctx.projectId, DYNAMIC_CHECK_ORDER.slice(firstBadSeq));
+    }
+  } catch {
+    /* la observabilidad persistida nunca rompe la herramienta */
+  }
   if (!ctx.dynamicChecks) return;
   const scopes = checkScopes(ctx.projectDir);
   let firstBad = -1;
@@ -902,6 +953,55 @@ export function invalidateDynamicChecks(ctx: ToolContext): void {
   const doomed = new Set(DYNAMIC_CHECK_ORDER.slice(firstBad));
   for (const k of doomed) delete ctx.dynamicChecks[k];
   ctx.dynamicChecksOrder = (ctx.dynamicChecksOrder ?? []).filter((k) => !doomed.has(k));
+}
+
+/**
+ * Fingerprint del scope de un check (revisión Codex: expuesto para la
+ * puerta persistida y sus tests).
+ */
+export function checkScopeFingerprint(projectDir: string, key: DynamicCheckKey): string | null {
+  return scopeFingerprint(checkScopes(projectDir)[key]);
+}
+
+/**
+ * Puerta de verificación AUTORITATIVA para la ruta HTTP (revisión Codex,
+ * Fase 6): exige los SEIS receipts persistidos vigentes sobre las fuentes
+ * actuales y en orden canónico. Sustituye la aproximación anterior (último
+ * build success + migraciones success), que no verificaba orden,
+ * fingerprints ni los seis checks.
+ */
+export function persistedDynamicGateStatus(
+  db: Database.Database,
+  projectDir: string,
+  projectId: string,
+): { ok: boolean; reason?: string } {
+  const receipts = listVerificationReceipts(db, projectId);
+  if (receipts.length !== DYNAMIC_CHECK_ORDER.length) {
+    const have = new Set(receipts.map((r) => r.checkKey));
+    const missing = DYNAMIC_CHECK_ORDER.filter((k) => !have.has(k));
+    return {
+      ok: false,
+      reason: `missing verification receipts: ${missing.join(', ')} (run the 5A/5B verification tools in order first)`,
+    };
+  }
+  for (let i = 0; i < DYNAMIC_CHECK_ORDER.length; i++) {
+    const key = DYNAMIC_CHECK_ORDER[i]!;
+    const r = receipts[i]!;
+    if (r.checkKey !== key || r.seq !== i) {
+      return {
+        ok: false,
+        reason: `verification receipts out of canonical order at position ${i} (expected '${key}' seq=${i})`,
+      };
+    }
+    const current = checkScopeFingerprint(projectDir, key);
+    if (current === null || current !== r.fingerprint) {
+      return {
+        ok: false,
+        reason: `verification receipt '${key}' is stale: project sources changed after the check (re-run the verification tools)`,
+      };
+    }
+  }
+  return { ok: true };
 }
 
 /**

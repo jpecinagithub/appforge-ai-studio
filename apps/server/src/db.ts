@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS deployment_events(
 CREATE TABLE IF NOT EXISTS project_runtime(
   project_id TEXT PRIMARY KEY, container_name TEXT, live_image TEXT,
   previous_image TEXT, status TEXT, updated_at TEXT);
+-- Fase 6 (revisión Codex): receipts persistidos autoritativos de la puerta
+-- de verificación 5A/5B (los seis checks, con fingerprint, seq y fecha).
+CREATE TABLE IF NOT EXISTS verification_receipts(
+  project_id TEXT NOT NULL, check_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+  seq INTEGER NOT NULL, created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, check_key));
 CREATE TABLE IF NOT EXISTS settings(
   id INTEGER PRIMARY KEY CHECK(id=1), data_json TEXT);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
