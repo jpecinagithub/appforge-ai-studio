@@ -553,6 +553,65 @@ export function upsertProjectRuntime(
   return { ...r, updatedAt: now };
 }
 
+export interface FinalizeLiveInput {
+  runtime: Omit<ProjectRuntimeRecord, 'updatedAt'>;
+  /** Diagnóstico humano (se sanitiza antes de persistir). */
+  diagnostic?: string;
+}
+
+/**
+ * Revisión Codex final (bloqueo 4): finalización correcta ATÓMICA.
+ * La actualización de `project_runtime`, la transición del deployment a
+ * `live` y su evento correspondiente se persisten en UNA sola transacción
+ * SQLite. Si falla cualquiera de las escrituras, la transacción revierte
+ * por completo: el nuevo runtime NO queda publicado y el deployment no
+ * pasa a `live` (el orquestador lo deja en `failed` vía catch-all, con el
+ * diagnóstico del error). Repetir sobre un deployment ya `live` es
+ * idempotente (no-op).
+ */
+export function finalizeLiveDeployment(
+  db: Database.Database,
+  deploymentId: string,
+  input: FinalizeLiveInput,
+): DeploymentRecord {
+  const apply = (): DeploymentRecord => {
+    const row = db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as
+      | Record<string, any>
+      | undefined;
+    if (!row) throw new DeploymentError('DEPLOYMENT_NOT_FOUND', `deployment '${deploymentId}' not found`, 404);
+    const current = rowToDeploymentRecord(row);
+    if (current.status === 'live') return current; // idempotente: no-op total
+    if (current.status !== 'promoting') {
+      throw new DeploymentError(
+        'INVALID_TRANSITION',
+        `invalid deployment transition: ${current.status} -> live`,
+      );
+    }
+    const now = nowIso();
+    const r = input.runtime;
+    db.prepare(
+      `INSERT INTO project_runtime(project_id, container_name, live_image, previous_image, status, updated_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(project_id) DO UPDATE SET
+         container_name=excluded.container_name, live_image=excluded.live_image,
+         previous_image=excluded.previous_image, status=excluded.status, updated_at=excluded.updated_at`,
+    ).run(r.projectId, r.containerName, r.liveImage, r.previousImage, r.status, now);
+    db.prepare(
+      `UPDATE deployments SET status='live', updated_at=?, finished_at=?, error=? WHERE id=?`,
+    ).run(now, now, current.error, deploymentId);
+    insertEventRow(db, deploymentId, {
+      phase: 'live',
+      event: 'transition',
+      status: 'live',
+      output: input.diagnostic ?? null,
+    });
+    return rowToDeploymentRecord(
+      db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as Record<string, any>,
+    );
+  };
+  return db.transaction(apply)();
+}
+
 // ---------------------------------------------------------------------------
 // Reconciliación tras reinicio (CONTRACT.md §9.14 / §9.21)
 // ---------------------------------------------------------------------------
