@@ -74,6 +74,13 @@ export interface DriverResult {
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$/;
 
 /**
+ * Referencia completa de imagen AppForge (`appforge/app-<p8>:dep-<d8>-<sha12>`).
+ * Es el único formato aceptado para `previousLiveVersion`: la fija el Studio
+ * desde `project_runtime` (7B), nunca el modelo.
+ */
+export const APPFORGE_IMAGE_REF_RE = /^appforge\/app-[0-9a-f]{8}:dep-[0-9a-f]{8}-[0-9a-f]{12}$/;
+
+/**
  * Valida que los argumentos sean identificadores seguros derivados
  * internamente. Rechaza comandos, rutas, espacios y cadenas vacías: el
  * driver nunca debe recibir entrada libre del modelo. Los campos opcionales
@@ -102,12 +109,21 @@ export function assertDriverArgs(args: DriverOpArgs): void {
       throw new Error(`invalid driver argument 'signal': must be an AbortSignal`);
     }
   }
-  for (const k of ['previousLiveVersion', 'backupId'] as const) {
+  for (const k of ['backupId'] as const) {
     if (k in extra) {
       const v = extra[k];
       if (v !== null && (typeof v !== 'string' || !SAFE_ID.test(v))) {
         throw new Error(`invalid driver argument '${k}': must be an internally-derived identifier or null`);
       }
+    }
+  }
+  // previousLiveVersion: null o referencia completa de imagen AppForge.
+  if ('previousLiveVersion' in extra) {
+    const v = extra['previousLiveVersion'];
+    if (v !== null && (typeof v !== 'string' || !APPFORGE_IMAGE_REF_RE.test(v))) {
+      throw new Error(
+        `invalid driver argument 'previousLiveVersion': must be null or a full appforge image reference`,
+      );
     }
   }
   const allowed = new Set([

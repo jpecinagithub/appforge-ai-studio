@@ -74,6 +74,7 @@ import { listVerificationReceipts } from '../deploy/receipts.js';
 import { sanitizeSecrets } from '../secrets.js';
 import {
   assertDriverArgs,
+  APPFORGE_IMAGE_REF_RE,
   type DriverOpArgs,
   type DriverResult,
   type DeploymentDriver,
@@ -1780,7 +1781,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     // previousLiveVersion es la referencia completa de imagen (la fija 7B en project_runtime).
     const prevImage = args.previousLiveVersion ?? '';
-    if (!/^appforge\/app-[0-9a-f]{8}:dep-[0-9a-f]{8}-[0-9a-f]{12}$/.test(prevImage)) {
+    if (!APPFORGE_IMAGE_REF_RE.test(prevImage)) {
       return err('INVALID_PREVIOUS_IMAGE', 'previousLiveVersion must be a full appforge image reference');
     }
     try {
