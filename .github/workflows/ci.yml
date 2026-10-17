@@ -128,11 +128,33 @@ jobs:
         shell: bash
         run: |
           cp .env.example .env
-          {
-            echo "APPFORGE_ADMIN_TOKEN=$(openssl rand -hex 32)"
-            echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)"
-          } >> .env
+          token=$(openssl rand -hex 32)
+          gid=$(stat -c %g /var/run/docker.sock)
+          sed -i "s/^APPFORGE_ADMIN_TOKEN=.*/APPFORGE_ADMIN_TOKEN=$token/" .env
+          sed -i 's|^CORS_ORIGIN=.*|CORS_ORIGIN=http://127.0.0.1|' .env
+          sed -i 's/^APPFORGE_PRODUCTION=.*/APPFORGE_PRODUCTION=1/' .env
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$gid/" .env
+          sed -i 's/^GROQ_API_KEY=.*/GROQ_API_KEY=ci-placeholder-key-000000000000/' .env
           chmod 600 .env
+
+      - name: Run production preflight
+        shell: bash
+        run: |
+          bash -n infra/scripts/install.sh infra/scripts/preflight.sh
+          cp .env /tmp/appforge-insecure.env
+          chmod 644 /tmp/appforge-insecure.env
+          if bash infra/scripts/preflight.sh --env /tmp/appforge-insecure.env --compose infra/docker-compose.yml; then
+            echo "preflight accepted an insecure env mode" >&2
+            exit 1
+          fi
+          chmod 600 /tmp/appforge-insecure.env
+          printf '\nAPPFORGE_ADMIN_TOKEN=duplicate-must-fail\n' >> /tmp/appforge-insecure.env
+          if bash infra/scripts/preflight.sh --env /tmp/appforge-insecure.env --compose infra/docker-compose.yml; then
+            echo "preflight accepted a duplicate secret key" >&2
+            exit 1
+          fi
+          rm -f /tmp/appforge-insecure.env
+          bash infra/scripts/preflight.sh --env .env --compose infra/docker-compose.yml
 
       - name: Validate production compose
         run: docker compose --env-file .env -f infra/docker-compose.yml config --quiet

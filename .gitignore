@@ -4,6 +4,7 @@ data/
 *.db
 *.db-*
 .env
+.appforge-evidence/
 .env.local
 *.log
 .DS_Store

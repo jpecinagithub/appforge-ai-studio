@@ -97,3 +97,22 @@ describe('plantillas y compose: socket Docker limitado al orquestador', () => {
     expect(studio).toContain('/var/run/docker.sock:/var/run/docker.sock:rw');
   });
 });
+
+describe('instalación productiva 7C', () => {
+  const install = fs.readFileSync(path.join(REPO, 'infra', 'scripts', 'install.sh'), 'utf8');
+  const preflight = fs.readFileSync(path.join(REPO, 'infra', 'scripts', 'preflight.sh'), 'utf8');
+
+  test('usa el repositorio correcto y exige una revisión inmutable', () => {
+    expect(install).toContain('jpecinagithub/appforge-ai-studio.git');
+    expect(install).toContain('APPFORGE_REF');
+    expect(install).toContain('checkout --detach');
+    expect(install).not.toContain('git -C "$APP_DIR" pull');
+  });
+
+  test('protege el env y nunca lo carga como código shell', () => {
+    expect(install).toContain('chmod 600 "$env_file"');
+    expect(preflight).toContain("[ \"$mode\" = 600 ]");
+    expect(preflight).not.toMatch(/(?:^|\n)\s*(?:source|\.)\s+[^\n]*\.env/);
+    expect(preflight).not.toContain('cat "$ENV_FILE"');
+  });
+});

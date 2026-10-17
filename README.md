@@ -110,11 +110,19 @@ is untested until Oracle.
 
 ## Deploying the studio itself (Oracle Cloud)
 
+Production is installed from an exact tag or full commit. The installer creates
+the protected admin token, installs Docker/Compose, runs the fail-closed
+preflight, starts the hardened stack and waits for health. It does not print
+the supplied LLM key or generated token.
+
 ```bash
-bash infra/scripts/install.sh   # apt, Node 22, git, repo, .env (optional Caddy)
-# edit .env, then:
-cd infra && docker compose up -d --build
+export APPFORGE_REF=fase7c-stable            # use the released 7C tag
+export APPFORGE_PUBLIC_ORIGIN=http://203.0.113.10
+export GROQ_API_KEY='provided-out-of-band'   # or OPENROUTER_API_KEY
+bash infra/scripts/install.sh
 ```
 
-Caddy reverse-proxies `:80 → studio:3001`; uncomment the TLS block in
-`infra/Caddyfile` and set your domain for automatic HTTPS.
+For a domain already pointing at the VM, also set
+`APPFORGE_SITE_ADDRESS=appforge.example.com` and use the corresponding HTTPS
+origin. Caddy then manages TLS automatically. A domain is not required for the
+Oracle/IP certification.
