@@ -1005,6 +1005,27 @@ describe('B8: validación posterior completa vía docker inspect', () => {
     expect(r.code).toMatch(/CONTAINER_TMPFS_MISMATCH/);
   });
 
+  test('tmpfs solo en HostConfig.Tmpfs (otra versión de Docker) → ok', async () => {
+    const { r } = await startWith((insp) => {
+      // Algunas versiones de Docker no listan el tmpfs en Mounts.
+      insp.Mounts = (insp.Mounts as unknown[]).filter((m) => (m as { Destination: string }).Destination !== '/tmp');
+      (insp.HostConfig as Record<string, unknown>).Tmpfs = { '/tmp': 'rw,noexec,nosuid,size=64m' };
+    });
+    expect(r.ok).toBe(true);
+  });
+
+  test('mount no-tmpfs en /tmp aunque haya flag → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      insp.Mounts = [
+        (insp.Mounts as unknown[])[0], // /data intacto
+        { Type: 'volume', Name: 'sospechoso', Source: 'sospechoso', Destination: '/tmp' },
+      ];
+      (insp.HostConfig as Record<string, unknown>).Tmpfs = { '/tmp': 'rw,noexec,nosuid,size=64m' };
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_TMPFS_MISMATCH/);
+  });
+
   test('PidMode=host → rechazado', async () => {
     const { r } = await startWith((insp) => {
       (insp.HostConfig as Record<string, unknown>).PidMode = 'host';

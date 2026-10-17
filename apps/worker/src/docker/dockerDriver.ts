@@ -1095,14 +1095,22 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err('CONTAINER_STUDIO_VOLUME_MOUNT', `container '${name}' mounts the Studio data volume`);
       }
     }
-    const tmpfsMount = mounts.find((m) => m?.Destination === '/tmp');
-    if (!tmpfsMount || tmpfsMount.Type !== 'tmpfs') {
-      return err('CONTAINER_TMPFS_MISMATCH', `container '${name}' has no tmpfs at /tmp`);
-    }
     if (!Object.keys(info?.NetworkSettings?.Networks ?? {}).includes(this.config.network)) {
       return err('CONTAINER_NETWORK_MISMATCH', `container '${name}' is not on network '${this.config.network}'`);
     }
     const hc = info?.HostConfig ?? {};
+    // El tmpfs de `--tmpfs` puede aparecer en `Mounts` (Type=tmpfs) o solo
+    // en `HostConfig.Tmpfs` según la versión de Docker; se acepta cualquiera
+    // de las dos representaciones (ambas salen del flag --tmpfs auditado).
+    // Pero si hay un mount en /tmp, DEBE ser tmpfs (no un volumen encubierto).
+    const tmpfsMount = mounts.find((m) => m?.Destination === '/tmp');
+    const hasHostTmpfs = Object.prototype.hasOwnProperty.call(hc.Tmpfs ?? {}, '/tmp');
+    if (tmpfsMount !== undefined && tmpfsMount.Type !== 'tmpfs') {
+      return err('CONTAINER_TMPFS_MISMATCH', `container '${name}' has non-tmpfs mount at /tmp`);
+    }
+    if (tmpfsMount === undefined && !hasHostTmpfs) {
+      return err('CONTAINER_TMPFS_MISMATCH', `container '${name}' has no tmpfs at /tmp`);
+    }
     if (hc.Memory !== 512 * 1024 * 1024) return err('CONTAINER_LIMIT_MISMATCH', `memory is ${hc.Memory}`);
     if (hc.MemorySwap !== 512 * 1024 * 1024) {
       return err('CONTAINER_SWAP_MISMATCH', `memory-swap is ${hc.MemorySwap}, expected 512m (swap capped)`);
@@ -1541,6 +1549,38 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     return manifest;
   }
 
+  /** Extrae ficheros de un volumen al host usando un contenedor temporal. */
+  private async extractVolumeToHost(
+    image: string,
+    volume: string,
+    mountPoint: string,
+    files: Array<{ name: string }>,
+    destDir: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const tmp = `appforge-tmp-extract-${randomUUID().slice(0, 8)}`;
+    const cc = await this.sh(['create', '--name', tmp, '-v', `${volume}:${mountPoint}`, image], {
+      timeoutMs: 30_000,
+      signal,
+    });
+    if (cc.code !== 0) {
+      throw new DockerDriverError('RESTORE_EXTRACT_CREATE_FAILED', cc.stderr.slice(0, 300));
+    }
+    try {
+      for (const f of files) {
+        const cp = await this.sh(['cp', `${tmp}:${mountPoint}/${f.name}`, path.join(destDir, f.name)], {
+          timeoutMs: 120_000,
+          signal,
+        });
+        if (cp.code !== 0) {
+          throw new DockerDriverError('RESTORE_EXTRACT_CP_FAILED', `extract ${f.name}: ${cp.stderr.slice(0, 200)}`);
+        }
+      }
+    } finally {
+      await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+    }
+  }
+
   /** Copia ficheros del host a un volumen usando un contenedor temporal. */
   private async copyHostFilesToVolume(
     image: string,
@@ -1710,28 +1750,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           throw new DockerDriverError('RESTORE_VOLUME_CREATE_FAILED', vc.stderr.slice(0, 300));
         }
 
-        // ---- 5. staging -> live + verificación final en el live.
+        // ---- 5. staging -> live vía un temporal del host + verificación
+        // final en el live. (`docker cp` no soporta contenedor→contenedor.)
         if (manifest.hadDatabase) {
-          const tmp = `appforge-tmp-promote-${id8(deploymentId)}`;
-          const cc = await this.sh(
-            ['create', '--name', tmp, '-v', `${stagingVol}:/staging`, '-v', `${liveVolume}:/data`, names.image],
-            { timeoutMs: 30_000, signal: args.signal },
-          );
-          if (cc.code !== 0) {
-            throw new DockerDriverError('RESTORE_PROMOTE_CREATE_FAILED', cc.stderr.slice(0, 300));
-          }
+          const pdir = fs.mkdtempSync(path.join('/tmp', 'af-restore-promote-'));
           try {
-            for (const f of manifest.files) {
-              const cp = await this.sh(['cp', `${tmp}:/staging/${f.name}`, `${tmp}:/data/${f.name}`], {
-                timeoutMs: 120_000,
-                signal: args.signal,
-              });
-              if (cp.code !== 0) {
-                throw new DockerDriverError('RESTORE_PROMOTE_CP_FAILED', `promote ${f.name}: ${cp.stderr.slice(0, 200)}`);
-              }
-            }
+            await this.extractVolumeToHost(names.image, stagingVol, '/data', manifest.files, pdir, args.signal);
+            await this.copyHostFilesToVolume(names.image, liveVolume, manifest.files, pdir, args.signal);
           } finally {
-            await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+            fs.rmSync(pdir, { recursive: true, force: true });
           }
           await this.verifyVolumeFiles(names.image, liveVolume, manifest.files, true, args.signal);
         }

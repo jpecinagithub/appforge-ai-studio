@@ -280,7 +280,7 @@ d('docker integration (fase 7A)', () => {
     const to = setTimeout(() => ctl.abort(), haveImage ? 600_000 : 45_000);
     const r1 = await h.driver.buildCandidate({ ...h.args, signal: ctl.signal });
     clearTimeout(to);
-    expect(r1.code).not.toMatch(/RECEIPT_GATE_FAILED/);
+    expect(r1.code ?? '').not.toMatch(/RECEIPT_GATE_FAILED/);
     if (haveImage) okRes(r1);
     // Manipula las fuentes tras el gate: los receipts quedan stale y la
     // puerta persistida (Fase 6/7A) se cierra antes de tocar Docker.
@@ -352,18 +352,29 @@ d('docker integration (fase 7A)', () => {
   // D2 = despliegue v2 con migración rota. D3 = build abortado.
 
   let shared: Harness | null = null;
+  async function buildSharedHarness(): Promise<Harness> {
+    const h = await makeHarness();
+    const b = await h.driver.buildCandidate(h.args);
+    okRes(b);
+    snapshotFp(h);
+    builtImages.add(h.names.image);
+    return h;
+  }
   async function sharedHarness(): Promise<Harness> {
     if (!shared) {
-      const h = await makeHarness();
-      const b = await h.driver.buildCandidate(h.args);
-      okRes(b);
-      snapshotFp(h);
-      builtImages.add(h.names.image);
-      shared = h;
+      shared = await buildSharedHarness();
     } else {
-      // Revalidar idempotencia en cada uso.
+      // Revalidar idempotencia en cada uso. Si un test anterior mutó las
+      // fuentes (p. ej. 'migración rota', 'abort'), el snapshot del
+      // deployment compartido ya no corresponde a las fuentes verificadas
+      // (fail closed correcto: SNAPSHOT_SOURCE_MISMATCH) y se parte de un
+      // harness fresco en vez de reutilizar un deployment obsoleto.
       const b = await shared.driver.buildCandidate(shared.args);
-      okRes(b);
+      if (!b.ok && b.code === 'SNAPSHOT_SOURCE_MISMATCH') {
+        shared = await buildSharedHarness();
+      } else {
+        okRes(b);
+      }
     }
     return shared;
   }
