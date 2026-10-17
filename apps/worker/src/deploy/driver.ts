@@ -228,6 +228,16 @@ export interface FakeDriverOptions {
   /** backupId devuelto por createLiveBackup (derivado si se omite). */
   backupId?: string;
   /**
+   * Para tests (bloqueo 3, revisión Codex final): omite `backupId` en el
+   * resultado de createLiveBackup para simular un backup sin identificador.
+   */
+  omitBackupId?: boolean;
+  /**
+   * Para tests (bloqueo 3): valor de `backupValidated` en el resultado de
+   * createLiveBackup (defecto 'true'; 'false' simula backup no validado).
+   */
+  backupValidated?: string;
+  /**
    * Decisor dinámico por operación (p. ej. fallar runHealthCheck solo para
    * runtime='live'). Tiene prioridad sobre `behavior`.
    */
@@ -321,8 +331,8 @@ export class FakeDeploymentDriver implements DeploymentDriver {
         const data: Record<string, string> | undefined =
           op === 'createLiveBackup'
             ? {
-                backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}`,
-                backupValidated: 'true',
+                ...(this.opts.omitBackupId ? {} : { backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}` }),
+                backupValidated: this.opts.backupValidated ?? 'true',
               }
             : undefined;
         return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
