@@ -700,9 +700,14 @@ describe('no docker, shell or network (criterio 21)', () => {
     expect(FakeDeploymentDriver.name).toBe('FakeDeploymentDriver');
   });
 
-  it('does not export a DockerDeploymentDriver', async () => {
+  it('DockerDeploymentDriver existe (7A) pero es inerte sin kill switches', async () => {
+    // Fase 7A introduce el driver Docker, pero desactivado por defecto:
+    // sin el doble kill switch + red + volumen, el driver NO existe.
     const worker = await import('../index.js');
-    expect('DockerDeploymentDriver' in worker).toBe(false);
+    expect('DockerDeploymentDriver' in worker).toBe(true);
+    const { resolveDockerDriverConfig } = await import('../docker/dockerDriver.js');
+    expect(resolveDockerDriverConfig({}, '/data')).toBeNull();
+    expect(resolveDockerDriverConfig({ APPFORGE_DEPLOY_DRIVER: 'docker' }, '/data')).toBeNull();
     expect(worker.FakeDeploymentDriver).toBe(FakeDeploymentDriver);
   });
 
