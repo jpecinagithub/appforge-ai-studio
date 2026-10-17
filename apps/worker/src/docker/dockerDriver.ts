@@ -599,7 +599,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
     const names = resourceNames(projectId, deploymentId, fp);
     const labels: ManagedLabels = { projectId, deploymentId, role: 'live', fingerprint: fp };
-    const buildArgs = ['build', '-t', names.image, ...labelArgs(labels), '-f', 'Dockerfile', snapDir];
+    const buildArgs = ['build', '-t', names.image, ...labelArgs(labels), '-f', path.join(snapDir, 'Dockerfile'), snapDir];
     assertNoForbiddenFlags(buildArgs);
     const b = await this.sh(buildArgs, { timeoutMs: BUILD_TIMEOUT_MS, signal: args.signal, maxOutputBytes: 2_097_152 });
     if (b.aborted) {
