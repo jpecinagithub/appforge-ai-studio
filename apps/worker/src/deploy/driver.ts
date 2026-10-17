@@ -67,13 +67,34 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$/;
 /**
  * Valida que los argumentos sean identificadores seguros derivados
  * internamente. Rechaza comandos, rutas, espacios y cadenas vacías: el
- * driver nunca debe recibir entrada libre del modelo.
+ * driver nunca debe recibir entrada libre del modelo. Los campos opcionales
+ * (`previousLiveVersion`, `backupId`) admiten `null`; `runtime` solo
+ * admite 'verify'|'live'. Interfaz cerrada: claves desconocidas → error.
  */
 export function assertDriverArgs(args: DriverOpArgs): void {
-  for (const [k, v] of Object.entries(args)) {
+  const extra = args as Record<string, unknown>;
+  for (const k of ['deploymentId', 'projectId', 'candidateId'] as const) {
+    const v = extra[k];
     if (typeof v !== 'string' || !SAFE_ID.test(v)) {
       throw new Error(`invalid driver argument '${k}': must be an internally-derived identifier`);
     }
+  }
+  if ('runtime' in extra && extra.runtime !== 'verify' && extra.runtime !== 'live') {
+    throw new Error(`invalid driver argument 'runtime': must be 'verify' or 'live'`);
+  }
+  for (const k of ['previousLiveVersion', 'backupId'] as const) {
+    if (k in extra) {
+      const v = extra[k];
+      if (v !== null && (typeof v !== 'string' || !SAFE_ID.test(v))) {
+        throw new Error(`invalid driver argument '${k}': must be an internally-derived identifier or null`);
+      }
+    }
+  }
+  const allowed = new Set([
+    'deploymentId', 'projectId', 'candidateId', 'runtime', 'previousLiveVersion', 'backupId',
+  ]);
+  for (const k of Object.keys(extra)) {
+    if (!allowed.has(k)) throw new Error(`invalid driver argument '${k}': unknown argument`);
   }
 }
 
@@ -175,6 +196,13 @@ export interface FakeDriverOptions {
   gates?: Partial<Record<FakeOpName, () => Promise<void>>>;
   /** backupId devuelto por createLiveBackup (derivado si se omite). */
   backupId?: string;
+  /**
+   * Decisor dinámico por operación (p. ej. fallar runHealthCheck solo para
+   * runtime='live'). Tiene prioridad sobre `behavior`.
+   */
+  decide?: (op: FakeOpName, args: DriverOpArgs) => FakeOpBehavior | undefined;
+  /** Salida bruta por operación (para probar sanitizado y truncado). */
+  outputOverride?: Partial<Record<FakeOpName, string>>;
 }
 
 /**
@@ -197,8 +225,6 @@ export class FakeDeploymentDriver implements DeploymentDriver {
 
   private async run(op: FakeOpName, args: DriverOpArgs): Promise<DriverResult> {
     assertDriverArgs(args);
-    const gate = this.opts.gates?.[op];
-    if (gate) await gate();
     let observedStatus: string | null = null;
     if (this.opts.db) {
       try {
@@ -211,16 +237,20 @@ export class FakeDeploymentDriver implements DeploymentDriver {
       }
     }
     const call: FakeCall = { op, args: { ...args }, observedStatus, at: new Date().toISOString() };
+    // Se registra al invocar (antes de la compuerta): el orquestador ya
+    // llamó a la operación aunque esta espere.
     this.calls.push(call);
+    const gate = this.opts.gates?.[op];
+    if (gate) await gate();
     const hook = this.opts.hooks?.[op];
     if (hook) await hook(call);
     const delay = this.opts.delayMs?.[op] ?? 0;
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-    const behavior = this.opts.behavior?.[op] ?? 'success';
+    const behavior = this.opts.decide?.(op, args) ?? this.opts.behavior?.[op] ?? 'success';
     if (behavior === 'success') {
       const data: Record<string, string> | undefined =
         op === 'createLiveBackup' ? { backupId: this.opts.backupId ?? `backup-${args.deploymentId.slice(0, 8)}` } : undefined;
-      return { ok: true, code: `${op.toUpperCase()}_OK`, output: `fake ${op} ok`, data };
+      return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
     }
     const code =
       behavior === 'timeout'

@@ -393,13 +393,13 @@ export function transitionDeployment(
   if (!isDeploymentStatus(to)) {
     throw new DeploymentError('INVALID_STATE', `unknown deployment status '${to}'`);
   }
-  const apply = (): DeploymentRecord => {
+  const apply = (): { record: DeploymentRecord; repeated: boolean } => {
     const row = db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as
       | Record<string, any>
       | undefined;
     if (!row) throw new DeploymentError('DEPLOYMENT_NOT_FOUND', `deployment '${deploymentId}' not found`, 404);
     const current = rowToDeploymentRecord(row);
-    if (current.status === to) return current; // idempotente
+    if (current.status === to) return { record: current, repeated: true }; // idempotente: no-op total
     if (!TRANSITIONS[current.status].includes(to)) {
       throw new DeploymentError(
         'INVALID_TRANSITION',
@@ -412,18 +412,23 @@ export function transitionDeployment(
       `UPDATE deployments SET status=?, updated_at=?, finished_at=COALESCE(finished_at,?), error=?
        WHERE id=?`,
     ).run(to, now, terminal ? now : null, to === 'failed' ? (opts.error ?? current.error) : current.error, deploymentId);
-    return rowToDeploymentRecord(
-      db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as Record<string, any>,
-    );
+    return {
+      record: rowToDeploymentRecord(
+        db.prepare('SELECT * FROM deployments WHERE id=?').get(deploymentId) as Record<string, any>,
+      ),
+      repeated: false,
+    };
   };
-  const next = db.transaction(apply)();
-  recordEvent(db, deploymentId, {
-    phase: to,
-    event: 'transition',
-    status: to,
-    output: opts.diagnostic ?? null,
-    error: to === 'failed' ? (opts.error ?? null) : null,
-  });
+  const { record: next, repeated } = db.transaction(apply)();
+  if (!repeated) {
+    recordEvent(db, deploymentId, {
+      phase: to,
+      event: 'transition',
+      status: to,
+      output: opts.diagnostic ?? null,
+      error: to === 'failed' ? (opts.error ?? null) : null,
+    });
+  }
   return next;
 }
 
@@ -438,7 +443,7 @@ export function requestDeploymentCancel(db: Database.Database, deploymentId: str
   return getDeployment(db, deploymentId);
 }
 
-export function isCancelRequested(db: Database.Database, deploymentId: string): boolean {
+export function isDeploymentCancelRequested(db: Database.Database, deploymentId: string): boolean {
   const row = db.prepare('SELECT cancel_requested FROM deployments WHERE id=?').get(deploymentId) as
     | { cancel_requested: number }
     | undefined;

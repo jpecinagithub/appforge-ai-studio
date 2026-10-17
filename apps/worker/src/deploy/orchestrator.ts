@@ -43,7 +43,7 @@ import {
   createDeployment,
   getDeployment,
   getProjectRuntime,
-  isCancelRequested,
+  isDeploymentCancelRequested,
   recordEvent,
   setDeploymentBackup,
   setDeploymentCandidate,
@@ -52,6 +52,8 @@ import {
   upsertProjectRuntime,
   type DeploymentRecord,
 } from './stateMachine.js';
+
+export { DeploymentError };
 import { nowIso } from '../tools.js';
 import type {
   DeploymentDriver,
@@ -138,10 +140,6 @@ export async function runDeploymentPipeline(
   if (opts.target !== 'oracle') {
     throw new DeploymentError('INVALID_TARGET', `unsupported deploy target '${opts.target}' (only 'oracle' is supported)`, 400);
   }
-  const gate = opts.verificationGate?.();
-  if (gate && !gate.ok) {
-    throw new DeploymentError('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current', 409);
-  }
 
   let dep: DeploymentRecord;
   if (opts.deploymentId) {
@@ -151,7 +149,20 @@ export async function runDeploymentPipeline(
       throw new DeploymentError('DEPLOYMENT_NOT_FOUND', `deployment '${opts.deploymentId}' not found`, 404);
     }
     dep = existing;
+    // Re-chequeo defensivo (la ruta HTTP ya validó): un deployment
+    // pre-creado nunca debe quedar colgado en no terminal.
+    const gate = opts.verificationGate?.();
+    if (gate && !gate.ok) {
+      return transitionDeployment(db, dep.id, 'failed', {
+        diagnostic: gate.reason ?? '5A/5B verification checks are not current',
+        error: `VERIFICATION_GATE: ${gate.reason ?? '5A/5B verification checks are not current'}`,
+      });
+    }
   } else {
+    const gate = opts.verificationGate?.();
+    if (gate && !gate.ok) {
+      throw new DeploymentError('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current', 409);
+    }
     dep = createDeployment(db, { projectId: opts.projectId, target: opts.target });
   }
   const depId = dep.id;
@@ -200,13 +211,15 @@ export async function runDeploymentPipeline(
     }
   };
 
-  const finishFailed = (phase: string, error: string): DeploymentRecord =>
-    transitionDeployment(db, depId, 'failed', { diagnostic: `phase ${phase}: ${error}`.slice(0, 4000), error: error.slice(0, 4000) });
+  const finishFailed = (phase: string, error: string): DeploymentRecord => {
+    const full = `phase=${phase}: ${error}`;
+    return transitionDeployment(db, depId, 'failed', { diagnostic: full.slice(0, 4000), error: full.slice(0, 4000) });
+  };
 
   const finishCancelled = (phase: string, note: string): DeploymentRecord =>
     transitionDeployment(db, depId, 'cancelled', { diagnostic: `cancelled during ${phase}: ${note}`.slice(0, 2000) });
 
-  const cancelledNow = (): boolean => isCancelRequested(db, depId);
+  const cancelledNow = (): boolean => isDeploymentCancelRequested(db, depId);
 
   try {
     // ---- 1. pending → building -------------------------------------------

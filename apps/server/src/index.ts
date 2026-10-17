@@ -805,6 +805,12 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       reply.code(501);
       return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
     }
+    // Puerta de verificación: síncrona para responder 409 antes de crear nada.
+    const gate = persistedVerificationGate(db, id);
+    if (!gate.ok) {
+      reply.code(409);
+      return err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current');
+    }
     let dep: DeploymentRecord;
     try {
       dep = createDeployment(db, { projectId: id, target: body.target });
