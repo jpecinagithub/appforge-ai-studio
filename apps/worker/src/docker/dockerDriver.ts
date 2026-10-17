@@ -17,7 +17,7 @@
  *   tomará de `project_runtime.live_image`.
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
@@ -31,10 +31,15 @@ import {
   verifySnapshot,
   newBackupId,
   isValidBackupId,
+  APPFORGE_DOCKERIGNORE,
   SnapshotError,
 } from './snapshot.js';
+import { persistedDynamicGateStatus, checkScopeFingerprint } from '../dynamicTools.js';
 import {
   resourceNames,
+  projectLiveVolumeName,
+  liveVolumeLabelArgs,
+  assertLiveVolumeLabels,
   labelArgs,
   assertLabelsMatch,
   assertUuid,
@@ -47,6 +52,7 @@ import {
   LABEL_DEPLOYMENT,
   LABEL_ROLE,
   LABEL_FINGERPRINT,
+  LABEL_COMPONENT,
   ResourceError,
   type ManagedLabels,
   type ResourceRole,
@@ -61,8 +67,10 @@ import {
   enforceRetention,
   sha256File,
   BackupError,
+  type BackupManifest,
+  type BackupFileEntry,
 } from './sqliteBackup.js';
-import { sourceFingerprint } from '../fingerprint.js';
+import { listVerificationReceipts } from '../deploy/receipts.js';
 import { sanitizeSecrets } from '../secrets.js';
 import {
   assertDriverArgs,
@@ -99,6 +107,14 @@ export interface DockerDriverConfig {
   dockerBin: string;
   socketPath: string;
   minDockerVersion: string;
+  /**
+   * Raíz de plantillas confiables (p. ej. `<repo>/templates`). El Dockerfile
+   * usado en el build se compara byte a byte con
+   * `<templatesDir>/dynamic-react-node/Dockerfile`. Vacío o ausente → el
+   * build falla cerrado (nunca se confía en un Dockerfile del proyecto sin
+   * verificar).
+   */
+  templatesDir?: string;
 }
 
 /**
@@ -125,6 +141,7 @@ export function resolveDockerDriverConfig(
     dockerBin: 'docker',
     socketPath: '/var/run/docker.sock',
     minDockerVersion: '24.0.0',
+    templatesDir: (env.APPFORGE_TEMPLATES_DIR ?? '').trim(),
   };
 }
 
@@ -203,12 +220,32 @@ export async function preflightDocker(
   } catch {
     return fail('data dir not writable');
   }
-  // Red interna: verificar o crear (internal=true, etiquetada).
+  // Red interna: si ya existe, inspeccionar y exigir propiedad EXACTA
+  // (managed + componente + interna). Ante colisión o labels ajenas →
+  // fallar SIN modificar el recurso (revisión Codex, Fase 7A).
   const netInspect = await runner.run({
     args: ['network', 'inspect', config.network],
     timeoutMs: 15_000,
   });
-  if (netInspect.code !== 0) {
+  if (netInspect.code === 0) {
+    let net: { Internal?: boolean; Labels?: Record<string, string> };
+    try {
+      const arr = JSON.parse(netInspect.stdout) as unknown[];
+      net = (Array.isArray(arr) && arr.length > 0 ? arr[0] : {}) as typeof net;
+    } catch {
+      return fail(`cannot parse inspect of existing network '${config.network}'`);
+    }
+    const labels = net.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true' || labels[LABEL_COMPONENT] !== 'network') {
+      return fail(
+        `network '${config.network}' exists with foreign/missing labels; refusing to adopt or modify it`,
+      );
+    }
+    if (net.Internal !== true) {
+      return fail(`network '${config.network}' exists but is not internal; refusing to use it`);
+    }
+    diagnostics.push(`using existing internal network '${config.network}'`);
+  } else {
     const created = await runner.run({
       args: [
         'network',
@@ -217,7 +254,7 @@ export async function preflightDocker(
         '--label',
         `${MANAGED_LABEL}=true`,
         '--label',
-        'com.appforge.component=network',
+        `${LABEL_COMPONENT}=network`,
         config.network,
       ],
       timeoutMs: 30_000,
@@ -227,14 +264,37 @@ export async function preflightDocker(
     }
     diagnostics.push(`created internal network '${config.network}'`);
   }
-  // Volumen de datos del Studio: verificar o crear.
+  // Volumen de datos del Studio: igual exigencia de propiedad exacta.
   const volInspect = await runner.run({
     args: ['volume', 'inspect', config.dataVolume],
     timeoutMs: 15_000,
   });
-  if (volInspect.code !== 0) {
+  if (volInspect.code === 0) {
+    let vol: { Labels?: Record<string, string> };
+    try {
+      const arr = JSON.parse(volInspect.stdout) as unknown[];
+      vol = (Array.isArray(arr) && arr.length > 0 ? arr[0] : {}) as typeof vol;
+    } catch {
+      return fail(`cannot parse inspect of existing volume '${config.dataVolume}'`);
+    }
+    const labels = vol.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true' || labels[LABEL_COMPONENT] !== 'studio-data') {
+      return fail(
+        `data volume '${config.dataVolume}' exists with foreign/missing labels; refusing to adopt or modify it`,
+      );
+    }
+    diagnostics.push(`using existing data volume '${config.dataVolume}'`);
+  } else {
     const created = await runner.run({
-      args: ['volume', 'create', '--label', `${MANAGED_LABEL}=true`, config.dataVolume],
+      args: [
+        'volume',
+        'create',
+        '--label',
+        `${MANAGED_LABEL}=true`,
+        '--label',
+        `${LABEL_COMPONENT}=studio-data`,
+        config.dataVolume,
+      ],
       timeoutMs: 30_000,
     });
     if (created.code !== 0) {
@@ -252,8 +312,12 @@ export async function preflightDocker(
 
 export interface DockerDriverOptions {
   runner?: DockerCommandRunner;
-  /** Opcional: para vincular receipts→snapshot y persistir el fingerprint. */
-  db?: Database.Database;
+  /**
+   * Obligatoria (revisión Codex, Fase 7A): el driver real exige acceso a
+   * los seis receipts canónicos de `verification_receipts`. Sin DB, el
+   * constructor lanza `RECEIPT_DB_REQUIRED` (fail closed).
+   */
+  db: Database.Database;
 }
 
 const BUILD_TIMEOUT_MS = 600_000;
@@ -274,11 +338,23 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   readonly name = 'docker';
   private readonly runner: DockerCommandRunner;
   private readonly config: DockerDriverConfig;
-  private readonly db?: Database.Database;
+  /**
+   * Revisión Codex (Fase 7A): el driver real EXIGE la DB. Sin acceso a los
+   * seis receipts canónicos de `verification_receipts`, la puerta de
+   * verificación no puede abrirse y el driver ni siquiera se construye
+   * (fail closed en el constructor, nunca puerta desactivada en silencio).
+   */
+  private readonly db: Database.Database;
 
-  constructor(config: DockerDriverConfig, opts: DockerDriverOptions = {}) {
+  constructor(config: DockerDriverConfig, opts: DockerDriverOptions = {} as DockerDriverOptions) {
     this.config = config;
     this.runner = opts.runner ?? new DockerCommandRunner({ dockerBin: config.dockerBin });
+    if (!opts.db) {
+      throw new DockerDriverError(
+        'RECEIPT_DB_REQUIRED',
+        'DockerDeploymentDriver requires a database handle for the six verification receipts (fail closed)',
+      );
+    }
     this.db = opts.db;
   }
 
@@ -403,12 +479,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     return { status: res.status, json, setCookies };
   }
 
-  /** Columnas aditivas del snapshot en deployments (idempotente). */
+  /**
+   * Columnas aditivas del snapshot en deployments (idempotente). Revisión
+   * Codex (Fase 7A): se persisten POR SEPARADO el fingerprint de fuentes
+   * verificado por la puerta (`verified_source_fingerprint`) y el
+   * fingerprint del contenido del snapshot (`snapshot_fingerprint`).
+   */
   private ensureSnapshotColumns(): void {
-    if (!this.db) return;
     for (const ddl of [
       'ALTER TABLE deployments ADD COLUMN snapshot_fingerprint TEXT',
       'ALTER TABLE deployments ADD COLUMN snapshot_path TEXT',
+      'ALTER TABLE deployments ADD COLUMN verified_source_fingerprint TEXT',
     ]) {
       try {
         this.db.exec(ddl);
@@ -418,28 +499,77 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
-  private persistSnapshot(deploymentId: string, fingerprint: string, snapshotPath: string): void {
-    if (!this.db) return;
+  private persistSnapshot(
+    deploymentId: string,
+    verifiedSourceFingerprint: string,
+    snapshotFingerprint: string,
+    snapshotPath: string,
+  ): void {
     this.ensureSnapshotColumns();
     this.db
-      .prepare('UPDATE deployments SET snapshot_fingerprint=?, snapshot_path=? WHERE id=?')
-      .run(fingerprint, snapshotPath, deploymentId);
+      .prepare(
+        'UPDATE deployments SET verified_source_fingerprint=?, snapshot_fingerprint=?, snapshot_path=? WHERE id=?',
+      )
+      .run(verifiedSourceFingerprint, snapshotFingerprint, snapshotPath, deploymentId);
   }
 
-  /** Fingerprint de los receipts vigentes (o null si no hay). */
-  private receiptsFingerprint(projectId: string): string | null {
-    if (!this.db) return null;
+  /** Registro persistido del snapshot para verificar reutilizaciones. */
+  private readPersistedSnapshot(deploymentId: string): {
+    verifiedSourceFingerprint: string | null;
+    snapshotFingerprint: string | null;
+    snapshotPath: string | null;
+  } | null {
+    this.ensureSnapshotColumns();
     try {
-      const rows = this.db
-        .prepare('SELECT fingerprint FROM verification_receipts WHERE project_id=?')
-        .all(projectId) as Array<{ fingerprint: string }>;
-      if (rows.length === 0) return null;
-      const fps = new Set(rows.map((r) => r.fingerprint));
-      if (fps.size !== 1) return null;
-      return [...fps][0];
+      const row = this.db
+        .prepare(
+          'SELECT verified_source_fingerprint, snapshot_fingerprint, snapshot_path FROM deployments WHERE id=?',
+        )
+        .get(deploymentId) as
+        | { verified_source_fingerprint: string | null; snapshot_fingerprint: string | null; snapshot_path: string | null }
+        | undefined;
+      if (!row) return null;
+      return {
+        verifiedSourceFingerprint: row.verified_source_fingerprint,
+        snapshotFingerprint: row.snapshot_fingerprint,
+        snapshotPath: row.snapshot_path,
+      };
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Puerta de receipts REAL (revisión Codex, Fase 7A): exige los SEIS
+   * receipts canónicos de `verification_receipts`, en orden canónico y
+   * vigentes sobre las fuentes actuales (delegado en
+   * `persistedDynamicGateStatus`, la misma puerta autoritativa de la ruta
+   * HTTP). Fail closed: ausencia de receipts, orden incorrecto,
+   * fingerprints distintos, scopes no vigentes o error de lectura NUNCA
+   * desactivan la puerta; siempre lanzan `DockerDriverError`.
+   *
+   * Devuelve el fingerprint raíz (`authenticatedFlow`, scope = proyecto
+   * completo) para ligar el snapshot a las fuentes verificadas.
+   */
+  private verifyReceiptGate(projectId: string, projectDir: string): { rootFingerprint: string } {
+    let gate: { ok: boolean; reason?: string };
+    try {
+      gate = persistedDynamicGateStatus(this.db, projectDir, projectId);
+    } catch (e) {
+      throw new DockerDriverError(
+        'RECEIPT_GATE_ERROR',
+        `cannot read verification receipts (fail closed): ${(e as Error).message}`,
+      );
+    }
+    if (!gate.ok) {
+      throw new DockerDriverError('RECEIPT_GATE_FAILED', gate.reason ?? 'verification receipts gate failed');
+    }
+    const receipts = listVerificationReceipts(this.db, projectId);
+    const root = receipts.find((r) => r.checkKey === 'authenticatedFlow');
+    if (!root || typeof root.fingerprint !== 'string' || root.fingerprint.length === 0) {
+      throw new DockerDriverError('RECEIPT_GATE_FAILED', 'authenticatedFlow root receipt missing after gate check');
+    }
+    return { rootFingerprint: root.fingerprint };
   }
 
   // -- operaciones --------------------------------------------------------
@@ -544,23 +674,39 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
         return err('PROJECT_NOT_FOUND', `project dir not found for ${projectId}`);
       }
-      // §6.6: el fingerprint de los receipts debe coincidir con el proyecto.
-      const receiptFp = this.receiptsFingerprint(projectId);
-      if (receiptFp && sourceFingerprint(projectDir) !== receiptFp) {
+      // Puerta autoritativa (revisión Codex, Fase 7A): seis receipts reales
+      // de `verification_receipts`, en orden canónico y vigentes sobre las
+      // fuentes actuales. Fail closed: nunca se abre por defecto.
+      let gate: { rootFingerprint: string };
+      try {
+        gate = this.verifyReceiptGate(projectId, projectDir);
+      } catch (e) {
+        if (e instanceof DockerDriverError) return err(e.code, e.message);
+        return err('RECEIPT_GATE_ERROR', (e as Error).message);
+      }
+      // Fingerprint raíz (receipt `authenticatedFlow`, scope = proyecto
+      // completo) ANTES de crear el snapshot.
+      const rootFpBefore = checkScopeFingerprint(projectDir, 'authenticatedFlow');
+      if (rootFpBefore === null || rootFpBefore !== gate.rootFingerprint) {
         return err('RECEIPT_FINGERPRINT_MISMATCH', 'project sources changed after the verification gate');
       }
       // Idempotencia antes de tocar el snapshot.
       const manifestPath = path.join(this.snapshotDir(deploymentId), '.appforge-manifest.json');
       if (fs.existsSync(manifestPath)) {
-        // El snapshot ya existe: re-verificar (lanza si fue manipulado).
-        const fp = verifySnapshot(this.snapshotDir(deploymentId));
-        const reused = await this.reuseBuiltImage(projectId, deploymentId, fp);
-        if (reused) return reused;
-        // Snapshot verificado pero imagen ausente: reconstruir desde él.
-        return await this.buildFromSnapshot(args, this.snapshotDir(deploymentId), fp);
+        return await this.reuseSnapshot(args, gate.rootFingerprint);
       }
       const snap = createSnapshot({ projectDir, snapshotsRoot: this.snapshotsRoot(), deploymentId });
-      this.persistSnapshot(deploymentId, snap.fingerprint, snap.dir);
+      // Las fuentes no pueden haber mutado durante la copia del snapshot;
+      // si lo hicieron, el snapshot se descarta (fail closed).
+      const rootFpAfter = checkScopeFingerprint(projectDir, 'authenticatedFlow');
+      if (rootFpAfter === null || rootFpAfter !== rootFpBefore) {
+        fs.rmSync(snap.dir, { recursive: true, force: true });
+        return err(
+          'SOURCE_MUTATED_DURING_SNAPSHOT',
+          'project sources changed while creating the snapshot; snapshot discarded',
+        );
+      }
+      this.persistSnapshot(deploymentId, rootFpBefore, snap.fingerprint, snap.dir);
       // Re-verificación TOCTOU inmediatamente antes del build.
       if (verifySnapshot(snap.dir) !== snap.fingerprint) {
         return err('SNAPSHOT_TAMPERED', 'snapshot changed between creation and build');
@@ -571,6 +717,53 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('BUILD_ERROR', (e as Error).message);
     }
+  }
+
+  /**
+   * Reutilización de snapshot (revisión Codex, Fase 7A): el manifiesto es
+   * editable y NO basta. Se comprueba contra SQLite la ruta registrada, el
+   * fingerprint del snapshot y el fingerprint de fuentes verificado, y se
+   * re-hasea el contenido real con `verifySnapshot`.
+   */
+  private async reuseSnapshot(args: DriverOpArgs, rootFingerprint: string): Promise<DriverResult> {
+    const { deploymentId, projectId } = args;
+    const dir = this.snapshotDir(deploymentId);
+    const rec = this.readPersistedSnapshot(deploymentId);
+    if (!rec || !rec.snapshotFingerprint || !rec.snapshotPath) {
+      return err(
+        'SNAPSHOT_DB_MISMATCH',
+        'no persisted snapshot record for this deployment; refusing to reuse an unverified snapshot',
+      );
+    }
+    if (path.resolve(rec.snapshotPath) !== path.resolve(dir)) {
+      return err('SNAPSHOT_DB_MISMATCH', 'snapshot path does not match the persisted record');
+    }
+    let fp: string;
+    try {
+      fp = verifySnapshot(dir);
+    } catch (e) {
+      if (e instanceof SnapshotError) return err('SNAPSHOT_FAILED', `${e.code}: ${(e as Error).message}`);
+      throw e;
+    }
+    if (fp !== rec.snapshotFingerprint) {
+      return err('SNAPSHOT_DB_MISMATCH', 'snapshot content fingerprint does not match the persisted record');
+    }
+    if (rec.verifiedSourceFingerprint && rec.verifiedSourceFingerprint !== rootFingerprint) {
+      return err('SNAPSHOT_SOURCE_MISMATCH', 'snapshot was built from different verified sources');
+    }
+    // El Dockerfile confiable y el .dockerignore controlado también se
+    // verifican al reutilizar (no solo al construir): el manifiesto no los
+    // hasea y son editables en disco.
+    try {
+      this.assertTrustedDockerfile(dir);
+    } catch (e) {
+      if (e instanceof DockerDriverError) return err(e.code, e.message);
+      return err('DOCKERFILE_VERIFY_ERROR', (e as Error).message);
+    }
+    const reused = await this.reuseBuiltImage(projectId, deploymentId, fp);
+    if (reused) return reused;
+    // Snapshot verificado pero imagen ausente: reconstruir desde él.
+    return await this.buildFromSnapshot(args, dir, fp);
   }
 
   /**
@@ -591,6 +784,68 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     return null;
   }
 
+  /**
+   * Dockerfile confiable (revisión Codex, Fase 7A): el proyecto NUNCA puede
+   * aportar un Dockerfile arbitrario. El usado en el build debe ser byte a
+   * byte idéntico al de la plantilla confiable
+   * `<templatesDir>/dynamic-react-node/Dockerfile`. Sin templatesDir o sin
+   * plantilla legible → fail closed.
+   */
+  private trustedDockerfileBytes(): Buffer {
+    const tdir = (this.config.templatesDir ?? '').trim();
+    if (!tdir) {
+      throw new DockerDriverError(
+        'TEMPLATES_DIR_REQUIRED',
+        'cannot verify the Dockerfile without a trusted templates dir (fail closed)',
+      );
+    }
+    const p = path.join(tdir, 'dynamic-react-node', 'Dockerfile');
+    try {
+      const st = fs.statSync(p);
+      if (!st.isFile()) throw new Error('not a file');
+      return fs.readFileSync(p);
+    } catch {
+      throw new DockerDriverError(
+        'TRUSTED_DOCKERFILE_MISSING',
+        `trusted template Dockerfile not readable: ${p}`,
+      );
+    }
+  }
+
+  /** Compara byte a byte el Dockerfile del snapshot con el de la plantilla. */
+  private assertTrustedDockerfile(snapDir: string): void {
+    const dockerfile = path.join(snapDir, 'Dockerfile');
+    let actual: Buffer;
+    try {
+      const st = fs.statSync(dockerfile);
+      if (!st.isFile()) throw new Error('not a file');
+      actual = fs.readFileSync(dockerfile);
+    } catch {
+      throw new DockerDriverError('DOCKERFILE_MISSING', 'controlled Dockerfile not found in snapshot');
+    }
+    const trusted = this.trustedDockerfileBytes();
+    if (actual.length !== trusted.length || !timingSafeEqual(actual, trusted)) {
+      throw new DockerDriverError(
+        'DOCKERFILE_UNTRUSTED',
+        'snapshot Dockerfile differs from the trusted template (byte comparison); refusing to build',
+      );
+    }
+    // El .dockerignore controlado también forma parte de la integridad.
+    const diPath = path.join(snapDir, '.dockerignore');
+    let diActual: string;
+    try {
+      diActual = fs.readFileSync(diPath, 'utf8');
+    } catch {
+      throw new DockerDriverError('DOCKERIGNORE_MISSING', 'controlled .dockerignore not found in snapshot');
+    }
+    if (diActual !== APPFORGE_DOCKERIGNORE) {
+      throw new DockerDriverError(
+        'DOCKERIGNORE_UNTRUSTED',
+        'snapshot .dockerignore differs from the AppForge-controlled content; refusing to build',
+      );
+    }
+  }
+
   /** Construye la imagen desde un snapshot ya verificado. */
   private async buildFromSnapshot(
     args: DriverOpArgs,
@@ -598,9 +853,11 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     fp: string,
   ): Promise<DriverResult> {
     const { deploymentId, projectId } = args;
-    const dockerfile = path.join(snapDir, 'Dockerfile');
-    if (!fs.existsSync(dockerfile) || !fs.statSync(dockerfile).isFile()) {
-      return err('DOCKERFILE_MISSING', 'controlled Dockerfile not found in snapshot');
+    try {
+      this.assertTrustedDockerfile(snapDir);
+    } catch (e) {
+      if (e instanceof DockerDriverError) return err(e.code, e.message);
+      return err('DOCKERFILE_VERIFY_ERROR', (e as Error).message);
     }
     const names = resourceNames(projectId, deploymentId, fp);
     const labels: ManagedLabels = { projectId, deploymentId, role: 'live', fingerprint: fp };
@@ -727,27 +984,27 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
-  /** Crea el volumen live con labels si falta (sin él, `docker run -v` lo
-   * autocrearía SIN labels y quedaría fuera del inventario managed). */
-  private async ensureLiveVolume(
-    projectId: string,
-    deploymentId: string,
-    signal?: AbortSignal,
-  ): Promise<DriverResult | null> {
-    const names = this.names(projectId, deploymentId);
-    const labels = this.opLabels(projectId, deploymentId, 'live');
-    if (await resourceExists(this.runner, 'volume', names.liveVolume)) {
-      const info = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+  /**
+   * Crea el volumen live con labels ESTABLES por proyecto (revisión Codex,
+   * Fase 7A): managed + project-id + rol live. Sin deployment-id ni
+   * fingerprint: dos despliegues consecutivos comparten el volumen y los
+   * datos. Sin él, `docker run -v` lo autocrearía SIN labels y quedaría
+   * fuera del inventario managed.
+   */
+  private async ensureLiveVolume(projectId: string, signal?: AbortSignal): Promise<DriverResult | null> {
+    const liveVolume = projectLiveVolumeName(projectId);
+    if (await resourceExists(this.runner, 'volume', liveVolume)) {
+      const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
         Labels?: Record<string, string>;
       };
       try {
-        assertLabelsMatch(info?.Labels, labels);
+        assertLiveVolumeLabels(info?.Labels, projectId);
       } catch {
-        return err('FOREIGN_RESOURCE', `refusing to use volume '${names.liveVolume}' with non-matching labels`);
+        return err('FOREIGN_RESOURCE', `refusing to use live volume '${liveVolume}' with non-matching labels`);
       }
       return null;
     }
-    const c = await this.sh(['volume', 'create', ...labelArgs(labels), names.liveVolume], {
+    const c = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
       timeoutMs: 30_000,
       signal,
     });
@@ -760,7 +1017,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     try {
       const names = this.names(args.projectId, args.deploymentId);
-      const v = await this.ensureLiveVolume(args.projectId, args.deploymentId, args.signal);
+      const v = await this.ensureLiveVolume(args.projectId, args.signal);
       if (v) return v;
       return await this.runMigrations(args, names.liveVolume, 'migration', MIGRATION_TIMEOUT_MS);
     } catch (e) {
@@ -777,18 +1034,25 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     expectRestart: 'unless-stopped' | 'no',
   ): Promise<DriverResult> {
     const info = (await inspectResource(this.runner, 'container', name)) as {
-      Config?: { Labels?: Record<string, string>; User?: string };
+      Config?: { Labels?: Record<string, string>; User?: string; Image?: string };
       State?: { Running?: boolean };
-      Mounts?: Array<{ Name?: string; Destination?: string }>;
+      Mounts?: Array<{ Type?: string; Name?: string; Source?: string; Destination?: string }>;
       NetworkSettings?: { Networks?: Record<string, unknown>; Ports?: Record<string, unknown[]> };
       HostConfig?: {
         Memory?: number;
+        MemorySwap?: number;
         NanoCpus?: number;
         PidsLimit?: number;
         CapDrop?: string[];
         SecurityOpt?: string[];
         ReadonlyRootfs?: boolean;
         RestartPolicy?: { Name?: string };
+        Privileged?: boolean;
+        Devices?: unknown[];
+        PidMode?: string;
+        IpcMode?: string;
+        NetworkMode?: string;
+        Tmpfs?: Record<string, string>;
       };
     };
     try {
@@ -797,15 +1061,52 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return err('CONTAINER_LABEL_MISMATCH', `container '${name}' labels do not match`);
     }
     if (info?.State?.Running !== true) return err('CONTAINER_NOT_RUNNING', `container '${name}' is not running`);
+    // Arquitectura y SO de la imagen (revisión Codex, Fase 7A).
+    const imageName = String(info?.Config?.Image ?? '');
+    if (!imageName) return err('CONTAINER_IMAGE_UNKNOWN', `container '${name}' has no image reference`);
+    let imgInfo: { Os?: string; Architecture?: string };
+    try {
+      imgInfo = (await inspectResource(this.runner, 'image', imageName)) as typeof imgInfo;
+    } catch {
+      return err('IMAGE_INSPECT_FAILED', `cannot inspect image '${imageName}'`);
+    }
+    if (String(imgInfo?.Os ?? '').toLowerCase() !== 'linux') {
+      return err('IMAGE_OS_MISMATCH', `image OS is '${imgInfo?.Os}', expected linux`);
+    }
+    const arch = String(imgInfo?.Architecture ?? '').toLowerCase();
+    if (arch !== 'amd64' && arch !== 'arm64') {
+      return err('IMAGE_ARCH_MISMATCH', `image architecture '${arch}' is not supported (amd64/arm64)`);
+    }
     const mounts = info?.Mounts ?? [];
     if (!mounts.some((m) => m?.Name === volume && m?.Destination === '/data')) {
       return err('CONTAINER_MOUNT_MISMATCH', `container '${name}' does not mount '${volume}' at /data`);
+    }
+    // Mounts exactos: solo /data (volumen propio) y /tmp (tmpfs). Nada más.
+    for (const m of mounts) {
+      const dest = String(m?.Destination ?? '');
+      if (dest !== '/data' && dest !== '/tmp') {
+        return err('CONTAINER_MOUNT_UNEXPECTED', `container '${name}' has unexpected mount at '${dest}'`);
+      }
+      const src = String(m?.Source ?? m?.Name ?? '');
+      if (src.includes('docker.sock')) {
+        return err('CONTAINER_SOCKET_MOUNT', `container '${name}' mounts the docker socket`);
+      }
+      if (src === this.config.dataVolume) {
+        return err('CONTAINER_STUDIO_VOLUME_MOUNT', `container '${name}' mounts the Studio data volume`);
+      }
+    }
+    const tmpfsMount = mounts.find((m) => m?.Destination === '/tmp');
+    if (!tmpfsMount || tmpfsMount.Type !== 'tmpfs') {
+      return err('CONTAINER_TMPFS_MISMATCH', `container '${name}' has no tmpfs at /tmp`);
     }
     if (!Object.keys(info?.NetworkSettings?.Networks ?? {}).includes(this.config.network)) {
       return err('CONTAINER_NETWORK_MISMATCH', `container '${name}' is not on network '${this.config.network}'`);
     }
     const hc = info?.HostConfig ?? {};
     if (hc.Memory !== 512 * 1024 * 1024) return err('CONTAINER_LIMIT_MISMATCH', `memory is ${hc.Memory}`);
+    if (hc.MemorySwap !== 512 * 1024 * 1024) {
+      return err('CONTAINER_SWAP_MISMATCH', `memory-swap is ${hc.MemorySwap}, expected 512m (swap capped)`);
+    }
     if (hc.NanoCpus !== 1_000_000_000) return err('CONTAINER_LIMIT_MISMATCH', `cpus is ${hc.NanoCpus}`);
     if (hc.PidsLimit !== 128) return err('CONTAINER_LIMIT_MISMATCH', `pids-limit is ${hc.PidsLimit}`);
     if (!Array.isArray(hc.CapDrop) || !hc.CapDrop.includes('ALL')) return err('CONTAINER_CAP_MISMATCH', 'cap-drop ALL missing');
@@ -813,6 +1114,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return err('CONTAINER_SECOPT_MISMATCH', 'no-new-privileges missing');
     }
     if (hc.ReadonlyRootfs !== true) return err('CONTAINER_READONLY_MISMATCH', 'read-only rootfs not set');
+    if (hc.Privileged === true) return err('CONTAINER_PRIVILEGED', `container '${name}' is privileged`);
+    if (Array.isArray(hc.Devices) && hc.Devices.length > 0) {
+      return err('CONTAINER_DEVICES', `container '${name}' has host devices`);
+    }
+    if (hc.PidMode === 'host') return err('CONTAINER_PID_HOST', `container '${name}' uses host PID namespace`);
+    if (hc.IpcMode === 'host') return err('CONTAINER_IPC_HOST', `container '${name}' uses host IPC namespace`);
+    if (hc.NetworkMode !== this.config.network) {
+      return err('CONTAINER_NETWORKMODE_MISMATCH', `network mode is '${hc.NetworkMode}', expected '${this.config.network}'`);
+    }
     if (hc.RestartPolicy?.Name !== expectRestart) {
       return err('CONTAINER_RESTART_MISMATCH', `restart policy is '${hc.RestartPolicy?.Name}'`);
     }
@@ -820,9 +1130,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (Object.values(ports).some((b) => Array.isArray(b) && b.length > 0)) {
       return err('CONTAINER_PORTS_PUBLISHED', `container '${name}' publishes host ports`);
     }
-    const user = String(info?.Config?.User ?? '');
-    if (!user || user === '0' || user.toLowerCase() === 'root') {
-      return err('CONTAINER_ROOT_USER', `container '${name}' runs as root`);
+    // Usuario exacto 1001 (el endurecimiento lo fija con --user 1001).
+    if (String(info?.Config?.User ?? '') !== '1001') {
+      return err('CONTAINER_USER_MISMATCH', `container '${name}' user is '${info?.Config?.User}', expected '1001'`);
     }
     return ok();
   }
@@ -1121,7 +1431,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     try {
       const names = this.names(args.projectId, args.deploymentId);
       const labels = this.opLabels(args.projectId, args.deploymentId, 'live');
-      const v = await this.ensureLiveVolume(args.projectId, args.deploymentId, args.signal);
+      const v = await this.ensureLiveVolume(args.projectId, args.signal);
       if (v) return v;
       if (await resourceExists(this.runner, 'container', names.liveContainer)) {
         await this.assertLiveSlot(args.projectId, names.liveContainer);
@@ -1157,6 +1467,166 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
+  /**
+   * Valida ÍNTEGRAMENTE un backup antes de detener/eliminar nada (revisión
+   * Codex, Fase 7A): manifiesto, projectId, backupId, nombres permitidos,
+   * unicidad, tamaños, SHA-256 de cada fichero en disco y
+   * `PRAGMA quick_check`. Un backup corrupto se rechaza aquí, con el live
+   * intacto. Lanza `DockerDriverError` ante cualquier problema.
+   */
+  private validateBackupForRestore(projectId: string, backupId: string): BackupManifest {
+    const bdir = backupDirFor(this.config.dataDir, projectId, backupId);
+    let manifest: BackupManifest;
+    try {
+      manifest = readBackupManifest(bdir);
+    } catch (e) {
+      throw new DockerDriverError(
+        'BACKUP_MANIFEST_INVALID',
+        `cannot read backup manifest: ${(e as Error).message}`,
+      );
+    }
+    if (manifest.projectId !== projectId) {
+      throw new DockerDriverError('BACKUP_PROJECT_MISMATCH', 'backup manifest projectId does not match');
+    }
+    if (manifest.backupId !== backupId) {
+      throw new DockerDriverError('BACKUP_ID_MISMATCH', 'backup manifest backupId does not match');
+    }
+    if (typeof manifest.deploymentId !== 'string' || !/^[0-9a-f-]{36}$/i.test(manifest.deploymentId)) {
+      throw new DockerDriverError('BACKUP_MANIFEST_INVALID', 'backup manifest deploymentId is invalid');
+    }
+    const allowed = new Set(['app.db', 'app.db-wal']);
+    const seen = new Set<string>();
+    for (const f of manifest.files) {
+      if (!allowed.has(f.name)) {
+        throw new DockerDriverError('BACKUP_FILE_FORBIDDEN', `backup manifest lists forbidden file: ${f.name}`);
+      }
+      if (seen.has(f.name)) {
+        throw new DockerDriverError('BACKUP_FILE_DUPLICATE', `backup manifest lists duplicate file: ${f.name}`);
+      }
+      seen.add(f.name);
+      if (!Number.isInteger(f.size) || f.size <= 0 || f.size > 10 * 1024 * 1024 * 1024) {
+        throw new DockerDriverError('BACKUP_FILE_SIZE_INVALID', `backup file ${f.name} has invalid size`);
+      }
+      if (!/^[0-9a-f]{64}$/i.test(f.sha256)) {
+        throw new DockerDriverError('BACKUP_FILE_HASH_INVALID', `backup file ${f.name} has invalid sha256`);
+      }
+      const abs = path.join(bdir, f.name);
+      try {
+        const st = fs.statSync(abs);
+        if (!st.isFile()) throw new Error('not a file');
+      } catch {
+        throw new DockerDriverError('BACKUP_FILE_MISSING', `backup file missing on disk: ${f.name}`);
+      }
+      const got = sha256File(abs);
+      if (got.size !== f.size || got.sha256.toLowerCase() !== f.sha256.toLowerCase()) {
+        throw new DockerDriverError(
+          'BACKUP_FILE_CORRUPT',
+          `backup file ${f.name} checksum mismatch: refusing to restore a corrupt backup`,
+        );
+      }
+    }
+    if (manifest.hadDatabase) {
+      if (!seen.has('app.db')) {
+        throw new DockerDriverError('BACKUP_MANIFEST_INVALID', 'backup claims hadDatabase but app.db is missing');
+      }
+      try {
+        quickCheck(path.join(bdir, 'app.db'));
+      } catch (e) {
+        throw new DockerDriverError(
+          'BACKUP_QUICK_CHECK_FAILED',
+          `backup app.db failed PRAGMA quick_check: ${(e as Error).message}`,
+        );
+      }
+    }
+    return manifest;
+  }
+
+  /** Copia ficheros del host a un volumen usando un contenedor temporal. */
+  private async copyHostFilesToVolume(
+    image: string,
+    volume: string,
+    files: Array<{ name: string }>,
+    srcDir: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const tmp = `appforge-tmp-cp-${randomUUID().slice(0, 8)}`;
+    const cc = await this.sh(['create', '--name', tmp, '-v', `${volume}:/data`, image], {
+      timeoutMs: 30_000,
+      signal,
+    });
+    if (cc.code !== 0) {
+      throw new DockerDriverError('RESTORE_TMP_CREATE_FAILED', cc.stderr.slice(0, 300));
+    }
+    try {
+      for (const f of files) {
+        const cp = await this.sh(['cp', path.join(srcDir, f.name), `${tmp}:/data/${f.name}`], {
+          timeoutMs: 120_000,
+          signal,
+        });
+        if (cp.code !== 0) {
+          throw new DockerDriverError('RESTORE_CP_FAILED', `copy ${f.name}: ${cp.stderr.slice(0, 200)}`);
+        }
+      }
+    } finally {
+      await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Verifica ficheros dentro de un volumen: los extrae a un temporal,
+   * compara tamaño+SHA-256 con el manifiesto y pasa `quick_check` a
+   * app.db cuando se pide.
+   */
+  private async verifyVolumeFiles(
+    image: string,
+    volume: string,
+    files: BackupFileEntry[],
+    doQuickCheck: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const tmp = `appforge-tmp-verify-${randomUUID().slice(0, 8)}`;
+    const cc = await this.sh(['create', '--name', tmp, '-v', `${volume}:/data`, image], {
+      timeoutMs: 30_000,
+      signal,
+    });
+    if (cc.code !== 0) {
+      throw new DockerDriverError('RESTORE_VERIFY_CREATE_FAILED', cc.stderr.slice(0, 300));
+    }
+    const vdir = fs.mkdtempSync(path.join('/tmp', 'af-restore-verify-'));
+    try {
+      for (const f of files) {
+        const out = path.join(vdir, f.name);
+        const cp = await this.sh(['cp', `${tmp}:/data/${f.name}`, out], {
+          timeoutMs: 120_000,
+          signal,
+        });
+        if (cp.code !== 0) {
+          throw new DockerDriverError('RESTORE_VERIFY_CP_FAILED', `verify ${f.name}: ${cp.stderr.slice(0, 200)}`);
+        }
+        const got = sha256File(out);
+        if (got.size !== f.size || got.sha256.toLowerCase() !== f.sha256.toLowerCase()) {
+          throw new DockerDriverError(
+            'RESTORE_VERIFY_MISMATCH',
+            `restored ${f.name} checksum mismatch`,
+          );
+        }
+      }
+      if (doQuickCheck) {
+        try {
+          quickCheck(path.join(vdir, 'app.db'));
+        } catch (e) {
+          throw new DockerDriverError(
+            'RESTORE_QUICK_CHECK_FAILED',
+            `restored app.db failed PRAGMA quick_check: ${(e as Error).message}`,
+          );
+        }
+      }
+    } finally {
+      fs.rmSync(vdir, { recursive: true, force: true });
+      await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+    }
+  }
+
   async restoreBackup(args: RestoreBackupArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     const backupId = args.backupId ?? null;
@@ -1164,66 +1634,112 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     try {
       const { projectId, deploymentId } = args;
       const names = this.names(projectId, deploymentId);
-      const manifest = readBackupManifest(backupDirFor(this.config.dataDir, projectId, backupId!));
-      // Liberar el volumen: quitar el contenedor live detenido (si existe).
-      if (await resourceExists(this.runner, 'container', names.liveContainer)) {
-        await this.assertLiveSlot(projectId, names.liveContainer);
-        if (await this.containerRunning(names.liveContainer)) {
-          await this.stopContainerBounded(names.liveContainer, args.signal, 10);
-          if (await this.containerRunning(names.liveContainer)) {
-            return err('RESTORE_STOP_FAILED', 'live container still running; cannot restore');
-          }
-        }
-        const rm = await this.sh(['rm', names.liveContainer], { timeoutMs: 30_000, signal: args.signal });
-        if (rm.code !== 0) return err('RESTORE_RM_FAILED', rm.stderr.slice(0, 300));
+      const liveVolume = projectLiveVolumeName(projectId);
+
+      // ---- 1. Validación TOTAL del backup ANTES de detener/eliminar nada.
+      // Un backup corrupto se rechaza aquí, con el live intacto.
+      const manifest = this.validateBackupForRestore(projectId, backupId!);
+
+      // ---- 2. Staging: restaurar primero en un volumen staging, validar
+      // allí, y solo después sustituir el live (revisión Codex, Fase 7A).
+      const stagingVol = `appforge-restore-staging-${id8(deploymentId)}`;
+      const stagingLabels: ManagedLabels = {
+        projectId,
+        deploymentId,
+        role: 'migration',
+        fingerprint: this.snapshotFingerprint(deploymentId),
+      };
+      if (await resourceExists(this.runner, 'volume', stagingVol)) {
+        await this.sh(['volume', 'rm', stagingVol], { timeoutMs: 30_000, signal: args.signal }).catch(
+          () => undefined,
+        );
       }
-      // Recrear el volumen vacío.
-      const vrm = await this.sh(['volume', 'rm', names.liveVolume], { timeoutMs: 30_000, signal: args.signal });
-      if (vrm.code !== 0 && !/no such volume/i.test(vrm.stderr)) {
-        return err('RESTORE_VOLUME_RM_FAILED', vrm.stderr.slice(0, 300));
-      }
-      const vlabels = this.opLabels(projectId, deploymentId, 'live');
-      const vc = await this.sh(['volume', 'create', ...labelArgs(vlabels), names.liveVolume], {
+      const svc = await this.sh(['volume', 'create', ...labelArgs(stagingLabels), stagingVol], {
         timeoutMs: 30_000,
         signal: args.signal,
       });
-      if (vc.code !== 0) return err('RESTORE_VOLUME_CREATE_FAILED', vc.stderr.slice(0, 300));
-      if (manifest.hadDatabase) {
-        const bdir = backupDirFor(this.config.dataDir, projectId, backupId!);
-        const tmp = `appforge-tmp-restore-${id8(deploymentId)}`;
-        const cc = await this.sh(['create', '--name', tmp, '-v', `${names.liveVolume}:/data`, names.image], {
+      if (svc.code !== 0) {
+        throw new DockerDriverError('RESTORE_STAGING_CREATE_FAILED', svc.stderr.slice(0, 300));
+      }
+      try {
+        if (manifest.hadDatabase) {
+          const bdir = backupDirFor(this.config.dataDir, projectId, backupId!);
+          await this.copyHostFilesToVolume(names.image, stagingVol, manifest.files, bdir, args.signal);
+          await this.verifyVolumeFiles(names.image, stagingVol, manifest.files, true, args.signal);
+        }
+
+        // ---- 3. Liberar el live: quitar el contenedor detenido (si existe).
+        if (await resourceExists(this.runner, 'container', names.liveContainer)) {
+          await this.assertLiveSlot(projectId, names.liveContainer);
+          if (await this.containerRunning(names.liveContainer)) {
+            await this.stopContainerBounded(names.liveContainer, args.signal, 10);
+            if (await this.containerRunning(names.liveContainer)) {
+              throw new DockerDriverError('RESTORE_STOP_FAILED', 'live container still running; cannot restore');
+            }
+          }
+          const rm = await this.sh(['rm', names.liveContainer], { timeoutMs: 30_000, signal: args.signal });
+          if (rm.code !== 0) {
+            throw new DockerDriverError('RESTORE_RM_FAILED', rm.stderr.slice(0, 300));
+          }
+        }
+
+        // ---- 4. Sustituir el volumen live. Las labels ESTABLES se
+        // verifican ANTES del `volume rm`: un volumen ajeno sobrevive.
+        if (await resourceExists(this.runner, 'volume', liveVolume)) {
+          const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
+            Labels?: Record<string, string>;
+          };
+          try {
+            assertLiveVolumeLabels(info?.Labels, projectId);
+          } catch {
+            throw new DockerDriverError(
+              'FOREIGN_RESOURCE',
+              `refusing to remove live volume '${liveVolume}' with non-matching labels`,
+            );
+          }
+          const vrm = await this.sh(['volume', 'rm', liveVolume], { timeoutMs: 30_000, signal: args.signal });
+          if (vrm.code !== 0) {
+            throw new DockerDriverError('RESTORE_VOLUME_RM_FAILED', vrm.stderr.slice(0, 300));
+          }
+        }
+        const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
           timeoutMs: 30_000,
           signal: args.signal,
         });
-        if (cc.code !== 0) return err('RESTORE_TMP_CREATE_FAILED', cc.stderr.slice(0, 300));
-        try {
-          for (const f of manifest.files) {
-            const cp = await this.sh(['cp', path.join(bdir, f.name), `${tmp}:/data/${f.name}`], {
-              timeoutMs: 120_000,
-              signal: args.signal,
-            });
-            if (cp.code !== 0) return err('RESTORE_CP_FAILED', `restore ${f.name}: ${cp.stderr.slice(0, 200)}`);
+        if (vc.code !== 0) {
+          throw new DockerDriverError('RESTORE_VOLUME_CREATE_FAILED', vc.stderr.slice(0, 300));
+        }
+
+        // ---- 5. staging -> live + verificación final en el live.
+        if (manifest.hadDatabase) {
+          const tmp = `appforge-tmp-promote-${id8(deploymentId)}`;
+          const cc = await this.sh(
+            ['create', '--name', tmp, '-v', `${stagingVol}:/staging`, '-v', `${liveVolume}:/data`, names.image],
+            { timeoutMs: 30_000, signal: args.signal },
+          );
+          if (cc.code !== 0) {
+            throw new DockerDriverError('RESTORE_PROMOTE_CREATE_FAILED', cc.stderr.slice(0, 300));
           }
-          // Verificación: extraer y comparar checksums con el manifiesto.
-          const vdir = fs.mkdtempSync(path.join('/tmp', 'af-restore-verify-'));
           try {
             for (const f of manifest.files) {
-              const out = path.join(vdir, f.name);
-              const cp = await this.sh(['cp', `${tmp}:/data/${f.name}`, out], { timeoutMs: 120_000, signal: args.signal });
-              if (cp.code !== 0) return err('RESTORE_VERIFY_CP_FAILED', `verify ${f.name}: ${cp.stderr.slice(0, 200)}`);
-              const got = sha256File(out);
-              if (got.sha256 !== f.sha256 || got.size !== f.size) {
-                return err('RESTORE_VERIFY_MISMATCH', `restored ${f.name} checksum mismatch`);
+              const cp = await this.sh(['cp', `${tmp}:/staging/${f.name}`, `${tmp}:/data/${f.name}`], {
+                timeoutMs: 120_000,
+                signal: args.signal,
+              });
+              if (cp.code !== 0) {
+                throw new DockerDriverError('RESTORE_PROMOTE_CP_FAILED', `promote ${f.name}: ${cp.stderr.slice(0, 200)}`);
               }
             }
           } finally {
-            fs.rmSync(vdir, { recursive: true, force: true });
+            await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
           }
-        } finally {
-          await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+          await this.verifyVolumeFiles(names.image, liveVolume, manifest.files, true, args.signal);
         }
+        return ok();
+      } finally {
+        // Limpieza del staging en todos los caminos.
+        await this.sh(['volume', 'rm', stagingVol], { timeoutMs: 30_000 }).catch(() => undefined);
       }
-      return ok();
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
         return err(e.code, e.message);
@@ -1272,7 +1788,14 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   async discardCandidate(args: DriverOpArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
+      const { projectId, deploymentId } = args;
+      const names = this.names(projectId, deploymentId);
+      const labels: ManagedLabels = {
+        projectId,
+        deploymentId,
+        role: 'live',
+        fingerprint: this.snapshotFingerprint(deploymentId),
+      };
       // Nunca eliminar una imagen usada por un contenedor.
       const refs = await this.sh(
         ['ps', '-a', '--filter', `ancestor=${names.image}`, '--format', '{{.ID}}'],
@@ -1280,6 +1803,22 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       );
       if (refs.code === 0 && refs.stdout.trim() !== '') {
         return err('IMAGE_REFERENCED', `image '${names.image}' is still referenced by a container; refusing to discard`);
+      }
+      // La imagen debe existir y llevar las labels EXACTAS del deployment:
+      // una imagen ajena con el nombre esperado NO se elimina.
+      let info: { Config?: { Labels?: Record<string, string> } };
+      try {
+        info = (await inspectResource(this.runner, 'image', names.image)) as typeof info;
+      } catch {
+        return ok(); // no existe: nada que descartar
+      }
+      try {
+        assertLabelsMatch(info?.Config?.Labels, labels);
+      } catch {
+        return err(
+          'FOREIGN_RESOURCE',
+          `refusing to discard image '${names.image}' with non-matching labels`,
+        );
       }
       const r = await this.sh(['rmi', names.image], { timeoutMs: 120_000, signal: args.signal });
       if (r.code !== 0) {
@@ -1326,23 +1865,67 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   }
 
   /**
-   * Poda imágenes administradas excepto las indicadas. Inspecciona todos los
-   * resultados; los fallos se devuelven, nunca se ocultan. (7B lo llamará
-   * tras la promoción; en 7A se prueba de forma aislada.)
+   * Poda imágenes administradas DEL PROYECTO indicado (revisión Codex,
+   * Fase 7A). Lee `live_image`/`previous_image` de `project_runtime` en
+   * SQLite ANTES de aplicar retención: esas imágenes nunca se podan.
+   * Exige labels completas, inspecciona las labels exactas antes de cada
+   * `rmi` y nunca toca imágenes de otros proyectos. Los fallos se
+   * devuelven, nunca se ocultan. (7B lo llamará tras la promoción; en 7A
+   * se prueba de forma aislada.)
    */
-  async pruneManagedImages(keepImages: string[]): Promise<{ removed: string[]; failures: string[] }> {
+  async pruneManagedImages(
+    projectId: string,
+    keepImages: string[] = [],
+  ): Promise<{ removed: string[]; failures: string[] }> {
+    assertUuid(projectId, 'projectId');
     const keep = new Set(keepImages);
+    try {
+      const row = this.db
+        .prepare('SELECT live_image, previous_image FROM project_runtime WHERE project_id=?')
+        .get(projectId) as { live_image: string | null; previous_image: string | null } | undefined;
+      if (row?.live_image) keep.add(row.live_image);
+      if (row?.previous_image) keep.add(row.previous_image);
+    } catch {
+      /* project_runtime puede no existir aún; se sigue sin protegidos extra */
+    }
     const images = await listManagedResources(this.runner, 'image');
     const removed: string[] = [];
     const failures: string[] = [];
     for (const img of images) {
       const ref = img.name || img.id;
+      const labels = img.labels ?? {};
+      // Scope: solo este proyecto. Las imágenes de otros proyectos son
+      // intocables (ni siquiera se inspeccionan para podar).
+      if ((labels[LABEL_PROJECT] ?? '').toLowerCase() !== projectId.toLowerCase()) continue;
+      // Labels incompletas → se rechaza, no se poda a ciegas.
+      const missing = [LABEL_DEPLOYMENT, LABEL_ROLE, LABEL_FINGERPRINT].filter((k) => !labels[k]);
+      if (labels[MANAGED_LABEL] !== 'true' || missing.length > 0) {
+        failures.push(
+          `${ref || img.id}: incomplete labels (${missing.join(', ') || 'managed!=true'}); refusing to prune`,
+        );
+        continue;
+      }
       if (!ref || keep.has(ref) || keep.has(img.id)) continue;
       const refs = await this.sh(['ps', '-a', '--filter', `ancestor=${img.id}`, '--format', '{{.ID}}'], {
         timeoutMs: 30_000,
       });
       if (refs.code === 0 && refs.stdout.trim() !== '') {
         failures.push(`${ref}: still referenced by a container`);
+        continue;
+      }
+      // Inspección de labels exactas inmediatamente antes del rmi.
+      try {
+        const info = (await inspectResource(this.runner, 'image', img.id)) as {
+          Config?: { Labels?: Record<string, string> };
+        };
+        assertLabelsMatch(info?.Config?.Labels, {
+          projectId: labels[LABEL_PROJECT]!,
+          deploymentId: labels[LABEL_DEPLOYMENT]!,
+          role: labels[LABEL_ROLE] as ResourceRole,
+          fingerprint: labels[LABEL_FINGERPRINT]!,
+        });
+      } catch (e) {
+        failures.push(`${ref}: label re-inspection failed (${(e as Error).message.slice(0, 120)}); refusing rmi`);
         continue;
       }
       const r = await this.sh(['rmi', img.id], { timeoutMs: 120_000 });

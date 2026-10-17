@@ -18,6 +18,8 @@ export const LABEL_PROJECT = 'com.appforge.project-id';
 export const LABEL_DEPLOYMENT = 'com.appforge.deployment-id';
 export const LABEL_ROLE = 'com.appforge.role';
 export const LABEL_FINGERPRINT = 'com.appforge.source-fingerprint';
+/** Componente de infraestructura (red `appforge-apps`, volumen de datos del Studio). */
+export const LABEL_COMPONENT = 'com.appforge.component';
 
 export type ResourceRole = 'live' | 'verify' | 'migration';
 
@@ -89,9 +91,63 @@ export function resourceNames(projectId: string, deploymentId: string, fingerpri
     image: `appforge/app-${p8}:dep-${d8}-${sha12}`,
     liveContainer: `appforge-app-${p8}`,
     verifyContainer: `appforge-app-${p8}-verify-${d8}`,
-    liveVolume: `appforge-project-${projectId.toLowerCase()}-data`,
+    liveVolume: projectLiveVolumeName(projectId),
     verifyVolume: `appforge-verify-${deploymentId.toLowerCase()}-data`,
   };
+}
+
+/**
+ * Nombre del volumen live: identidad ESTABLE por proyecto (revisión Codex,
+ * Fase 7A). No depende del deployment ni del fingerprint: dos despliegues
+ * consecutivos del mismo proyecto comparten el volumen y, por tanto, los
+ * datos.
+ */
+export function projectLiveVolumeName(projectId: string): string {
+  assertUuid(projectId, 'projectId');
+  return `appforge-project-${projectId.toLowerCase()}-data`;
+}
+
+/**
+ * Labels del volumen live: identidad estable por proyecto (revisión Codex,
+ * Fase 7A). NO incluyen deployment-id ni fingerprint: el volumen sobrevive
+ * a los deployments y su propiedad se decide solo por proyecto + rol.
+ */
+export function liveVolumeLabelArgs(projectId: string): string[] {
+  assertUuid(projectId, 'projectId');
+  return [
+    '--label',
+    `${MANAGED_LABEL}=true`,
+    '--label',
+    `${LABEL_PROJECT}=${projectId.toLowerCase()}`,
+    '--label',
+    `${LABEL_ROLE}=live`,
+  ];
+}
+
+/**
+ * Verifica que un volumen existente sea el volumen live del proyecto:
+ * managed=true, project-id exacto y rol live. Cualquier divergencia
+ * (ausencia de labels, otro proyecto, otro rol) → ResourceError: el
+ * volumen es ajeno o corrupto y NO debe tocarse (p. ej. `volume rm`).
+ */
+export function assertLiveVolumeLabels(
+  actual: Record<string, string> | undefined,
+  projectId: string,
+): void {
+  assertUuid(projectId, 'projectId');
+  const a = actual ?? {};
+  const problems: string[] = [];
+  if (a[MANAGED_LABEL] !== 'true') problems.push(`${MANAGED_LABEL}!=true`);
+  if ((a[LABEL_PROJECT] ?? '').toLowerCase() !== projectId.toLowerCase()) {
+    problems.push(`${LABEL_PROJECT} mismatch`);
+  }
+  if (a[LABEL_ROLE] !== 'live') problems.push(`${LABEL_ROLE} mismatch`);
+  if (problems.length > 0) {
+    throw new ResourceError(
+      'FOREIGN_RESOURCE',
+      `refusing to touch live volume with non-matching labels: ${problems.join(', ')}`,
+    );
+  }
 }
 
 /** Vector de `--label k=v` para `docker run/create/build/volume/network`. */

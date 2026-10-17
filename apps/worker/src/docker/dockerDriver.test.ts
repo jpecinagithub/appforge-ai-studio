@@ -13,6 +13,9 @@ import {
 } from './dockerDriver.js';
 import { DockerCommandRunner } from './commandRunner.js';
 import { assertDriverArgs } from '../deploy/driver.js';
+import Database from 'better-sqlite3';
+import { ensureVerificationReceiptsTable, recordVerificationReceipt } from '../deploy/receipts.js';
+import type { DynamicCheckKey } from '../dynamicTools.js';
 
 const BASE_ENV = {
   APPFORGE_DEPLOY_DRIVER: 'docker',
@@ -20,6 +23,13 @@ const BASE_ENV = {
   APPFORGE_DOCKER_NETWORK: 'appforge-apps',
   APPFORGE_DOCKER_DATA_VOLUME: 'appforge-data',
 };
+
+/** DB en memoria con tabla de receipts canónica (Fase 6). */
+function openTestDb(): Database.Database {
+  const db = new Database(':memory:');
+  ensureVerificationReceiptsTable(db);
+  return db;
+}
 
 describe('kill switches (§4)', () => {
   test('null sin doble kill switch', () => {
@@ -76,7 +86,7 @@ describe('preflight negativo', () => {
 describe('driver: validación de args', () => {
   test('cada op rechaza args inválidos sin tocar Docker', async () => {
     const cfg = resolveDockerDriverConfig(BASE_ENV, '/tmp/af-driver-ut')!;
-    const d = new DockerDeploymentDriver(cfg);
+    const d = new DockerDeploymentDriver(cfg, { db: openTestDb() });
     const bad = { deploymentId: '../evil', projectId: 'p', candidateId: 'c' } as never;
     for (const op of [
       'buildCandidate',
@@ -85,6 +95,18 @@ describe('driver: validación de args', () => {
       'stopCurrentLiveRuntime',
     ] as const) {
       await expect((d[op] as (a: never) => Promise<unknown>)(bad)).rejects.toThrow();
+    }
+  });
+  test('el driver exige DB: sin ella falla cerrado en el constructor', () => {
+    const cfg = resolveDockerDriverConfig(BASE_ENV, '/tmp/af-driver-ut')!;
+    for (const fn of [() => new DockerDeploymentDriver(cfg), () => new DockerDeploymentDriver(cfg, {} as never)]) {
+      let code: string | undefined;
+      try {
+        fn();
+      } catch (e) {
+        code = (e as { code?: string }).code;
+      }
+      expect(code).toBe('RECEIPT_DB_REQUIRED');
     }
   });
   test('assertDriverArgs del contrato sigue vigente', () => {
