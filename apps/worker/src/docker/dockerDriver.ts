@@ -1836,7 +1836,127 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         );
       }
     }
+    // Revisión Codex (NO-GO 2, bloqueo 3): hadDatabase es booleano
+    // obligatorio; hadDatabase=false exige files=[] y hadDatabase=true
+    // exige app.db presente (ya comprobado arriba).
+    if (typeof manifest.hadDatabase !== 'boolean') {
+      throw new DockerDriverError('BACKUP_MANIFEST_INVALID', 'backup manifest hadDatabase must be a boolean');
+    }
+    if (!manifest.hadDatabase && manifest.files.length > 0) {
+      throw new DockerDriverError(
+        'BACKUP_MANIFEST_INVALID',
+        'backup with hadDatabase=false must list no files',
+      );
+    }
     return manifest;
+  }
+
+  /**
+   * Rescate del volumen live actual a un temporal del host (revisión Codex,
+   * NO-GO 2, bloqueo 3). Se ejecuta en `restoreBackup` ANTES de tocar el
+   * live: si la sustitución falla, la compensación devuelve estos datos al
+   * volumen live. Verifica las labels estables del volumen (un volumen
+   * ajeno aborta el restore con FOREIGN_RESOURCE) y extrae `app.db` /
+   * `app.db-wal` con un contenedor temporal endurecido. Si no hay volumen
+   * o no hay datos, devuelve `files` vacío. Cualquier otro fallo LANZA
+   * (no se continúa sin rescate).
+   */
+  private async rescueLiveVolume(
+    projectId: string,
+    liveVolume: string,
+    image: string,
+    signal?: AbortSignal,
+  ): Promise<{ dir: string; files: BackupFileEntry[] }> {
+    const dir = fs.mkdtempSync(path.join('/tmp', 'af-restore-rescue-'));
+    const files: BackupFileEntry[] = [];
+    if (!(await resourceExists(this.runner, 'volume', liveVolume))) return { dir, files };
+    const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
+      Labels?: Record<string, string>;
+    };
+    try {
+      assertLiveVolumeLabels(info?.Labels, projectId);
+    } catch {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `refusing to rescue foreign live volume '${liveVolume}'`);
+    }
+    const tmp = `appforge-tmp-rescue-${randomUUID().slice(0, 8)}`;
+    const createArgs = hardenedTempVolumeArgs({ name: tmp, image, volume: liveVolume });
+    assertNoForbiddenFlags(createArgs);
+    const cc = await this.sh(createArgs, { timeoutMs: 30_000, signal });
+    if (cc.aborted) throw new DockerDriverError('OPERATION_ABORTED', 'live rescue aborted');
+    if (cc.timedOut || cc.code !== 0) {
+      throw new DockerDriverError('RESTORE_RESCUE_CREATE_FAILED', cc.stderr.slice(0, 300));
+    }
+    try {
+      for (const f of ['app.db', 'app.db-wal']) {
+        const cp = await this.sh(['cp', `${tmp}:/data/${f}`, path.join(dir, f)], {
+          timeoutMs: 120_000,
+          signal,
+        });
+        if (cp.aborted) throw new DockerDriverError('OPERATION_ABORTED', 'live rescue aborted');
+        if (cp.timedOut) throw new DockerDriverError('RESTORE_RESCUE_TIMEOUT', `rescue cp ${f} timed out`);
+        if (cp.code !== 0) {
+          if (/no such file/i.test(cp.stderr)) continue;
+          throw new DockerDriverError('RESTORE_RESCUE_CP_FAILED', `rescue ${f}: ${cp.stderr.slice(0, 200)}`);
+        }
+        files.push({ name: f, ...sha256File(path.join(dir, f)) });
+      }
+    } finally {
+      await this.sh(['rm', tmp], { timeoutMs: 30_000 }).catch(() => undefined);
+    }
+    return { dir, files };
+  }
+
+  /**
+   * Compensación automática tras un fallo en la sustitución del volumen
+   * live (revisión Codex, NO-GO 2, bloqueo 3): recrea el volumen live con
+   * labels estables si falta, devuelve los datos rescatados y verifica sus
+   * checksums (+ `quick_check` si hay `app.db`). Nunca deja el live borrado
+   * o incompleto sin intentarlo. El contenedor NO se arranca aquí: eso lo
+   * hace `startPreviousVersion` (el orquestador).
+   */
+  private async compensateRestoreFailure(
+    projectId: string,
+    liveVolume: string,
+    image: string,
+    rescue: { dir: string; files: BackupFileEntry[] },
+    signal?: AbortSignal,
+  ): Promise<DriverResult> {
+    try {
+      if (!(await resourceExists(this.runner, 'volume', liveVolume))) {
+        const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
+          timeoutMs: 30_000,
+          signal,
+        });
+        if (vc.code !== 0) {
+          return err('RESTORE_COMPENSATION_FAILED', `cannot recreate live volume: ${vc.stderr.slice(0, 200)}`);
+        }
+      } else {
+        const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
+          Labels?: Record<string, string>;
+        };
+        try {
+          assertLiveVolumeLabels(info?.Labels, projectId);
+        } catch {
+          return err('FOREIGN_RESOURCE', `refusing to compensate foreign live volume '${liveVolume}'`);
+        }
+      }
+      if (rescue.files.length > 0) {
+        await this.copyHostFilesToVolume(image, liveVolume, rescue.files, rescue.dir, signal);
+        await this.verifyVolumeFiles(
+          image,
+          liveVolume,
+          rescue.files,
+          rescue.files.some((f) => f.name === 'app.db'),
+          signal,
+        );
+      }
+      return ok({ compensated: 'true' });
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
+        return err('RESTORE_COMPENSATION_FAILED', `${e.code}: ${e.message}`);
+      }
+      return err('RESTORE_COMPENSATION_FAILED', (e as Error).message);
+    }
   }
 
   /** Extrae ficheros de un volumen al host usando un contenedor temporal. */
@@ -1972,6 +2092,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
 
       // ---- 2. Staging: restaurar primero en un volumen staging, validar
       // allí, y solo después sustituir el live (revisión Codex, Fase 7A).
+      // Un staging preexistente se inspecciona con labels EXACTAS antes de
+      // eliminarlo: un staging ajeno sobrevive y produce FOREIGN_RESOURCE
+      // (revisión Codex, NO-GO 2, bloqueo 3).
       const stagingVol = `appforge-restore-staging-${id8(deploymentId)}`;
       const stagingLabels: ManagedLabels = {
         projectId,
@@ -1980,9 +2103,18 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         fingerprint: this.snapshotFingerprint(deploymentId),
       };
       if (await resourceExists(this.runner, 'volume', stagingVol)) {
-        await this.sh(['volume', 'rm', stagingVol], { timeoutMs: 30_000, signal: args.signal }).catch(
-          () => undefined,
-        );
+        const stagingInfo = (await inspectResource(this.runner, 'volume', stagingVol)) as {
+          Labels?: Record<string, string>;
+        };
+        try {
+          assertLabelsMatch(stagingInfo?.Labels, stagingLabels);
+        } catch {
+          return err('FOREIGN_RESOURCE', `refusing to remove foreign staging volume '${stagingVol}'`);
+        }
+        const srm = await this.sh(['volume', 'rm', stagingVol], { timeoutMs: 30_000, signal: args.signal });
+        if (srm.code !== 0) {
+          return err('RESTORE_STAGING_RM_FAILED', `cannot remove own staging volume: ${srm.stderr.slice(0, 300)}`);
+        }
       }
       const svc = await this.sh(['volume', 'create', ...labelArgs(stagingLabels), stagingVol], {
         timeoutMs: 30_000,
@@ -1991,14 +2123,20 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       if (svc.code !== 0) {
         throw new DockerDriverError('RESTORE_STAGING_CREATE_FAILED', svc.stderr.slice(0, 300));
       }
+      // ---- 2b. Rescate del live actual ANTES de tocarlo (bloqueo 3):
+      // copia a un temporal del host para compensar si algo falla después
+      // de eliminar el live. Si el rescate falla, NO se continúa (el
+      // staging se limpia en el finally).
+      let rescue: { dir: string; files: BackupFileEntry[] } | null = null;
       try {
+        rescue = await this.rescueLiveVolume(projectId, liveVolume, names.image, args.signal);
         if (manifest.hadDatabase) {
           const bdir = backupDirFor(this.config.dataDir, projectId, backupId!);
           await this.copyHostFilesToVolume(names.image, stagingVol, manifest.files, bdir, args.signal);
           await this.verifyVolumeFiles(names.image, stagingVol, manifest.files, true, args.signal);
         }
 
-        // ---- 3. Liberar el live: quitar el contenedor detenido (si existe).
+        // ---- 3. Liberar el live: detener y quitar el contenedor (si existe).
         if (await resourceExists(this.runner, 'container', names.liveContainer)) {
           await this.assertLiveSlot(projectId, names.liveContainer);
           if (await this.containerRunning(names.liveContainer)) {
@@ -2013,49 +2151,70 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           }
         }
 
-        // ---- 4. Sustituir el volumen live. Las labels ESTABLES se
-        // verifican ANTES del `volume rm`: un volumen ajeno sobrevive.
-        if (await resourceExists(this.runner, 'volume', liveVolume)) {
-          const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
-            Labels?: Record<string, string>;
-          };
-          try {
-            assertLiveVolumeLabels(info?.Labels, projectId);
-          } catch {
-            throw new DockerDriverError(
-              'FOREIGN_RESOURCE',
-              `refusing to remove live volume '${liveVolume}' with non-matching labels`,
+        // ---- 4+5. Sustitución del volumen con COMPENSACIÓN AUTOMÁTICA
+        // (bloqueo 3): si algo falla a partir de aquí, los datos rescatados
+        // se devuelven al volumen live; nunca se deja el live borrado o
+        // incompleto sin intentarlo.
+        try {
+          if (await resourceExists(this.runner, 'volume', liveVolume)) {
+            const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
+              Labels?: Record<string, string>;
+            };
+            try {
+              assertLiveVolumeLabels(info?.Labels, projectId);
+            } catch {
+              throw new DockerDriverError(
+                'FOREIGN_RESOURCE',
+                `refusing to remove live volume '${liveVolume}' with non-matching labels`,
+              );
+            }
+            const vrm = await this.sh(['volume', 'rm', liveVolume], { timeoutMs: 30_000, signal: args.signal });
+            if (vrm.code !== 0) {
+              throw new DockerDriverError('RESTORE_VOLUME_RM_FAILED', vrm.stderr.slice(0, 300));
+            }
+          }
+          const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
+            timeoutMs: 30_000,
+            signal: args.signal,
+          });
+          if (vc.code !== 0) {
+            throw new DockerDriverError('RESTORE_VOLUME_CREATE_FAILED', vc.stderr.slice(0, 300));
+          }
+
+          // ---- 5. staging -> live vía un temporal del host + verificación
+          // final en el live. (`docker cp` no soporta contenedor→contenedor.)
+          if (manifest.hadDatabase) {
+            const pdir = fs.mkdtempSync(path.join('/tmp', 'af-restore-promote-'));
+            try {
+              await this.extractVolumeToHost(names.image, stagingVol, '/data', manifest.files, pdir, args.signal);
+              await this.copyHostFilesToVolume(names.image, liveVolume, manifest.files, pdir, args.signal);
+            } finally {
+              fs.rmSync(pdir, { recursive: true, force: true });
+            }
+            await this.verifyVolumeFiles(names.image, liveVolume, manifest.files, true, args.signal);
+          }
+          return ok();
+        } catch (e) {
+          const orig =
+            e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
+              ? `${e.code}: ${e.message}`
+              : `RESTORE_ERROR: ${(e as Error).message}`;
+          const comp = await this.compensateRestoreFailure(projectId, liveVolume, names.image, rescue!, args.signal);
+          if (!comp.ok) {
+            return err(
+              'RESTORE_COMPENSATION_FAILED',
+              `${orig}; compensation also failed (${comp.code}): ${comp.error} — live data may be incomplete`,
             );
           }
-          const vrm = await this.sh(['volume', 'rm', liveVolume], { timeoutMs: 30_000, signal: args.signal });
-          if (vrm.code !== 0) {
-            throw new DockerDriverError('RESTORE_VOLUME_RM_FAILED', vrm.stderr.slice(0, 300));
-          }
+          return err(
+            'RESTORE_FAILED_COMPENSATED',
+            `${orig} (live data restored from the pre-restore rescue copy; start the previous version with startPreviousVersion)`,
+          );
         }
-        const vc = await this.sh(['volume', 'create', ...liveVolumeLabelArgs(projectId), liveVolume], {
-          timeoutMs: 30_000,
-          signal: args.signal,
-        });
-        if (vc.code !== 0) {
-          throw new DockerDriverError('RESTORE_VOLUME_CREATE_FAILED', vc.stderr.slice(0, 300));
-        }
-
-        // ---- 5. staging -> live vía un temporal del host + verificación
-        // final en el live. (`docker cp` no soporta contenedor→contenedor.)
-        if (manifest.hadDatabase) {
-          const pdir = fs.mkdtempSync(path.join('/tmp', 'af-restore-promote-'));
-          try {
-            await this.extractVolumeToHost(names.image, stagingVol, '/data', manifest.files, pdir, args.signal);
-            await this.copyHostFilesToVolume(names.image, liveVolume, manifest.files, pdir, args.signal);
-          } finally {
-            fs.rmSync(pdir, { recursive: true, force: true });
-          }
-          await this.verifyVolumeFiles(names.image, liveVolume, manifest.files, true, args.signal);
-        }
-        return ok();
       } finally {
-        // Limpieza del staging en todos los caminos.
+        // Limpieza del staging y del rescate en todos los caminos.
         await this.sh(['volume', 'rm', stagingVol], { timeoutMs: 30_000 }).catch(() => undefined);
+        if (rescue) fs.rmSync(rescue.dir, { recursive: true, force: true });
       }
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {

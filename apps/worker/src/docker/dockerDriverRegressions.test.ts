@@ -83,6 +83,13 @@ class StubDocker {
   /** Contenido servido al copiar DESDE un contenedor al host (verify). */
   hostFiles = new Map<string, Buffer>();
   /**
+   * Rastreo de contenido de volúmenes (NO-GO 2, bloqueo 3): permite
+   * demostrar con datos reales que el rescate y la compensación preservan
+   * los bytes del volumen live.
+   */
+  containerVolumes = new Map<string, string>(); // contenedor temporal → volumen montado en /data
+  volumeFiles = new Map<string, Map<string, Buffer>>(); // volumen → fichero → contenido
+  /**
    * Plantilla de inspect para contenedores creados con `docker run --name`.
    * Se deep-copia bajo el nombre indicado con State.Running=true.
    */
@@ -102,6 +109,25 @@ class StubDocker {
     this.faults.push({ prefix, result, stderr });
   }
 
+  /**
+   * Fallos con predicado (NO-GO 2, B3): el predicado recibe el argv y el
+   * propio stub (para consultar `containerVolumes`). Se consume una vez.
+   */
+  failPreds: Array<{
+    pred: (args: string[], stub: StubDocker) => boolean;
+    result: 'fail' | 'aborted';
+    stderr: string;
+  }> = [];
+
+  /** Inyecta un fallo en la próxima llamada que cumpla el predicado. */
+  failWhen(
+    pred: (args: string[], stub: StubDocker) => boolean,
+    result: 'fail' | 'aborted' = 'fail',
+    stderr = 'injected failure',
+  ): void {
+    this.failPreds.push({ pred, result, stderr });
+  }
+
   private deepCopy<T>(v: T): T {
     return JSON.parse(JSON.stringify(v)) as T;
   }
@@ -116,7 +142,16 @@ class StubDocker {
   async run(options: DockerRunOptions): Promise<DockerRunResult> {
     const args = options.args;
     this.calls.push([...args]);
-    // Fallo inyectado (se consume una sola vez).
+    // Fallo inyectado por predicado (se consume una sola vez).
+    const predIdx = this.failPreds.findIndex((f) => f.pred(args, this));
+    if (predIdx >= 0) {
+      const [fault] = this.failPreds.splice(predIdx, 1);
+      if (fault.result === 'aborted') {
+        return { ...this.okRes(), code: null, aborted: true };
+      }
+      return this.failRes(1, fault.stderr);
+    }
+    // Fallo inyectado por prefijo (se consume una sola vez).
     const faultIdx = this.faults.findIndex((f) => f.prefix.every((p, i) => args[i] === p));
     if (faultIdx >= 0) {
       const [fault] = this.faults.splice(faultIdx, 1);
@@ -174,6 +209,7 @@ class StubDocker {
       const name = args[2]!;
       if (!this.volumes.has(name)) return this.failRes(1, `Error: No such volume: ${name}`);
       this.volumes.delete(name);
+      this.volumeFiles.delete(name);
       return this.okRes(name + '\n');
     }
     if (sub === 'network' && second === 'create') {
@@ -238,17 +274,40 @@ class StubDocker {
       return this.okRes(`Untagged: ${ref}\n`);
     }
     if (sub === 'cp') {
-      // <contenedor>:/data/<name> -> <ruta host>: servir contenido configurado.
+      // <contenedor>:/data/<name> -> <ruta host>: servir contenido configurado
+      // o rastreado del volumen montado por el temporal.
+      // <ruta host> -> <contenedor>:/data/<name>: registrar en el volumen.
       // args = ['cp', <origen>, <destino>].
       const src: string = args[1] ?? '';
       const dst: string = args[2] ?? '';
       const marker = ':/data/';
       const mi = src.indexOf(marker);
       if (mi > 0 && !src.slice(0, mi).includes(':') && path.isAbsolute(dst)) {
-        const buf = this.hostFiles.get(src.slice(mi + marker.length));
+        const cname = src.slice(0, mi);
+        const fname = src.slice(mi + marker.length);
+        let buf = this.hostFiles.get(fname);
+        if (!buf) {
+          const vol = this.containerVolumes.get(cname);
+          buf = vol ? this.volumeFiles.get(vol)?.get(fname) : undefined;
+        }
         if (!buf) return this.failRes(1, `Error: No such file: ${src}`);
         fs.mkdirSync(path.dirname(dst), { recursive: true });
         fs.writeFileSync(dst, buf);
+      } else {
+        const dmi = dst.indexOf(marker);
+        if (dmi > 0 && !dst.slice(0, dmi).includes(':') && path.isAbsolute(src) && fs.existsSync(src)) {
+          const cname = dst.slice(0, dmi);
+          const fname = dst.slice(dmi + marker.length);
+          const vol = this.containerVolumes.get(cname);
+          if (vol) {
+            let m = this.volumeFiles.get(vol);
+            if (!m) {
+              m = new Map();
+              this.volumeFiles.set(vol, m);
+            }
+            m.set(fname, fs.readFileSync(src));
+          }
+        }
       }
       return this.okRes('');
     }
@@ -279,12 +338,24 @@ class StubDocker {
       if (entry?.State) entry.State.Running = true;
       return this.okRes('');
     }
-    // docker rm <n>: eliminar el contenedor del mapa.
-    if (sub === 'rm' && this.containers.has(args[1]!)) {
-      this.containers.delete(args[1]!);
+    // docker rm <n>: eliminar el contenedor del mapa y su mapeo de volumen.
+    if (sub === 'rm') {
+      this.containerVolumes.delete(args[1]!);
+      if (this.containers.has(args[1]!)) this.containers.delete(args[1]!);
       return this.okRes('');
     }
-    // create/rm/start/kill/logs/wait: éxito sin estado.
+    // docker create --name <n> -v <vol>:/data: registrar el mapeo
+    // contenedor→volumen para el rastreo de contenido (NO-GO 2, B3).
+    if (sub === 'create') {
+      const nIdx = args.indexOf('--name');
+      const vIdx = args.findIndex((a, i) => (a === '-v' || a === '--volume') && i + 1 < args.length);
+      if (nIdx >= 0 && vIdx >= 0) {
+        const vol = args[vIdx + 1]!.split(':')[0]!;
+        this.containerVolumes.set(args[nIdx + 1]!, vol);
+      }
+      return this.okRes('');
+    }
+    // start/kill/logs/wait: éxito sin estado.
     return this.okRes('');
   }
 
@@ -1733,5 +1804,296 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     expect(r.ok).toBe(false);
     expect(r.code).toMatch(/BACKUP_RECOVERY_FAILED/);
     expect(r.error).toMatch(/BACKUP_CP_FAILED/);
+  });
+});
+
+describe('NO-GO2 B3: restore failure-safe y propiedad del staging', () => {
+  const BACKUP_ID = 'bk_test_001';
+  const LIVE = `appforge-app-${PID.slice(0, 8)}`;
+  const PREV_DID = 'dddddddd-eeee-4fff-8aaa-000000000000';
+  const FP = 'd'.repeat(64);
+  const PREV_REF = `appforge/app-${PID.slice(0, 8)}:dep-${PREV_DID.slice(0, 8)}-${FP.slice(0, 12)}`;
+
+  function restoreArgs() {
+    return { projectId: PID, deploymentId: DID, candidateId: `cand-${DID.slice(0, 8)}`, backupId: BACKUP_ID } as never;
+  }
+
+  /** Backup válido en disco (los datos NUEVOS a restaurar). */
+  function makeValidBackup(dataDir: string): { bdir: string; bytes: Buffer } {
+    const bdir = backupDirFor(dataDir, PID, BACKUP_ID);
+    fs.mkdirSync(bdir, { recursive: true });
+    const dbPath = path.join(bdir, 'app.db');
+    const sdb = new Database(dbPath);
+    sdb.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('nuevo');");
+    sdb.close();
+    const { size, sha256 } = sha256File(dbPath);
+    const manifest: BackupManifest = {
+      backupId: BACKUP_ID,
+      projectId: PID,
+      deploymentId: DID,
+      createdAt: new Date().toISOString(),
+      hadDatabase: true,
+      files: [{ name: 'app.db', size, sha256 }],
+    };
+    writeBackupManifest(bdir, manifest);
+    return { bdir, bytes: fs.readFileSync(dbPath) };
+  }
+
+  async function setupBuilt(dataDir: string, db: Database.Database, stub: StubDocker) {
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    return d;
+  }
+
+  function liveVolumeLabels() {
+    return {
+      'com.appforge.managed': 'true',
+      'com.appforge.project-id': PID,
+      'com.appforge.role': 'live',
+    };
+  }
+
+  /** Volumen live con los datos ORIGINALES (los que el rescate debe preservar). */
+  function seedLiveVolumeWithData(stub: StubDocker): Buffer {
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.volumes.set(liveVolume, liveVolumeLabels());
+    const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'af-db-')), 'app.db');
+    const sdb = new Database(p);
+    sdb.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('original-live-data');");
+    sdb.close();
+    const bytes = fs.readFileSync(p);
+    let m = stub.volumeFiles.get(liveVolume);
+    if (!m) {
+      m = new Map();
+      stub.volumeFiles.set(liveVolume, m);
+    }
+    m.set('app.db', bytes);
+    return bytes;
+  }
+
+  function seedLiveContainer(stub: StubDocker) {
+    stub.containers.set(LIVE, {
+      Config: {
+        Labels: liveVolumeLabels(),
+        User: '1001',
+        Image: 'appforge/app-11111111:dep-aaaaaaaa-000000000000',
+      },
+      State: { Running: false },
+    });
+  }
+
+  function seedPrevImage(stub: StubDocker) {
+    const id = 'sha256:' + '7'.repeat(64);
+    const [repo, tag] = PREV_REF.split(':') as [string, string];
+    const img = {
+      id,
+      repo,
+      tag,
+      labels: {
+        'com.appforge.managed': 'true',
+        'com.appforge.project-id': PID,
+        'com.appforge.deployment-id': PREV_DID,
+        'com.appforge.role': 'live',
+        'com.appforge.source-fingerprint': FP,
+      },
+      os: 'linux',
+      arch: 'amd64',
+      user: '1001',
+    };
+    stub.images.set(PREV_REF, img);
+    stub.images.set(id, img);
+  }
+
+  function goodLiveInspect(labels: Record<string, string>, liveVolume: string, imageRef: string) {
+    return {
+      Config: { Labels: labels, User: '1001', Image: imageRef },
+      State: { Running: true },
+      Mounts: [
+        { Type: 'volume', Name: liveVolume, Source: liveVolume, Destination: '/data' },
+        { Type: 'tmpfs', Destination: '/tmp' },
+      ],
+      NetworkSettings: { Networks: { 'appforge-apps': {} }, Ports: {} },
+      HostConfig: {
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 512 * 1024 * 1024,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 128,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        ReadonlyRootfs: true,
+        Privileged: false,
+        Devices: [],
+        PidMode: '',
+        IpcMode: 'private',
+        NetworkMode: 'appforge-apps',
+        RestartPolicy: { Name: 'unless-stopped' },
+      },
+    };
+  }
+
+  test('staging preexistente ajeno sobrevive y produce FOREIGN_RESOURCE', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    makeValidBackup(dataDir);
+    const stagingVol = `appforge-restore-staging-${DID.slice(0, 8)}`;
+    stub.volumes.set(stagingVol, { 'otra': 'etiqueta' }); // ajeno
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/FOREIGN_RESOURCE/);
+    expect(stub.volumes.get(stagingVol)).toEqual({ 'otra': 'etiqueta' }); // sobrevive
+    // El live no se tocó.
+    expect(stub.calls.some((c) => c[0] === 'stop' || c[0] === 'kill')).toBe(false);
+  });
+
+  test('hadDatabase no booleano → rechazado antes de tocar nada', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    const { bdir } = makeValidBackup(dataDir);
+    const m = JSON.parse(fs.readFileSync(path.join(bdir, 'backup.json'), 'utf8')) as Record<string, unknown>;
+    m.hadDatabase = 'yes';
+    writeBackupManifest(bdir, m as unknown as BackupManifest);
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.volumes.set(liveVolume, liveVolumeLabels());
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/BACKUP_MANIFEST_INVALID/);
+    expect(stub.volumes.has(liveVolume)).toBe(true);
+    expect(stub.calls.some((c) => c[0] === 'volume' && c[1] === 'rm')).toBe(false);
+  });
+
+  test('hadDatabase=false con files no vacío → rechazado', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    const { bdir } = makeValidBackup(dataDir);
+    const m = JSON.parse(fs.readFileSync(path.join(bdir, 'backup.json'), 'utf8')) as BackupManifest;
+    m.hadDatabase = false;
+    writeBackupManifest(bdir, m);
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/BACKUP_MANIFEST_INVALID/);
+  });
+
+  /**
+   * Fallo inyectado DESPUÉS de eliminar el live: la compensación recrea el
+   * volumen y devuelve los datos rescatados (bytes idénticos a los
+   * originales); la versión anterior puede arrancar sana con esos datos.
+   */
+  async function compensatedRestore(
+    failDesc: string,
+    inject: (stub: StubDocker, liveVolume: string) => void,
+  ) {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    makeValidBackup(dataDir);
+    const liveVolume = projectLiveVolumeName(PID);
+    const originalBytes = seedLiveVolumeWithData(stub);
+    seedLiveContainer(stub);
+    seedPrevImage(stub);
+    inject(stub, liveVolume);
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/RESTORE_FAILED_COMPENSATED/);
+    // El volumen live existe de nuevo con los datos ORIGINALES (rescatados).
+    expect(stub.volumes.has(liveVolume)).toBe(true);
+    const after = stub.volumeFiles.get(liveVolume)?.get('app.db');
+    expect(after).toBeDefined();
+    expect(Buffer.compare(after!, originalBytes)).toBe(0);
+    // La versión anterior arranca sana con esos datos.
+    stub.containerTemplate = goodLiveInspect(
+      {
+        'com.appforge.managed': 'true',
+        'com.appforge.project-id': PID,
+        'com.appforge.deployment-id': PREV_DID,
+        'com.appforge.role': 'live',
+        'com.appforge.source-fingerprint': FP,
+      },
+      liveVolume,
+      PREV_REF,
+    );
+    const prev = await d.startPreviousVersion({
+      projectId: PID,
+      deploymentId: DID,
+      candidateId: `cand-${DID.slice(0, 8)}`,
+      previousLiveVersion: PREV_REF,
+    } as never);
+    expect(prev.ok).toBe(true);
+    return { dataDir, db, stub, d, failDesc };
+  }
+
+  test('fallo en volume create tras rm del live → compensación con datos originales', async () => {
+    await compensatedRestore('volume create', (stub, liveVolume) => {
+      stub.failWhen(
+        (c) => c[0] === 'volume' && c[1] === 'create' && c[c.length - 1] === liveVolume,
+        'fail',
+        'simulated volume create failure',
+      );
+    });
+  });
+
+  test('fallo en la copia staging→live → compensación con datos originales', async () => {
+    await compensatedRestore('copia a live', (stub) => {
+      // El primer cp host→contenedor es host→staging; el segundo, host→live.
+      let hostCpCount = 0;
+      stub.failWhen(
+        (c) => {
+          if (c[0] === 'cp' && c[1] && !c[1].includes(':/data/') && c[1].endsWith('/app.db')) {
+            hostCpCount++;
+            return hostCpCount === 2;
+          }
+          return false;
+        },
+        'fail',
+        'simulated copy failure',
+      );
+    });
+  });
+
+  test('fallo en la verificación final en el live → compensación con datos originales', async () => {
+    await compensatedRestore('verificación final', (stub, liveVolume) => {
+      stub.failWhen(
+        (c, s) => {
+          if (c[0] !== 'cp' || !c[1].startsWith('appforge-tmp-verify-')) return false;
+          const cname = c[1].split(':/data/')[0]!;
+          return s.containerVolumes.get(cname) === liveVolume;
+        },
+        'fail',
+        'simulated verify failure',
+      );
+    });
+  });
+
+  test('fallo en volume rm del live → el volumen original sobrevive intacto', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    makeValidBackup(dataDir);
+    const liveVolume = projectLiveVolumeName(PID);
+    const originalBytes = seedLiveVolumeWithData(stub);
+    seedLiveContainer(stub);
+    stub.failWhen(
+      (c) => c[0] === 'volume' && c[1] === 'rm' && c[2] === liveVolume,
+      'fail',
+      'simulated volume rm failure',
+    );
+    const r = await d.restoreBackup(restoreArgs());
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/RESTORE_FAILED_COMPENSATED/);
+    // El volumen nunca se eliminó: datos originales intactos.
+    expect(stub.volumes.has(liveVolume)).toBe(true);
+    const after = stub.volumeFiles.get(liveVolume)?.get('app.db');
+    expect(after).toBeDefined();
+    expect(Buffer.compare(after!, originalBytes)).toBe(0);
   });
 });
