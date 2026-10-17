@@ -188,6 +188,40 @@ export interface PreflightResult {
 }
 
 /**
+ * Normaliza la arquitectura reportada por Docker a los identificadores
+ * canónicos usados en los inspect de imagen (`amd64`/`arm64`).
+ * `docker info` devuelve `x86_64`/`aarch64`; el inspect de imagen,
+ * `amd64`/`arm64`. Cualquier otro valor se devuelve tal cual (la
+ * comparación posterior lo rechazará).
+ */
+export function normalizeArch(raw: string): string {
+  const a = raw.trim().toLowerCase();
+  if (a === 'x86_64' || a === 'amd64') return 'amd64';
+  if (a === 'aarch64' || a === 'arm64') return 'arm64';
+  return a;
+}
+
+/**
+ * Arquitectura del daemon Docker (`docker info --format '{{.Architecture}}'`).
+ * La usa el preflight (diagnóstico) y la validación posterior de
+ * contenedores (la imagen debe coincidir con el daemon/host).
+ */
+export async function detectDaemonArchitecture(runner: DockerCommandRunner): Promise<string> {
+  const r = await runner.run({ args: ['info', '--format', '{{.Architecture}}'], timeoutMs: 15_000 });
+  if (r.code !== 0 || r.timedOut || r.aborted) {
+    throw new DockerDriverError(
+      'DAEMON_ARCH_UNKNOWN',
+      `cannot detect docker daemon architecture: ${r.stderr.slice(0, 200)}`,
+    );
+  }
+  const arch = normalizeArch(r.stdout);
+  if (!arch) {
+    throw new DockerDriverError('DAEMON_ARCH_UNKNOWN', 'docker daemon reported an empty architecture');
+  }
+  return arch;
+}
+
+/**
  * Preflight: Linux, CLI compatible, socket Unix real, daemon accesible,
  * red y volumen (se crean etiquetados si faltan), data dir escribible,
  * versión mínima. Si falla → 501 con diagnóstico sanitizado; el Studio
@@ -215,6 +249,15 @@ export async function preflightDocker(
   if (compareVersions(serverVersion, config.minDockerVersion) < 0) {
     return fail(`docker server ${serverVersion} < minimum ${config.minDockerVersion}`);
   }
+  // Arquitectura del daemon/host (revisión Codex, NO-GO 2, bloqueo 5): la
+  // validación posterior exige que la imagen coincida con esta arquitectura.
+  let daemonArch: string;
+  try {
+    daemonArch = await detectDaemonArchitecture(runner);
+  } catch (e) {
+    return fail((e as Error).message);
+  }
+  diagnostics.push(`docker daemon architecture: ${daemonArch} (server ${serverVersion})`);
   try {
     fs.mkdirSync(config.dataDir, { recursive: true });
     fs.accessSync(config.dataDir, fs.constants.W_OK);
@@ -327,6 +370,15 @@ const HEALTH_ATTEMPTS = 12;
 const HEALTH_INTERVAL_MS = 5_000;
 const HEALTH_REQUEST_MS = 10_000;
 
+/**
+ * Valores exactos permitidos de PidMode/IpcMode (revisión Codex, NO-GO 2,
+ * bloqueo 5). Los contenedores endurecidos se crean sin `--pid`/`--ipc`,
+ * por lo que `docker inspect` solo muestra los valores por defecto:
+ * PidMode `""` e IpcMode `"private"` (algunas versiones reportan `""`).
+ */
+const ALLOWED_PID_MODES = new Set(['', 'private']);
+const ALLOWED_IPC_MODES = new Set(['', 'private']);
+
 function err(code: string, message: string): DriverResult {
   return { ok: false, code, error: sanitizeSecrets(message).slice(0, 2000) };
 }
@@ -346,6 +398,20 @@ export class DockerDeploymentDriver implements DeploymentDriver {
    * (fail closed en el constructor, nunca puerta desactivada en silencio).
    */
   private readonly db: Database.Database;
+  /**
+   * Arquitectura del daemon/host, detectada una vez por proceso-driver
+   * (revisión Codex, NO-GO 2, bloqueo 5): `validateRunningContainer` exige
+   * que la imagen del contenedor coincida EXACTAMENTE con ella.
+   */
+  private daemonArch: string | null = null;
+
+  /** Arquitectura del daemon (cacheada); lanza si no puede detectarse. */
+  private async getDaemonArch(): Promise<string> {
+    if (this.daemonArch === null) {
+      this.daemonArch = await detectDaemonArchitecture(this.runner);
+    }
+    return this.daemonArch;
+  }
 
   constructor(config: DockerDriverConfig, opts: DockerDriverOptions = {} as DockerDriverOptions) {
     this.config = config;
@@ -1084,9 +1150,24 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (String(imgInfo?.Os ?? '').toLowerCase() !== 'linux') {
       return err('IMAGE_OS_MISMATCH', `image OS is '${imgInfo?.Os}', expected linux`);
     }
-    const arch = String(imgInfo?.Architecture ?? '').toLowerCase();
+    // Arquitectura y SO de la imagen (revisión Codex, Fase 7A + NO-GO 2):
+    // la imagen debe ser linux/amd64|arm64 Y coincidir EXACTAMENTE con la
+    // arquitectura del daemon/host detectada en preflight.
+    const arch = normalizeArch(String(imgInfo?.Architecture ?? ''));
     if (arch !== 'amd64' && arch !== 'arm64') {
-      return err('IMAGE_ARCH_MISMATCH', `image architecture '${arch}' is not supported (amd64/arm64)`);
+      return err('IMAGE_ARCH_MISMATCH', `image architecture '${imgInfo?.Architecture}' is not supported (amd64/arm64)`);
+    }
+    let hostArch: string;
+    try {
+      hostArch = await this.getDaemonArch();
+    } catch (e) {
+      return err('DAEMON_ARCH_UNKNOWN', (e as Error).message);
+    }
+    if (arch !== hostArch) {
+      return err(
+        'IMAGE_ARCH_MISMATCH',
+        `image architecture '${arch}' does not match docker daemon/host architecture '${hostArch}'`,
+      );
     }
     const mounts = info?.Mounts ?? [];
     if (!mounts.some((m) => m?.Name === volume && m?.Destination === '/data')) {
@@ -1106,8 +1187,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err('CONTAINER_STUDIO_VOLUME_MOUNT', `container '${name}' mounts the Studio data volume`);
       }
     }
-    if (!Object.keys(info?.NetworkSettings?.Networks ?? {}).includes(this.config.network)) {
-      return err('CONTAINER_NETWORK_MISMATCH', `container '${name}' is not on network '${this.config.network}'`);
+    // Red: EXACTAMENTE una, la interna configurada (revisión Codex, NO-GO 2,
+    // bloqueo 5). Una red adicional (p. ej. bridge) es un escape del
+    // aislamiento y se rechaza.
+    const networks = Object.keys(info?.NetworkSettings?.Networks ?? {});
+    if (networks.length !== 1 || networks[0] !== this.config.network) {
+      return err(
+        'CONTAINER_NETWORK_MISMATCH',
+        `container '${name}' must be attached to exactly one network ('${this.config.network}'); found: ${networks.join(',') || 'none'}`,
+      );
     }
     const hc = info?.HostConfig ?? {};
     // El tmpfs de `--tmpfs` puede aparecer en `Mounts` (Type=tmpfs) o solo
@@ -1134,11 +1222,20 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
     if (hc.ReadonlyRootfs !== true) return err('CONTAINER_READONLY_MISMATCH', 'read-only rootfs not set');
     if (hc.Privileged === true) return err('CONTAINER_PRIVILEGED', `container '${name}' is privileged`);
-    if (Array.isArray(hc.Devices) && hc.Devices.length > 0) {
-      return err('CONTAINER_DEVICES', `container '${name}' has host devices`);
+    // Devices: debe estar EXPLÍCITAMENTE vacío (revisión Codex, NO-GO 2,
+    // bloqueo 5). Ausente o con dispositivos → rechazado.
+    if (!Array.isArray(hc.Devices) || hc.Devices.length !== 0) {
+      return err('CONTAINER_DEVICES', `container '${name}' must have an explicitly empty Devices list`);
     }
-    if (hc.PidMode === 'host') return err('CONTAINER_PID_HOST', `container '${name}' uses host PID namespace`);
-    if (hc.IpcMode === 'host') return err('CONTAINER_IPC_HOST', `container '${name}' uses host IPC namespace`);
+    // PidMode/IpcMode: solo los valores exactos permitidos (revisión Codex,
+    // NO-GO 2, bloqueo 5). Nuestros contenedores se crean sin --pid/--ipc,
+    // así que solo aparecen los valores por defecto de Docker.
+    if (!ALLOWED_PID_MODES.has(String(hc.PidMode ?? ''))) {
+      return err('CONTAINER_PID_MODE', `container '${name}' has disallowed PidMode '${hc.PidMode}'`);
+    }
+    if (!ALLOWED_IPC_MODES.has(String(hc.IpcMode ?? ''))) {
+      return err('CONTAINER_IPC_MODE', `container '${name}' has disallowed IpcMode '${hc.IpcMode}'`);
+    }
     if (hc.NetworkMode !== this.config.network) {
       return err('CONTAINER_NETWORKMODE_MISMATCH', `network mode is '${hc.NetworkMode}', expected '${this.config.network}'`);
     }

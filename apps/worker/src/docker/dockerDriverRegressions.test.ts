@@ -89,6 +89,8 @@ class StubDocker {
   containerTemplate: unknown = undefined;
   /** Labels que `inspect` devuelve para una imagen (por id), simulando cambio entre listado e inspección. */
   inspectLabelOverride = new Map<string, Record<string, string>>();
+  /** Arquitectura que `docker info --format '{{.Architecture}}'` reporta (defecto: x86_64). */
+  daemonArch = 'x86_64';
 
   private deepCopy<T>(v: T): T {
     return JSON.parse(JSON.stringify(v)) as T;
@@ -232,7 +234,10 @@ class StubDocker {
       return this.okRes('');
     }
     if (sub === 'version') return this.okRes('29.1.3\n');
-    if (sub === 'info') return this.okRes(JSON.stringify({ ServerVersion: '29.1.3' }));
+    if (sub === 'info') {
+      if (args.some((a) => a.includes('Architecture'))) return this.okRes(this.daemonArch + '\n');
+      return this.okRes(JSON.stringify({ ServerVersion: '29.1.3' }));
+    }
     // docker run --name <n>: registrar el contenedor desde la plantilla.
     if (sub === 'run') {
       const nIdx = args.indexOf('--name');
@@ -247,6 +252,12 @@ class StubDocker {
     if (sub === 'stop') {
       const entry = this.containers.get(args[args.length - 1]!) as { State?: { Running?: boolean } } | undefined;
       if (entry?.State) entry.State.Running = false;
+      return this.okRes('');
+    }
+    // docker start <n>: marcar en marcha.
+    if (sub === 'start') {
+      const entry = this.containers.get(args[args.length - 1]!) as { State?: { Running?: boolean } } | undefined;
+      if (entry?.State) entry.State.Running = true;
       return this.okRes('');
     }
     // docker rm <n>: eliminar el contenedor del mapa.
@@ -1026,12 +1037,120 @@ describe('B8: validación posterior completa vía docker inspect', () => {
     expect(r.code).toMatch(/CONTAINER_TMPFS_MISMATCH/);
   });
 
-  test('PidMode=host → rechazado', async () => {
+  test('PidMode=host → rechazado (solo valores exactos permitidos)', async () => {
     const { r } = await startWith((insp) => {
       (insp.HostConfig as Record<string, unknown>).PidMode = 'host';
     });
     expect(r.ok).toBe(false);
-    expect(r.code).toMatch(/CONTAINER_PID_HOST/);
+    expect(r.code).toMatch(/CONTAINER_PID_MODE/);
+  });
+
+  test('PidMode no permitido (container:otro) → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.HostConfig as Record<string, unknown>).PidMode = 'container:otro';
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_PID_MODE/);
+  });
+
+  test('IpcMode=host → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.HostConfig as Record<string, unknown>).IpcMode = 'host';
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_IPC_MODE/);
+  });
+
+  test('IpcMode no permitido (shareable) → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.HostConfig as Record<string, unknown>).IpcMode = 'shareable';
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_IPC_MODE/);
+  });
+
+  test('Devices ausente → rechazado (debe estar explícitamente vacío)', async () => {
+    const { r } = await startWith((insp) => {
+      delete (insp.HostConfig as Record<string, unknown>).Devices;
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_DEVICES/);
+  });
+
+  test('Devices no vacío → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.HostConfig as Record<string, unknown>).Devices = [{ PathOnHost: '/dev/sda', PathInContainer: '/dev/xvda' }];
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_DEVICES/);
+  });
+
+  test('red adicional (bridge) → rechazado: exactamente una red', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.NetworkSettings as Record<string, unknown>).Networks = { 'appforge-apps': {}, 'bridge': {} };
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_NETWORK_MISMATCH/);
+  });
+
+  test('sin redes → rechazado', async () => {
+    const { r } = await startWith((insp) => {
+      (insp.NetworkSettings as Record<string, unknown>).Networks = {};
+    });
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/CONTAINER_NETWORK_MISMATCH/);
+  });
+
+  test('arquitectura de imagen distinta a la del daemon → rechazado', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const projectDir = makeProjectDir(dataDir, PID);
+    recordAllReceipts(db, PID, projectDir);
+    db.prepare('INSERT INTO deployments(id) VALUES (?)').run(DID);
+    const stub = new StubDocker();
+    stub.daemonArch = 'aarch64'; // daemon arm64, imagen amd64
+    const d = makeDriver(dataDir, db, stub);
+    expect((await d.buildCandidate(opArgs(PID, DID))).ok).toBe(true);
+    const fp = (db.prepare('SELECT snapshot_fingerprint AS f FROM deployments WHERE id=?').get(DID) as { f: string }).f;
+    const imgRef = `appforge/app-${PID.slice(0, 8)}:dep-${DID.slice(0, 8)}-${fp.slice(0, 12)}`;
+    const liveVolume = projectLiveVolumeName(PID);
+    stub.containerTemplate = {
+      Config: {
+        Labels: {
+          'com.appforge.managed': 'true',
+          'com.appforge.project-id': PID,
+          'com.appforge.deployment-id': DID,
+          'com.appforge.role': 'live',
+          'com.appforge.source-fingerprint': fp,
+        },
+        User: '1001',
+        Image: imgRef,
+      },
+      State: { Running: true },
+      Mounts: [
+        { Type: 'volume', Name: liveVolume, Source: liveVolume, Destination: '/data' },
+        { Type: 'tmpfs', Destination: '/tmp' },
+      ],
+      NetworkSettings: { Networks: { 'appforge-apps': {} }, Ports: {} },
+      HostConfig: {
+        Memory: 512 * 1024 * 1024,
+        MemorySwap: 512 * 1024 * 1024,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 128,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges'],
+        ReadonlyRootfs: true,
+        Privileged: false,
+        Devices: [],
+        PidMode: '',
+        IpcMode: 'private',
+        NetworkMode: 'appforge-apps',
+        RestartPolicy: { Name: 'unless-stopped' },
+      },
+    };
+    const r = await d.startCandidateAsLive(opArgs(PID, DID));
+    expect(r.ok).toBe(false);
+    expect(r.code).toMatch(/IMAGE_ARCH_MISMATCH/);
   });
 
   test('NetworkMode distinto → rechazado', async () => {
@@ -1086,5 +1205,31 @@ describe('NO-GO2 B6: verified_source_fingerprint fail closed en reuseSnapshot', 
     db.prepare('UPDATE deployments SET verified_source_fingerprint=? WHERE id=?').run(row.f.toUpperCase(), DID);
     const r = await d.buildCandidate(opArgs(PID, DID));
     expect(r.ok).toBe(true);
+  });
+});
+
+describe('NO-GO2 B5: normalización de arquitectura', () => {
+  test('normalizeArch mapea x86_64→amd64 y aarch64→arm64', async () => {
+    const { normalizeArch } = await import('./dockerDriver.js');
+    expect(normalizeArch('x86_64')).toBe('amd64');
+    expect(normalizeArch('aarch64')).toBe('arm64');
+    expect(normalizeArch('amd64')).toBe('amd64');
+    expect(normalizeArch('arm64')).toBe('arm64');
+    expect(normalizeArch('X86_64\n')).toBe('amd64');
+    expect(normalizeArch('riscv64')).toBe('riscv64');
+  });
+
+  test('preflight informa la arquitectura del daemon en el diagnóstico', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const stub = new StubDocker();
+    stub.daemonArch = 'aarch64';
+    const sock = path.join(dataDir, 'docker.sock');
+    const server = net.createServer();
+    await new Promise<void>((res) => server.listen(sock, () => res()));
+    const cfg = { ...resolveDockerDriverConfig(BASE_ENV, dataDir)!, socketPath: sock };
+    const r = await preflightDocker(stub.asRunner(), cfg);
+    server.close();
+    expect(r.ok).toBe(true);
+    expect(r.diagnostics.join(' ')).toMatch(/daemon architecture: arm64/);
   });
 });

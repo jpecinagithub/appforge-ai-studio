@@ -60,6 +60,8 @@ export {
   DockerDriverError,
   resolveDockerDriverConfig,
   preflightDocker,
+  detectDaemonArchitecture,
+  normalizeArch,
   acquireDeploySlot,
   releaseDeploySlot,
   activeDeploySlots,
