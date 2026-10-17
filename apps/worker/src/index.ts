@@ -45,7 +45,7 @@ export {
   transitionDeployment,
   recordEvent,
   requestDeploymentCancel,
-  isCancelRequested,
+  isDeploymentCancelRequested,
   getProjectRuntime,
   upsertProjectRuntime,
   reconcileDeployments,
@@ -69,4 +69,3 @@ export type {
 } from './deploy/driver.js';
 export { runDeploymentPipeline, persistedVerificationGate, SUPPORTED_DEPLOY_TARGETS } from './deploy/orchestrator.js';
 export type { RunDeploymentOptions, VerificationGateResult } from './deploy/orchestrator.js';
-export { sanitizeSecrets } from './secrets.js';
