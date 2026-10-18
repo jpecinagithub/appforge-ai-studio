@@ -35,18 +35,25 @@ ref="$(git -C "$ROOT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true
 
 step "running the production preflight"
 bash "$ROOT_DIR/infra/scripts/preflight.sh" --env "$ENV_FILE" --compose "$COMPOSE_FILE" >/dev/null
+if docker info >/dev/null 2>&1; then
+  DOCKER=(docker)
+elif command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+  DOCKER=(sudo -n docker)
+else
+  fail "Docker daemon is unavailable"
+fi
 
 # Docker-socket access is host-equivalent, so Compose-level separation is not
 # enough: §9.24 requires the whole VM to be dedicated to AppForge.
-foreign="$(docker ps --format '{{.Names}}' | awk '
+foreign="$("${DOCKER[@]}" ps --format '{{.Names}}' | awk '
   $0 == "appforge-studio" || $0 == "appforge-caddy" || $0 ~ /^appforge-app-/ { next }
   { print }
 ')"
 [ -z "$foreign" ] || fail "dedicated VM check failed: unrelated running containers exist"
 
-[ "$(docker inspect --format '{{.State.Health.Status}}' appforge-studio 2>/dev/null || true)" = healthy ] \
+[ "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' appforge-studio 2>/dev/null || true)" = healthy ] \
   || fail "appforge-studio is not healthy"
-[ "$(docker inspect --format '{{.State.Status}}' appforge-caddy 2>/dev/null || true)" = running ] \
+[ "$("${DOCKER[@]}" inspect --format '{{.State.Status}}' appforge-caddy 2>/dev/null || true)" = running ] \
   || fail "appforge-caddy is not running"
 
 install_evidence="$(find "$EVIDENCE_DIR" -maxdepth 1 -type f -name 'install-*.json' -print 2>/dev/null | sort | tail -n1)"
@@ -67,7 +74,7 @@ printf '%s' "$driver_json" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"docker"' 
 mkdir -p "$EVIDENCE_DIR"
 chmod 700 "$EVIDENCE_DIR"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-docker_version="$(docker version --format '{{.Server.Version}}')"
+docker_version="$("${DOCKER[@]}" version --format '{{.Server.Version}}')"
 arch="$(uname -m)"
 evidence="$EVIDENCE_DIR/readiness-$timestamp.json"
 printf '{"schema":1,"checkedAt":"%s","commit":"%s","ref":"%s","host":{"arch":"%s"},"docker":{"version":"%s","driver":"docker"},"checks":{"preflight":"pass","dedicatedVm":"pass","studioHealth":"pass","edge":"pass","installEvidence":"pass"}}\n' \
