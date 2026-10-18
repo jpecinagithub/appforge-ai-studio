@@ -371,6 +371,14 @@ function ok(data?: Record<string, string>): DriverResult {
   return { ok: true, data };
 }
 
+interface CurrentLiveIdentity {
+  containerName: string;
+  deploymentId: string;
+  fingerprint: string;
+  image: string;
+  volume: string;
+}
+
 /** Opaque, API-safe metadata. Host paths and manifest filenames never leave the driver. */
 function validatedBackupData(manifest: BackupManifest): Record<string, string> {
   return {
@@ -491,6 +499,46 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (labels[LABEL_ROLE] !== 'live') {
       throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' is not a live container`);
     }
+  }
+
+  /**
+   * Identidad autoconsistente del live actual. No confía en SQLite ni en
+   * parámetros HTTP: nombre, labels e imagen deben concordar exactamente.
+   */
+  private async currentLiveIdentity(projectId: string): Promise<CurrentLiveIdentity> {
+    const containerName = `appforge-app-${id8(projectId)}`;
+    const info = (await inspectResource(this.runner, 'container', containerName)) as {
+      Config?: { Labels?: Record<string, string>; Image?: string };
+    };
+    const labels = info?.Config?.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true') {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `refusing to touch unmanaged container '${containerName}'`);
+    }
+    if ((labels[LABEL_PROJECT] ?? '').toLowerCase() !== projectId.toLowerCase()) {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' belongs to another project`);
+    }
+    if (labels[LABEL_ROLE] !== 'live') {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' is not a live container`);
+    }
+    const deploymentId = labels[LABEL_DEPLOYMENT] ?? '';
+    const fingerprint = labels[LABEL_FINGERPRINT] ?? '';
+    assertUuid(deploymentId, 'deployment-id');
+    assertFingerprint(fingerprint);
+    const expected = resourceNames(projectId, deploymentId, fingerprint);
+    const image = String(info?.Config?.Image ?? '');
+    if (image !== expected.image) {
+      throw new DockerDriverError(
+        'FOREIGN_RESOURCE',
+        `live image reference does not match its deployment/fingerprint labels`,
+      );
+    }
+    return {
+      containerName,
+      deploymentId,
+      fingerprint: fingerprint.toLowerCase(),
+      image,
+      volume: expected.liveVolume,
+    };
   }
 
   private async containerRunning(name: string): Promise<boolean> {
@@ -1035,16 +1083,26 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     volume: string,
     role: ResourceRole,
     timeoutMs: number,
+    liveIdentity?: CurrentLiveIdentity,
   ): Promise<DriverResult> {
-    const names = this.names(args.projectId, args.deploymentId);
-    const labels = this.opLabels(args.projectId, args.deploymentId, role);
+    const names = liveIdentity ? null : this.names(args.projectId, args.deploymentId);
+    const image = liveIdentity?.image ?? names!.image;
+    const labels: ManagedLabels = liveIdentity
+      ? {
+          projectId: args.projectId,
+          deploymentId: liveIdentity.deploymentId,
+          role,
+          fingerprint: liveIdentity.fingerprint,
+        }
+      : this.opLabels(args.projectId, args.deploymentId, role);
+    const envDeploymentId = liveIdentity?.deploymentId ?? args.deploymentId;
     const migName = `appforge-mig-${id8(args.deploymentId)}`;
     const runArgs = hardenedRunArgs({
       name: migName,
-      image: names.image,
+      image,
       volume,
       labels,
-      envFile: this.ensureEnvFile(args.projectId, args.deploymentId),
+      envFile: this.ensureEnvFile(args.projectId, envDeploymentId),
       network: this.config.network,
       role: 'migration',
       command: ['node', 'backend/dist/migrate.js'],
@@ -1056,7 +1114,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (r.code !== 0) {
       return err('MIGRATION_FAILED', `migrations exited ${r.code}: ${(r.stdout + '\n' + r.stderr).slice(0, 800)}`);
     }
-    return this.validateVolumeDatabase(volume, names.image, args.signal);
+    const verified = await this.validateVolumeDatabase(volume, image, args.signal);
+    if (!verified.ok) return verified;
+    return { ok: true, output: sanitizeSecrets(`${r.stdout}\n${r.stderr}`).slice(0, 64 * 1024) };
   }
 
   /** Extrae app.db del volumen y le pasa PRAGMA quick_check. */
@@ -1135,6 +1195,29 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('LIVE_MIGRATION_ERROR', (e as Error).message);
+    }
+  }
+
+  async runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
+    try {
+      const identity = await this.currentLiveIdentity(args.projectId);
+      if (await this.containerRunning(identity.containerName)) {
+        return err('LIVE_NOT_QUIESCED', 'manual migrations require the live runtime to be stopped by a validated backup');
+      }
+      const volumeCheck = await this.ensureLiveVolume(args.projectId, args.signal);
+      if (volumeCheck) return volumeCheck;
+      return await this.runMigrations(
+        args,
+        identity.volume,
+        'migration',
+        MIGRATION_TIMEOUT_MS,
+        identity,
+      );
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
+      return err('MANUAL_MIGRATION_ERROR', (e as Error).message);
     }
   }
 
@@ -2279,6 +2362,63 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err(e.code, e.message);
       }
       return err('RESTORE_ERROR', (e as Error).message);
+    }
+  }
+
+  async recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    if (!isValidBackupId(args.backupId)) {
+      return err('INVALID_BACKUP_ID', 'recoverCurrentLiveBackup requires a valid backupId');
+    }
+    try {
+      // Se captura la identidad real ANTES del restore, porque restoreBackup
+      // elimina el contenedor live al sustituir físicamente el volumen.
+      const identity = await this.currentLiveIdentity(args.projectId);
+      const liveArgs: DriverOpArgs = {
+        projectId: args.projectId,
+        deploymentId: identity.deploymentId,
+        candidateId: `cand-${id8(identity.deploymentId)}`,
+        signal: args.signal,
+      };
+      const restored = await this.restoreBackup({ ...liveArgs, backupId: args.backupId });
+      if (!restored.ok) {
+        // El restore puede fallar antes de tocar el live (contenedor detenido
+        // todavía presente) o después de una compensación (contenedor ya
+        // eliminado). En ambos casos se intenta recuperar servicio sano sin
+        // ocultar que el estado pre-migración no pudo confirmarse.
+        let service: DriverResult;
+        if (await resourceExists(this.runner, 'container', identity.containerName)) {
+          service = await this.resumeCurrentLiveRuntime({ ...args, signal: args.signal });
+        } else {
+          service = await this.startPreviousVersion({
+            ...liveArgs,
+            previousLiveVersion: identity.image,
+          });
+          if (service.ok) service = await this.runHealthCheck({ ...liveArgs, runtime: 'live' });
+        }
+        return err(
+          service.ok ? 'MANUAL_RESTORE_FAILED' : 'MANUAL_RESTORE_AND_RECOVERY_FAILED',
+          `backup restore failed (${restored.code}): ${restored.error}; service recovery ${service.ok ? 'succeeded' : `failed (${service.code}): ${service.error}`}`,
+        );
+      }
+
+      const started = await this.startPreviousVersion({
+        ...liveArgs,
+        previousLiveVersion: identity.image,
+      });
+      if (!started.ok) {
+        return err('MANUAL_RECOVERY_START_FAILED', `${started.code}: ${started.error}`);
+      }
+      const health = await this.runHealthCheck({ ...liveArgs, runtime: 'live' });
+      if (!health.ok) {
+        return err('MANUAL_RECOVERY_UNHEALTHY', `${health.code}: ${health.error}`);
+      }
+      return ok({ restored: 'true', liveImage: identity.image });
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
+        return err(e.code, e.message);
+      }
+      return err('MANUAL_RECOVERY_ERROR', (e as Error).message);
     }
   }
 

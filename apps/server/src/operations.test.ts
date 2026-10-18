@@ -6,8 +6,10 @@ import type Database from 'better-sqlite3';
 import { openDb } from './db.js';
 import {
   acquireProjectOperationLock,
+  checkpointOperation,
   completeOperation,
   listOperations,
+  listRunningOperations,
   OperationAuditError,
   reconcileInterruptedOperations,
   reconcileProjectOperationLocks,
@@ -79,6 +81,17 @@ describe('administrative operation idempotency', () => {
   it('returns in_progress for an identical concurrent request', () => {
     expect(reserveOperation(db, base).kind).toBe('started');
     expect(reserveOperation(db, base).kind).toBe('in_progress');
+  });
+
+  it('persists a bounded recovery checkpoint while the operation is running', () => {
+    const first = reserveOperation(db, { ...base, operation: 'migrations' });
+    if (first.kind !== 'started') throw new Error('expected started');
+    const checkpoint = { phase: 'backup_ready', backupId: 'bk_restart_safe' };
+    const updated = checkpointOperation(db, first.record.id, checkpoint);
+    expect(updated.checkpoint).toEqual(checkpoint);
+    expect(listRunningOperations(db)).toHaveLength(1);
+    completeOperation(db, first.record.id, 503, { error: { code: 'INTERRUPTED' } });
+    expect(() => checkpointOperation(db, first.record.id, checkpoint)).toThrow(/already terminal/);
   });
 
   it('fails closed on malformed keys and double completion', () => {

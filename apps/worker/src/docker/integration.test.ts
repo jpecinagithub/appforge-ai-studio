@@ -580,8 +580,10 @@ d('docker integration (fase 7A)', () => {
     expect(manifest.hadDatabase).toBe(true);
     expect(manifest.files.some((f) => f.name === 'app.db' && /^[0-9a-f]{64}$/.test(f.sha256))).toBe(true);
 
-    // El backup detuvo live: la misma operación administrativa lo reanuda y
-    // solo confirma éxito después del health check.
+    // El backup detuvo live: se ejecutan las migraciones de la imagen live
+    // inspeccionada (el ID administrativo no tiene snapshot) y solo después
+    // se reanuda y confirma health.
+    okRes(await h.driver.runCurrentLiveMigrations(manualArgs));
     okRes(await h.driver.resumeCurrentLiveRuntime(manualArgs));
     const ip2 = await containerIp(h.names.liveContainer);
     const t2 = await httpJsonDirect('POST', `http://${ip2}:8080/api/todos`, { body: { title: 'after-backup' }, cookie });
@@ -880,11 +882,9 @@ d('docker integration (fase 7A)', () => {
     expect(mig.ok).toBe(false);
     expect(mig.code).toBe('MIGRATION_FAILED');
 
-    // Rollback físico: restore del backup + arranque de la versión anterior.
-    // Las operaciones físicas deben ejecutarse (staging → swap → start).
-    okRes(await h.driver.restoreBackup({ ...args3, backupId }));
-    okRes(await h.driver.startPreviousVersion({ ...args3, previousLiveVersion: v1Image }));
-    okRes(await h.driver.runHealthCheck({ ...args3, runtime: 'live' }));
+    // Recuperación administrativa física: deriva la identidad del live
+    // actual, restaura staging → swap, arranca la MISMA imagen y exige health.
+    okRes(await h.driver.recoverCurrentLiveBackup({ ...args3, backupId }));
 
     // La versión anterior sirve y los datos anteriores están intactos.
     const rec = await h.driver.reconcileRuntime(args3);

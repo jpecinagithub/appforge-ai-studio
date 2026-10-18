@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS operation_audit(
   status TEXT NOT NULL,
   response_status INTEGER,
   response_json TEXT,
+  checkpoint_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   finished_at TEXT,
@@ -101,12 +102,22 @@ const DEPLOYMENTS_PHASE6_COLUMNS: Array<[string, string]> = [
   ['error', 'TEXT'],
 ];
 
+const OPERATION_AUDIT_7C_COLUMNS: Array<[string, string]> = [
+  ['checkpoint_json', 'TEXT'],
+];
+
 function addMissingColumns(db: Database.Database): void {
   const existing = new Set(
     (db.prepare('PRAGMA table_info(deployments)').all() as Array<{ name: string }>).map((c) => c.name),
   );
   for (const [col, ddl] of DEPLOYMENTS_PHASE6_COLUMNS) {
     if (!existing.has(col)) db.exec(`ALTER TABLE deployments ADD COLUMN ${col} ${ddl}`);
+  }
+  const operationColumns = new Set(
+    (db.prepare('PRAGMA table_info(operation_audit)').all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  for (const [col, ddl] of OPERATION_AUDIT_7C_COLUMNS) {
+    if (!operationColumns.has(col)) db.exec(`ALTER TABLE operation_audit ADD COLUMN ${col} ${ddl}`);
   }
 }
 

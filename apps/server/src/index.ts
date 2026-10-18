@@ -33,10 +33,11 @@ import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
 import {
   acquireProjectOperationLock,
+  checkpointOperation,
   completeOperation,
+  listRunningOperations,
   listOperations,
   OperationAuditError,
-  reconcileInterruptedOperations,
   reconcileProjectOperationLocks,
   releaseProjectOperationLock,
   reserveOperation,
@@ -210,6 +211,58 @@ export function reconcileInterruptedMigrations(db: Database.Database): number {
   return Number(r.changes);
 }
 
+/**
+ * 7C.2: una operación administrativa interrumpida nunca se limita a cambiar
+ * filas. Primero recupera el servicio; migraciones/rollback con backup
+ * persistido restauran físicamente el estado anterior. Después conserva un
+ * resultado 503 auditable: la petición original no se declara exitosa.
+ */
+export async function recoverInterruptedAdministrativeOperations(
+  db: Database.Database,
+  driver: DeploymentDriver | undefined,
+  dataDir: string,
+): Promise<number> {
+  const running = listRunningOperations(db);
+  for (const operation of running) {
+    const args = {
+      projectId: operation.projectId,
+      deploymentId: operation.id,
+      candidateId: `cand-${operation.id.slice(0, 8)}`,
+      signal: AbortSignal.timeout(5 * 60_000),
+    };
+    let recovery: { ok: boolean; code?: string; error?: string } = {
+      ok: false,
+      code: 'DEPLOYMENT_DRIVER_NOT_CONFIGURED',
+      error: 'deployment driver unavailable during restart recovery',
+    };
+    if (driver) {
+      try {
+        const checkpoint = operation.checkpoint as { phase?: unknown; backupId?: unknown } | null;
+        const backupId = typeof checkpoint?.backupId === 'string' && isValidBackupId(checkpoint.backupId)
+          ? checkpoint.backupId
+          : null;
+        const requiresRestore =
+          (operation.operation === 'migrations' || operation.operation === 'rollback') &&
+          checkpoint?.phase === 'backup_ready' &&
+          backupId !== null;
+        recovery = requiresRestore
+          ? await driver.recoverCurrentLiveBackup({ ...args, backupId })
+          : await driver.resumeCurrentLiveRuntime(args);
+      } catch (e) {
+        recovery = { ok: false, code: 'RECOVERY_EXCEPTION', error: (e as Error)?.message ?? String(e) };
+      }
+    }
+    const detail = recovery.ok
+      ? 'live recovery succeeded; retry with a new idempotency key after inspection'
+      : `live recovery failed (${recovery.code ?? 'UNKNOWN'}): ${recovery.error ?? 'unknown error'}`;
+    completeOperation(db, operation.id, 503, err(
+      'OPERATION_INTERRUPTED',
+      sanitizeOperationDiagnostic(`Administrative operation was interrupted by a Studio restart; ${detail}`, dataDir),
+    ));
+  }
+  return running.length;
+}
+
 // ---------------------------------------------------------------------------
 // Row mappers
 // ---------------------------------------------------------------------------
@@ -275,6 +328,62 @@ function rowToMigration(r: Record<string, any>): MigrationRecord {
     logs: r.logs ?? '',
     error: r.error ?? null,
   };
+}
+
+const MANAGED_MIGRATION_FILE_RE = /^(\d{3,})_[A-Za-z0-9][A-Za-z0-9._-]*\.sql$/;
+
+function managedMigrationFiles(root: string): Array<{ version: number; name: string }> {
+  const dir = path.join(root, 'migrations');
+  const files = fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && MANAGED_MIGRATION_FILE_RE.test(entry.name))
+    .map((entry) => {
+      const match = MANAGED_MIGRATION_FILE_RE.exec(entry.name)!;
+      return { version: Number(match[1]), name: entry.name };
+    })
+    .sort((a, b) => a.version - b.version || a.name.localeCompare(b.name));
+  const seen = new Set<number>();
+  for (const file of files) {
+    if (!Number.isSafeInteger(file.version) || seen.has(file.version)) {
+      throw new Error(`duplicate or invalid migration version: ${file.name}`);
+    }
+    seen.add(file.version);
+  }
+  return files;
+}
+
+function insertManagedMigrationRows(
+  db: Database.Database,
+  projectId: string,
+  files: Array<{ version: number; name: string }>,
+): string[] {
+  const startedAt = nowIso();
+  const insert = db.prepare(
+    `INSERT INTO migrations(id,project_id,version,name,status,started_at,finished_at,duration_ms,logs,error)
+     VALUES (?,?,?,?,'running',?,NULL,NULL,'',NULL)`,
+  );
+  const ids = files.map(() => randomUUID());
+  db.transaction(() => files.forEach((file, index) => {
+    insert.run(ids[index], projectId, file.version, file.name, startedAt);
+  }))();
+  return ids;
+}
+
+function finishManagedMigrationRows(
+  db: Database.Database,
+  ids: string[],
+  input: { status: 'success' | 'failed'; startedMs: number; logs: string; error: string | null },
+): MigrationRecord[] {
+  const finishedAt = nowIso();
+  const durationMs = Math.max(0, Date.now() - input.startedMs);
+  const update = db.prepare(
+    `UPDATE migrations SET status=?,finished_at=?,duration_ms=?,logs=?,error=?
+     WHERE id=? AND status='running'`,
+  );
+  const read = db.prepare('SELECT * FROM migrations WHERE id=?');
+  return db.transaction(() => {
+    for (const id of ids) update.run(input.status, finishedAt, durationMs, input.logs, input.error, id);
+    return ids.map((id) => rowToMigration(read.get(id) as Record<string, unknown>));
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1093,205 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   });
 
   // ----------------------------------------------------- managed operations
+  app.post('/api/projects/:id/migrations', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const project = needProject(id);
+    if (project.type !== 'dynamic') {
+      reply.code(400);
+      return err('INVALID_TYPE', 'Live migrations are only available for dynamic projects');
+    }
+    if (!adminToken) {
+      reply.code(503);
+      return err('ADMIN_AUTH_NOT_CONFIGURED', 'Administrative authentication is not configured');
+    }
+    if (!deployDriver) {
+      reply.code(501);
+      return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
+    }
+    const rawKey = req.headers['idempotency-key'];
+    const idempotencyKey = Array.isArray(rawKey) ? '' : (rawKey ?? '');
+    let reservation;
+    try {
+      reservation = reserveOperation(db, {
+        idempotencyKey,
+        actor: 'admin',
+        operation: 'migrations',
+        projectId: id,
+        payload: {},
+      });
+    } catch (e) {
+      if (e instanceof OperationAuditError && e.code === 'INVALID_IDEMPOTENCY_KEY') {
+        reply.code(400);
+        return err(e.code, e.message);
+      }
+      throw e;
+    }
+    if (reservation.kind === 'conflict') {
+      reply.code(409);
+      return err('IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+    }
+    if (reservation.kind === 'in_progress') {
+      reply.code(409);
+      return err('OPERATION_IN_PROGRESS', 'The idempotent operation is still running');
+    }
+    if (reservation.kind === 'replay') {
+      reply.header('Idempotency-Replayed', 'true').code(reservation.responseStatus);
+      return reservation.response;
+    }
+
+    const finish = (status: number, body: unknown): unknown => {
+      completeOperation(db, reservation.record.id, status, body);
+      reply.code(status);
+      return body;
+    };
+    const runtime = getProjectRuntimeRecord(db, id);
+    if (!runtime || runtime.status !== 'running' || !APPFORGE_IMAGE_REF_RE.test(runtime.liveImage)) {
+      return finish(409, err('RUNTIME_NOT_READY', 'Project has no verified running live runtime to migrate'));
+    }
+    if (getActiveDeployment(db, id)) {
+      return finish(409, err('DEPLOYMENT_ACTIVE', 'A deployment is already active for this project'));
+    }
+    let files: Array<{ version: number; name: string }>;
+    try {
+      files = managedMigrationFiles(projectDir(dataDir, id));
+    } catch (e) {
+      return finish(400, err('INVALID_MIGRATIONS', sanitizeOperationDiagnostic((e as Error).message, dataDir)));
+    }
+    if (files.length === 0) return finish(409, err('NO_MIGRATIONS', 'Project contains no managed migration files'));
+    if (!acquireProjectOperationLock(db, {
+      projectId: id,
+      operationId: reservation.record.id,
+      operation: 'migrations',
+    })) {
+      return finish(409, err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project'));
+    }
+    const releaseCapacity = acquireDeploymentCapacity(deployDriver);
+    if (!releaseCapacity) {
+      releaseProjectOperationLock(db, reservation.record.id);
+      return finish(409, err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted'));
+    }
+
+    const startedMs = Date.now();
+    const operationArgs = {
+      projectId: id,
+      deploymentId: reservation.record.id,
+      candidateId: `cand-${reservation.record.id.slice(0, 8)}`,
+    };
+    let backupId: string | null = null;
+    let rowIds: string[] = [];
+    const recover = async (): Promise<ReturnType<typeof err> | null> => {
+      if (!backupId) return null;
+      const recovered = await deployDriver.recoverCurrentLiveBackup({
+        ...operationArgs,
+        backupId,
+        signal: AbortSignal.timeout(5 * 60_000),
+      });
+      if (recovered.ok) return null;
+      return err(
+        'MIGRATION_RECOVERY_FAILED',
+        sanitizeOperationDiagnostic(
+          `${recovered.code ?? 'RECOVERY_FAILED'}: ${recovered.error ?? 'live recovery failed'}`,
+          dataDir,
+        ),
+      );
+    };
+
+    try {
+      const backup = await deployDriver.createLiveBackup({
+        ...operationArgs,
+        previousLiveVersion: runtime.liveImage,
+        signal: AbortSignal.timeout(10 * 60_000),
+      });
+      const backupData = backup.data ?? {};
+      const backupSize = Number(backupData.sizeBytes);
+      const backupCreatedAt = backupData.createdAt ?? '';
+      const validBackup =
+        backup.ok &&
+        isValidBackupId(backupData.backupId) &&
+        backupData.backupValidated === 'true' &&
+        backupData.hadDatabase === 'true' &&
+        Number.isSafeInteger(backupSize) &&
+        backupSize > 0 &&
+        Number.isFinite(Date.parse(backupCreatedAt)) &&
+        new Date(backupCreatedAt).toISOString() === backupCreatedAt;
+      if (!validBackup) {
+        const diagnostic = sanitizeOperationDiagnostic(
+          backup.error ?? backup.code ?? 'driver returned invalid backup evidence',
+          dataDir,
+        );
+        const resumed = await deployDriver.resumeCurrentLiveRuntime({
+          ...operationArgs,
+          signal: AbortSignal.timeout(120_000),
+        });
+        if (!resumed.ok) {
+          return finish(502, err(
+            'MIGRATION_BACKUP_RECOVERY_FAILED',
+            sanitizeOperationDiagnostic(
+              `${diagnostic}; live recovery failed (${resumed.code}): ${resumed.error}`,
+              dataDir,
+            ),
+          ));
+        }
+        return finish(502, err('MIGRATION_BACKUP_FAILED', diagnostic));
+      }
+      backupId = backupData.backupId!;
+      checkpointOperation(db, reservation.record.id, { phase: 'backup_ready', backupId });
+      rowIds = insertManagedMigrationRows(db, id, files);
+      const migrated = await deployDriver.runCurrentLiveMigrations({
+        ...operationArgs,
+        signal: AbortSignal.timeout(10 * 60_000),
+      });
+      const logs = migrated.output ? sanitizeOperationDiagnostic(migrated.output, dataDir) : '';
+      if (!migrated.ok) {
+        const diagnostic = sanitizeOperationDiagnostic(
+          `${migrated.code ?? 'MIGRATION_FAILED'}: ${migrated.error ?? 'migration failed'}`,
+          dataDir,
+        );
+        const recoveryError = await recover();
+        const finalError = recoveryError?.error.message ?? diagnostic;
+        finishManagedMigrationRows(db, rowIds, {
+          status: 'failed', startedMs, logs, error: finalError,
+        });
+        return finish(502, recoveryError ?? err('MIGRATION_FAILED', diagnostic));
+      }
+
+      const resumed = await deployDriver.resumeCurrentLiveRuntime({
+        ...operationArgs,
+        signal: AbortSignal.timeout(120_000),
+      });
+      if (!resumed.ok) {
+        const diagnostic = sanitizeOperationDiagnostic(
+          `${resumed.code ?? 'LIVE_RECOVERY_FAILED'}: ${resumed.error ?? 'live runtime unhealthy after migration'}`,
+          dataDir,
+        );
+        const recoveryError = await recover();
+        const finalError = recoveryError?.error.message ?? diagnostic;
+        finishManagedMigrationRows(db, rowIds, {
+          status: 'failed', startedMs, logs, error: finalError,
+        });
+        return finish(502, recoveryError ?? err('MIGRATION_LIVE_RECOVERY_FAILED', diagnostic));
+      }
+
+      const items = finishManagedMigrationRows(db, rowIds, {
+        status: 'success', startedMs, logs, error: null,
+      });
+      return finish(200, { items });
+    } catch (e) {
+      const diagnostic = sanitizeOperationDiagnostic((e as Error)?.message ?? String(e), dataDir);
+      const recoveryError = await recover();
+      const finalError = recoveryError?.error.message ?? diagnostic;
+      if (rowIds.length > 0) {
+        finishManagedMigrationRows(db, rowIds, {
+          status: 'failed', startedMs, logs: '', error: finalError,
+        });
+      }
+      return finish(502, recoveryError ?? err('MIGRATION_FAILED', diagnostic));
+    } finally {
+      releaseCapacity();
+      releaseProjectOperationLock(db, reservation.record.id);
+    }
+  });
+
   app.get('/api/projects/:id/migrations', async (req) => {
     const { id } = req.params as { id: string };
     const project = needProject(id);
@@ -1096,8 +1404,22 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
           result.error ?? result.code ?? 'driver returned invalid backup evidence',
           dataDir,
         );
+        const resumed = await deployDriver.resumeCurrentLiveRuntime({
+          ...driverArgs,
+          signal: AbortSignal.timeout(120_000),
+        });
+        if (!resumed.ok) {
+          return finish(502, err(
+            'BACKUP_INVALID_RESULT_AND_RECOVERY_FAILED',
+            sanitizeOperationDiagnostic(
+              `${diagnostic}; live recovery failed (${resumed.code}): ${resumed.error}`,
+              dataDir,
+            ),
+          ));
+        }
         return finish(502, err('BACKUP_INVALID_RESULT', diagnostic));
       }
+      checkpointOperation(db, reservation.record.id, { phase: 'backup_ready', backupId: data.backupId });
       // createLiveBackup deliberately leaves the live container quiesced for
       // deployment promotion. A standalone backup must explicitly resume and
       // health-check it with an independent recovery budget.
@@ -1499,8 +1821,6 @@ async function main(): Promise<void> {
   if (interruptedBuilds > 0) console.log(`[server] marked ${interruptedBuilds} interrupted build(s) as failed`);
   const interruptedMigrations = reconcileInterruptedMigrations(db);
   if (interruptedMigrations > 0) console.log(`[server] marked ${interruptedMigrations} interrupted migration(s) as failed`);
-  const interruptedOperations = reconcileInterruptedOperations(db);
-  if (interruptedOperations > 0) console.log(`[server] marked ${interruptedOperations} interrupted operation(s) as failed`);
   // Fase 5B: ephemeral previews never survive a restart.
   const stalePreviews = reconcilePreviews(db);
   if (stalePreviews > 0) console.log(`[server] discarded ${stalePreviews} stale preview(s)`);
@@ -1519,6 +1839,10 @@ async function main(): Promise<void> {
   // el driver inspecciona primero los recursos que realmente posee.
   const interruptedDeployments = await reconcileDeployments(db, deploymentDriver);
   if (interruptedDeployments > 0) console.log(`[server] marked ${interruptedDeployments} interrupted deployment(s) as failed`);
+  const interruptedOperations = await recoverInterruptedAdministrativeOperations(db, deploymentDriver, dataDir);
+  if (interruptedOperations > 0) {
+    console.log(`[server] recovered and closed ${interruptedOperations} interrupted administrative operation(s)`);
+  }
   const staleOperationLocks = reconcileProjectOperationLocks(db);
   if (staleOperationLocks > 0) console.log(`[server] released ${staleOperationLocks} stale project operation lock(s)`);
   if (deploymentDriver) {

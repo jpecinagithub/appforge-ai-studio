@@ -20,6 +20,7 @@ export interface OperationAuditRecord {
   status: AuditStatus;
   responseStatus: number | null;
   response: unknown | null;
+  checkpoint: unknown | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -94,10 +95,38 @@ function rowToRecord(row: Record<string, unknown>): OperationAuditRecord {
     status: String(row.status) as AuditStatus,
     responseStatus: row.response_status === null ? null : Number(row.response_status),
     response: parseResponse(row.response_json === null ? null : String(row.response_json)),
+    checkpoint: parseResponse(row.checkpoint_json === null ? null : String(row.checkpoint_json)),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     finishedAt: row.finished_at === null ? null : String(row.finished_at),
   };
+}
+
+export function checkpointOperation(
+  db: Database.Database,
+  id: string,
+  checkpoint: unknown,
+): OperationAuditRecord {
+  const checkpointJson = canonicalJson(checkpoint);
+  if (Buffer.byteLength(checkpointJson, 'utf8') > MAX_RESPONSE_BYTES) {
+    throw new OperationAuditError('CHECKPOINT_TOO_LARGE', 'operation checkpoint exceeds 64 KiB');
+  }
+  const now = new Date().toISOString();
+  const changed = db.prepare(
+    `UPDATE operation_audit SET checkpoint_json=?,updated_at=? WHERE id=? AND status='running'`,
+  ).run(checkpointJson, now, id);
+  if (changed.changes !== 1) {
+    throw new OperationAuditError('INVALID_OPERATION_STATE', 'operation is missing or already terminal');
+  }
+  const row = db.prepare('SELECT * FROM operation_audit WHERE id=?').get(id) as Record<string, unknown>;
+  return rowToRecord(row);
+}
+
+export function listRunningOperations(db: Database.Database): OperationAuditRecord[] {
+  const rows = db
+    .prepare("SELECT * FROM operation_audit WHERE status='running' ORDER BY created_at,id")
+    .all() as Array<Record<string, unknown>>;
+  return rows.map(rowToRecord);
 }
 
 export function reserveOperation(
