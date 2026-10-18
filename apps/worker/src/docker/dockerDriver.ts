@@ -1352,8 +1352,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   async runHealthCheck(args: HealthCheckArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
-      const cname = args.runtime === 'verify' ? names.verifyContainer : names.liveContainer;
+      let cname: string;
+      if (args.runtime === 'verify') {
+        cname = this.names(args.projectId, args.deploymentId).verifyContainer;
+      } else {
+        // El health live también se usa por operaciones administrativas cuyo
+        // ID no tiene snapshot. El slot live es canónico por proyecto.
+        cname = `appforge-app-${id8(args.projectId)}`;
+        await this.assertLiveSlot(args.projectId, cname);
+      }
       const ip = await this.containerIp(cname);
       const url = `http://${ip}:8080/healthz`;
       let lastErr = 'no attempts';
@@ -1504,15 +1511,19 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     try {
       const { projectId, deploymentId } = args;
-      const names = this.names(projectId, deploymentId);
+      // El backup manual recibe un operation/deploymentId nuevo que no tiene
+      // snapshot. El slot y volumen live dependen solo del proyecto; exigir un
+      // snapshot aquí rompería el endpoint HTTP aunque el runtime fuese sano.
+      const liveContainer = `appforge-app-${id8(projectId)}`;
+      const liveVolume = projectLiveVolumeName(projectId);
       const backupId = newBackupId();
       const dir = backupDirFor(this.config.dataDir, projectId, backupId);
       const stamp = new Date().toISOString();
       const hasPrevious =
         typeof args.previousLiveVersion === 'string' && APPFORGE_IMAGE_REF_RE.test(args.previousLiveVersion);
-      const liveContainerExists = await resourceExists(this.runner, 'container', names.liveContainer);
+      const liveContainerExists = await resourceExists(this.runner, 'container', liveContainer);
       if (!liveContainerExists) {
-        const liveVolumeExists = await resourceExists(this.runner, 'volume', names.liveVolume);
+        const liveVolumeExists = await resourceExists(this.runner, 'volume', liveVolume);
         // hadDatabase=false SOLO si no hay versión anterior, ni contenedor
         // live, ni volumen live con datos (revisión Codex, NO-GO 2, bloqueo
         // 2). "Contenedor live ausente" NO equivale a "primer despliegue".
@@ -1526,15 +1537,19 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           // Volumen live huérfano (existe sin contenedor): verificar sus
           // labels y respaldar sus datos con un contenedor temporal
           // endurecido.
-          const info = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+          const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
             Labels?: Record<string, string>;
           };
           try {
             assertLiveVolumeLabels(info?.Labels, projectId);
           } catch {
-            return err('FOREIGN_RESOURCE', `refusing to back up foreign live volume '${names.liveVolume}'`);
+            return err('FOREIGN_RESOURCE', `refusing to back up foreign live volume '${liveVolume}'`);
           }
-          return await this.backupOrphanLiveVolume(args, names.liveVolume, backupId, stamp);
+          // Con versión live persistida se usa esa imagen validada. El caso
+          // de primer despliegue con volumen huérfano reutiliza el candidato,
+          // que sí debe tener snapshot.
+          const helperImage = hasPrevious ? args.previousLiveVersion! : this.names(projectId, deploymentId).image;
+          return await this.backupOrphanLiveVolume(args, liveVolume, helperImage, backupId, stamp);
         }
         // Una versión anterior persistida sin contenedor ni volumen es una
         // inconsistencia peligrosa, no un primer despliegue vacío. Afirmar
@@ -1544,17 +1559,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           'previousLiveVersion exists but both live container and live volume are missing; refusing an empty backup',
         );
       }
-      await this.assertLiveSlot(projectId, names.liveContainer);
+      await this.assertLiveSlot(projectId, liveContainer);
       // Detener de forma controlada antes de copiar.
-      await this.stopContainerBounded(names.liveContainer, args.signal, 30);
-      if (await this.containerRunning(names.liveContainer)) {
+      await this.stopContainerBounded(liveContainer, args.signal, 30);
+      if (await this.containerRunning(liveContainer)) {
         return err('BACKUP_STOP_FAILED', 'live container did not stop before backup');
       }
       // A partir de aquí el live está detenido: cualquier fallo o abort debe
       // intentar re-levantarlo y verificar health ANTES de devolver el error.
       // Nunca se deja el servicio parado por un backup fallido (bloqueo 2).
       try {
-        const copied = await this.copyDatabaseFilesFromContainer(args, names.liveContainer, dir);
+        const copied = await this.copyDatabaseFilesFromContainer(args, liveContainer, dir);
         if (!copied.some((c) => c.name === 'app.db')) {
           throw new DockerDriverError('BACKUP_SOURCE_MISSING', 'live container has no app.db');
         }
@@ -1574,7 +1589,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
             ? err(e.code, e.message)
             : err('BACKUP_ERROR', (e as Error).message);
-        const recovered = await this.recoverStoppedLive(args, names.liveContainer);
+        const recovered = await this.recoverStoppedLive(args, liveContainer);
         if (!recovered.ok) {
           return err(
             'BACKUP_RECOVERY_FAILED',
@@ -1640,15 +1655,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   private async backupOrphanLiveVolume(
     args: LiveBackupArgs,
     liveVolume: string,
+    helperImage: string,
     backupId: string,
     stamp: string,
   ): Promise<DriverResult> {
     const { projectId, deploymentId } = args;
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
-    const names = this.names(projectId, deploymentId);
     const dir = backupDirFor(this.config.dataDir, projectId, backupId);
     const tmp = `appforge-tmp-backup-${randomUUID().slice(0, 8)}`;
-    const createArgs = hardenedTempVolumeArgs({ name: tmp, image: names.image, volume: liveVolume });
+    const createArgs = hardenedTempVolumeArgs({ name: tmp, image: helperImage, volume: liveVolume });
     assertNoForbiddenFlags(createArgs);
     const cc = await this.sh(createArgs, { timeoutMs: 30_000, signal: args.signal });
     if (cc.aborted) return err('OPERATION_ABORTED', 'orphan volume backup aborted');
@@ -1718,15 +1733,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   async resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
-      if (!(await resourceExists(this.runner, 'container', names.liveContainer))) {
+      const liveContainer = `appforge-app-${id8(args.projectId)}`;
+      if (!(await resourceExists(this.runner, 'container', liveContainer))) {
         return err('LIVE_MISSING', 'live container is missing; cannot resume it after backup');
       }
-      await this.assertLiveSlot(args.projectId, names.liveContainer);
-      if (await this.containerRunning(names.liveContainer)) {
+      await this.assertLiveSlot(args.projectId, liveContainer);
+      if (await this.containerRunning(liveContainer)) {
         return await this.runHealthCheck({ ...args, runtime: 'live' });
       }
-      return await this.recoverStoppedLive(args, names.liveContainer);
+      return await this.recoverStoppedLive(args, liveContainer);
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('RESUME_LIVE_ERROR', (e as Error).message);

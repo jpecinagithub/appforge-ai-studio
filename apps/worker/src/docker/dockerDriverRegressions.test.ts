@@ -1740,6 +1740,32 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     expect(live.State.Running).toBe(false);
   });
 
+  test('backup manual y reanudación funcionan con un operation id sin snapshot', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const operationId = '99999999-8888-4777-8666-555555555555';
+    const args = {
+      projectId: PID,
+      deploymentId: operationId,
+      candidateId: `cand-${operationId.slice(0, 8)}`,
+    };
+
+    const backup = await d.createLiveBackup({
+      ...args,
+      previousLiveVersion: 'appforge/app-11111111:dep-aaaaaaaa-000000000000',
+    });
+    expect(backup.ok).toBe(true);
+    expect(backup.data?.backupValidated).toBe('true');
+    expect(fs.existsSync(path.join(dataDir, 'deploy-snapshots', operationId))).toBe(false);
+
+    mockHealthOk(d);
+    const resumed = await d.resumeCurrentLiveRuntime(args);
+    expect(resumed.ok).toBe(true);
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+  });
+
   test('contenedor ausente + volumen live con datos → backup hadDatabase=true vía temporal endurecido', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
     const db = openDb();
