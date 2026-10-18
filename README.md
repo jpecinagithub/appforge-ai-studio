@@ -133,3 +133,17 @@ builds and deployments 30 seconds to finish (`APPFORGE_SHUTDOWN_TIMEOUT_MS`).
 Docker allows 40 seconds before forcing termination. Work that exceeds the
 budget is closed from persisted state by startup reconciliation; source files
 and the last healthy live deployment remain the recovery authority.
+
+Before beginning the three real 7C.3 runs, execute the fail-closed readiness
+gate on the Oracle host:
+
+```bash
+bash infra/scripts/certify-7c-readiness.sh
+```
+
+It requires a clean checkout at an exact tag, matching installation evidence,
+healthy Studio/edge containers, the real Docker driver, and a dedicated VM. It
+rejects a host with unrelated running containers and writes a sanitized JSON
+record under `.appforge-evidence/`; it never writes the admin token. Passing
+this gate establishes readiness only—the three E2E runs and their evidence are
+still required for certification.

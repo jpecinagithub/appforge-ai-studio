@@ -140,7 +140,7 @@ jobs:
       - name: Run production preflight
         shell: bash
         run: |
-          bash -n infra/scripts/install.sh infra/scripts/preflight.sh
+          bash -n infra/scripts/install.sh infra/scripts/preflight.sh infra/scripts/certify-7c-readiness.sh
           cp .env /tmp/appforge-insecure.env
           chmod 644 /tmp/appforge-insecure.env
           if bash infra/scripts/preflight.sh --env /tmp/appforge-insecure.env --compose infra/docker-compose.yml; then
