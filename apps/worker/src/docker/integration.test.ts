@@ -557,7 +557,19 @@ d('docker integration (fase 7A)', () => {
     const t1 = await httpJsonDirect('POST', `http://${ip}:8080/api/todos`, { body: { title: 'before-backup' }, cookie });
     const todoId = (t1.json as { id?: string }).id!;
 
-    const bk = await h.driver.createLiveBackup({ ...h.args, previousLiveVersion: null });
+    // Cruce HTTP→driver: una operación administrativa usa un ID nuevo que
+    // deliberadamente no tiene snapshot propio. Debe respaldar el slot live
+    // canónico y poder reanudarlo igualmente.
+    const manualDeploymentId = randomUUID();
+    const manualArgs = {
+      projectId: h.projectId,
+      deploymentId: manualDeploymentId,
+      candidateId: `cand-${manualDeploymentId.slice(0, 8)}`,
+    };
+    const bk = await h.driver.createLiveBackup({
+      ...manualArgs,
+      previousLiveVersion: h.names.image,
+    });
     okRes(bk);
     const backupId = bk.data!.backupId;
     expect(isValidBackupId(backupId)).toBe(true);
@@ -568,9 +580,9 @@ d('docker integration (fase 7A)', () => {
     expect(manifest.hadDatabase).toBe(true);
     expect(manifest.files.some((f) => f.name === 'app.db' && /^[0-9a-f]{64}$/.test(f.sha256))).toBe(true);
 
-    // El backup detuvo live: rearrancar y añadir datos posteriores.
-    await runner.run({ args: ['start', h.names.liveContainer], timeoutMs: 30_000 });
-    okRes(await h.driver.runHealthCheck({ ...h.args, runtime: 'live' }));
+    // El backup detuvo live: la misma operación administrativa lo reanuda y
+    // solo confirma éxito después del health check.
+    okRes(await h.driver.resumeCurrentLiveRuntime(manualArgs));
     const ip2 = await containerIp(h.names.liveContainer);
     const t2 = await httpJsonDirect('POST', `http://${ip2}:8080/api/todos`, { body: { title: 'after-backup' }, cookie });
     expect(t2.status).toBe(201);
