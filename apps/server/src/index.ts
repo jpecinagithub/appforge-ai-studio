@@ -42,7 +42,7 @@ import {
   releaseProjectOperationLock,
   reserveOperation,
 } from './operations.js';
-import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, waitForTaskSet, type AgentSettings, type ToolContext } from 'appforge-worker';
+import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, activeDeploymentCapacity, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, waitForTaskSet, type AgentSettings, type ToolContext } from 'appforge-worker';
 // Fase 6 — orquestador persistente del pipeline de despliegue (CONTRACT.md §9.21)
 import {
   DeploymentError,
@@ -1070,6 +1070,19 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   // 501 estable, sin simular despliegues. El fake solo se inyecta vía
   // ServerOptions en tests; nunca por defecto en producción.
   const deployDriver = opts.deploymentDriver;
+
+  app.get('/api/deployment-driver', async () => {
+    if (!deployDriver) return { configured: false, name: null, active: 0, limit: null, available: null };
+    const active = activeDeploymentCapacity(deployDriver);
+    const limit = deployDriver.maxConcurrentDeploys ?? null;
+    return {
+      configured: true,
+      name: deployDriver.name,
+      active,
+      limit,
+      available: limit === null ? null : Math.max(0, limit - active),
+    };
+  });
 
   app.post('/api/projects/:id/deploy', async (req, reply) => {
     const { id } = req.params as { id: string };

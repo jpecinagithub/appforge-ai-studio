@@ -10,6 +10,7 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  ServerCog,
   Smartphone,
   Sparkles,
   Tablet,
@@ -27,6 +28,7 @@ import type { TKey } from '../i18n/strings';
 import { Badge, Btn, Empty, ErrorBox, IconBtn, Spinner, TextInput } from './ui';
 import { FileTree } from './FileTree';
 import { CodeEditor } from './CodeEditor';
+import { OperationsPane } from './OperationsPane';
 import { formatBytes, formatDateTime, formatDuration, timeAgo } from '../utils/format';
 import { apiErrorDetail, apiErrorKey } from '../utils/errors';
 import type {
@@ -42,6 +44,7 @@ const TABS: { id: WorkspaceTab; label: TKey; Icon: LucideIcon }[] = [
   { id: 'builds', label: 'ws.tabBuilds', Icon: Hammer },
   { id: 'code', label: 'ws.tabCode', Icon: Code2 },
   { id: 'console', label: 'ws.tabConsole', Icon: TerminalSquare },
+  { id: 'operations', label: 'ws.tabOperations', Icon: ServerCog },
 ];
 
 export function Workspace() {
@@ -50,7 +53,7 @@ export function Workspace() {
   return (
     <div className="flex h-full flex-col">
       <div
-        className="flex gap-1 border-b border-zinc-200 px-3 dark:border-zinc-800"
+        className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-3 dark:border-zinc-800"
         role="tablist"
         aria-label={t('ws.workspace')}
       >
@@ -80,6 +83,7 @@ export function Workspace() {
         {workspaceTab === 'builds' && <BuildsPane />}
         {workspaceTab === 'code' && <CodePane />}
         {workspaceTab === 'console' && <ConsolePane />}
+        {workspaceTab === 'operations' && <OperationsPane />}
       </div>
     </div>
   );

@@ -268,6 +268,23 @@ describe('POST /api/projects/:id/deploy (criterios 1, 18, 19, 20)', () => {
   });
 });
 
+describe('GET /api/deployment-driver — operations UI', () => {
+  it('reports the configured driver and capacity without exposing configuration', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/deployment-driver' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ configured: true, name: 'fake', active: 0, limit: null, available: null });
+
+    const withoutDriver = await buildApp();
+    try {
+      const missing = await withoutDriver.inject({ method: 'GET', url: '/api/deployment-driver' });
+      expect(missing.statusCode).toBe(200);
+      expect(missing.json()).toEqual({ configured: false, name: null, active: 0, limit: null, available: null });
+    } finally {
+      await withoutDriver.close();
+    }
+  });
+});
+
 describe('concurrent deploys (criterio 4)', () => {
   it('serializes deploy against another managed operation on the same project', async () => {
     addProject('locked-project');

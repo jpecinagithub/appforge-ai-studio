@@ -161,6 +161,7 @@ const es = {
   'ws.tabBuilds': 'Builds',
   'ws.tabCode': 'Code',
   'ws.tabConsole': 'Console',
+  'ws.tabOperations': 'Operaciones',
   'ws.workspace': 'Workspace',
 
   'preview.reload': 'Recargar',
@@ -484,6 +485,7 @@ const en: Record<EsKey, string> = {
   'ws.tabBuilds': 'Builds',
   'ws.tabCode': 'Code',
   'ws.tabConsole': 'Console',
+  'ws.tabOperations': 'Operations',
   'ws.workspace': 'Workspace',
 
   'preview.reload': 'Reload',
