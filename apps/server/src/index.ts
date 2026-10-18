@@ -248,7 +248,26 @@ export async function recoverInterruptedAdministrativeOperations(
           currentImage?: unknown;
           rollbackDeploymentId?: unknown;
           targetImage?: unknown;
+          deploymentId?: unknown;
         } | null;
+        if (operation.operation === 'deploy' && checkpoint?.phase === 'accepted' && typeof checkpoint.deploymentId === 'string') {
+          const accepted = getDeploymentRecord(db, checkpoint.deploymentId);
+          if (accepted) {
+            completeOperation(db, operation.id, 202, toDeploymentInfo(accepted));
+            continue;
+          }
+        }
+        if (
+          operation.operation === 'deployment_cancel' &&
+          checkpoint?.phase === 'cancel_requested' &&
+          typeof checkpoint.deploymentId === 'string'
+        ) {
+          const cancelled = requestDeploymentCancel(db, checkpoint.deploymentId);
+          if (cancelled) {
+            completeOperation(db, operation.id, 200, toDeploymentInfo(cancelled));
+            continue;
+          }
+        }
         const backupId = typeof checkpoint?.backupId === 'string' && isValidBackupId(checkpoint.backupId)
           ? checkpoint.backupId
           : null;
@@ -1068,31 +1087,64 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       reply.code(501);
       return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
     }
+    let auditReservation: ReturnType<typeof reserveOperation> | null = null;
+    if (adminToken) {
+      const rawKey = req.headers['idempotency-key'];
+      const idempotencyKey = Array.isArray(rawKey) ? '' : (rawKey ?? '');
+      try {
+        auditReservation = reserveOperation(db, {
+          idempotencyKey,
+          actor: 'admin',
+          operation: 'deploy',
+          projectId: id,
+          payload: body,
+        });
+      } catch (e) {
+        if (e instanceof OperationAuditError && e.code === 'INVALID_IDEMPOTENCY_KEY') {
+          reply.code(400);
+          return err(e.code, e.message);
+        }
+        throw e;
+      }
+      if (auditReservation.kind === 'conflict') {
+        reply.code(409);
+        return err('IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+      }
+      if (auditReservation.kind === 'in_progress') {
+        reply.code(409);
+        return err('OPERATION_IN_PROGRESS', 'The idempotent deploy request is still being accepted');
+      }
+      if (auditReservation.kind === 'replay') {
+        reply.header('Idempotency-Replayed', 'true').code(auditReservation.responseStatus);
+        return auditReservation.response;
+      }
+    }
+    const finishAudit = (status: number, response: unknown): unknown => {
+      if (auditReservation?.kind === 'started') completeOperation(db, auditReservation.record.id, status, response);
+      reply.code(status);
+      return response;
+    };
     // Puerta de verificación autoritativa (revisión Codex): los seis
     // receipts persistidos deben estar vigentes sobre las fuentes actuales
     // y en orden canónico. Síncrona para responder 409 antes de crear nada.
     const gate = persistedDynamicGateStatus(db, projectDir(dataDir, id), id);
     if (!gate.ok) {
-      reply.code(409);
-      return err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current');
+      return finishAudit(409, err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current'));
     }
     // Preserve the public Fase 6 error code when the conflicting operation is
     // specifically another deployment; the cross-operation lock below covers
     // backup/migrations/rollback races.
     if (getActiveDeployment(db, id)) {
-      reply.code(409);
-      return err('DEPLOYMENT_ACTIVE', 'There is already a deployment in progress for this project');
+      return finishAudit(409, err('DEPLOYMENT_ACTIVE', 'There is already a deployment in progress for this project'));
     }
-    const projectLockId = `deploy-${randomUUID()}`;
+    const projectLockId = auditReservation?.kind === 'started' ? auditReservation.record.id : `deploy-${randomUUID()}`;
     if (!acquireProjectOperationLock(db, { projectId: id, operationId: projectLockId, operation: 'deploy' })) {
-      reply.code(409);
-      return err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project');
+      return finishAudit(409, err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project'));
     }
     const releaseCapacity = acquireDeploymentCapacity(deployDriver);
     if (!releaseCapacity) {
       releaseProjectOperationLock(db, projectLockId);
-      reply.code(409);
-      return err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted');
+      return finishAudit(409, err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted'));
     }
     let dep: DeploymentRecord;
     try {
@@ -1101,10 +1153,14 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       releaseCapacity();
       releaseProjectOperationLock(db, projectLockId);
       if (e instanceof DeploymentError) {
-        reply.code(e.statusCode);
-        return err(e.code, e.message);
+        return finishAudit(e.statusCode, err(e.code, e.message));
       }
       throw e;
+    }
+    const accepted = toDeploymentInfo(dep);
+    if (auditReservation?.kind === 'started') {
+      checkpointOperation(db, auditReservation.record.id, { phase: 'accepted', deploymentId: dep.id });
+      completeOperation(db, auditReservation.record.id, 202, accepted);
     }
     // 202: el pipeline corre en segundo plano y persiste estados terminales
     // internamente (nunca rechaza por fallos del despliegue).
@@ -1121,7 +1177,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       });
     void (opts.backgroundTasks ? opts.backgroundTasks.track(deploymentTask) : deploymentTask);
     reply.code(202);
-    return toDeploymentInfo(dep);
+    return accepted;
   });
 
   app.get('/api/projects/:id/deployments', async (req) => {
@@ -1142,12 +1198,48 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 
   app.post('/api/deployments/:deploymentId/cancel', async (req, reply) => {
     const { deploymentId } = req.params as { deploymentId: string };
-    const dep = requestDeploymentCancel(db, deploymentId);
-    if (!dep) {
+    const current = getDeploymentRecord(db, deploymentId);
+    if (!current) {
       reply.code(404);
       return err('DEPLOYMENT_NOT_FOUND', 'deployment not found');
     }
-    return toDeploymentInfo(dep);
+    let auditReservation: ReturnType<typeof reserveOperation> | null = null;
+    if (adminToken) {
+      const rawKey = req.headers['idempotency-key'];
+      const idempotencyKey = Array.isArray(rawKey) ? '' : (rawKey ?? '');
+      try {
+        auditReservation = reserveOperation(db, {
+          idempotencyKey,
+          actor: 'admin',
+          operation: 'deployment_cancel',
+          projectId: current.projectId,
+          payload: { deploymentId },
+        });
+      } catch (e) {
+        if (e instanceof OperationAuditError && e.code === 'INVALID_IDEMPOTENCY_KEY') {
+          reply.code(400);
+          return err(e.code, e.message);
+        }
+        throw e;
+      }
+      if (auditReservation.kind === 'conflict') {
+        reply.code(409);
+        return err('IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+      }
+      if (auditReservation.kind === 'in_progress') {
+        reply.code(409);
+        return err('OPERATION_IN_PROGRESS', 'The idempotent cancellation request is still running');
+      }
+      if (auditReservation.kind === 'replay') {
+        reply.header('Idempotency-Replayed', 'true').code(auditReservation.responseStatus);
+        return auditReservation.response;
+      }
+      checkpointOperation(db, auditReservation.record.id, { phase: 'cancel_requested', deploymentId });
+    }
+    const dep = requestDeploymentCancel(db, deploymentId)!;
+    const response = toDeploymentInfo(dep);
+    if (auditReservation?.kind === 'started') completeOperation(db, auditReservation.record.id, 200, response);
+    return response;
   });
 
   // ----------------------------------------------------- managed operations

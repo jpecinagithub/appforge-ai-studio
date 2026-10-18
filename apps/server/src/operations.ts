@@ -7,7 +7,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
-export type AdministrativeOperation = 'database_backup' | 'migrations' | 'rollback';
+export type AdministrativeOperation =
+  | 'database_backup'
+  | 'migrations'
+  | 'rollback'
+  | 'deploy'
+  | 'deployment_cancel';
 export type AuditStatus = 'running' | 'succeeded' | 'failed';
 
 export interface OperationAuditRecord {
