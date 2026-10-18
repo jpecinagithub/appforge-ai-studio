@@ -147,3 +147,26 @@ rejects a host with unrelated running containers and writes a sanitized JSON
 record under `.appforge-evidence/`; it never writes the admin token. Passing
 this gate establishes readiness only—the three E2E runs and their evidence are
 still required for certification.
+
+### Shared educational host
+
+For a private, single-user installation on a server that already runs other
+Docker workloads, use the standalone shared-host compose instead. It does not
+start Caddy or publish ports 80/443. Studio is bound only to IPv4 loopback and
+the existing host nginx forwards traffic to it.
+
+```bash
+export APPFORGE_REF=<full-commit-sha>
+export APPFORGE_PUBLIC_ORIGIN=https://appforge-ai-studio-six.vercel.app
+export APPFORGE_SHARED_PORT=3201
+export GROQ_API_KEY='provided-out-of-band'   # or OPENROUTER_API_KEY
+bash infra/scripts/install-shared.sh
+bash infra/scripts/certify-shared-readiness.sh
+```
+
+The shared variant uses the isolated `appforge-edu-*` namespace, one concurrent
+deployment, 1.5 CPU/1.5 GiB for Studio, 512 MiB per generated application, log
+rotation and an internal application network. It deliberately keeps outbound
+access on the control network for LLM calls. Passing its readiness gate means
+the educational shared-host profile is isolated and healthy; it is not the
+dedicated-VM certification described by 7C.3.

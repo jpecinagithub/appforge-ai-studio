@@ -125,3 +125,35 @@ describe('instalación productiva 7C', () => {
     expect(compose).toContain('stop_grace_period: 40s');
   });
 });
+
+describe('perfil educativo en host compartido', () => {
+  const compose = fs.readFileSync(path.join(REPO, 'infra', 'docker-compose.shared.yml'), 'utf8');
+  const install = fs.readFileSync(path.join(REPO, 'infra', 'scripts', 'install-shared.sh'), 'utf8');
+  const readiness = fs.readFileSync(path.join(REPO, 'infra', 'scripts', 'certify-shared-readiness.sh'), 'utf8');
+
+  test('no ocupa el borde público y publica Studio solo en loopback', () => {
+    expect(compose).not.toMatch(/(?:^|\n)\s*-\s*["']?80:80/);
+    expect(compose).not.toMatch(/(?:^|\n)\s*-\s*["']?443:443/);
+    expect(compose).toContain('127.0.0.1:${APPFORGE_SHARED_PORT:-3201}:3001');
+    expect(compose).not.toContain('container_name: appforge-studio\n');
+    expect(compose).toContain('container_name: appforge-edu-studio');
+  });
+
+  test('separa recursos y mantiene una sola ruta con acceso al socket', () => {
+    expect(compose).toContain('APPFORGE_DOCKER_NETWORK: appforge-edu-apps');
+    expect(compose).toContain('APPFORGE_DOCKER_DATA_VOLUME: appforge-edu-data');
+    expect(compose).toContain('APPFORGE_MAX_CONCURRENT_DEPLOYS: "1"');
+    const mounts = compose.match(/\/var\/run\/docker\.sock:\/var\/run\/docker\.sock:rw/g) ?? [];
+    expect(mounts).toHaveLength(1);
+    expect(compose).toContain('appforge-edu-apps:\n    name: appforge-edu-apps\n    internal: true');
+  });
+
+  test('instalador no instala Docker y la puerta permite ajenos pero verifica aislamiento', () => {
+    expect(install).not.toContain('apt-get');
+    expect(install).not.toContain('systemctl');
+    expect(install).toContain('docker-compose.shared.yml');
+    expect(readiness).not.toContain('unrelated running containers exist');
+    expect(readiness).toContain('foreign containers joined appforge-edu-apps');
+    expect(readiness).toContain('Studio must be published on IPv4 loopback only');
+  });
+});
