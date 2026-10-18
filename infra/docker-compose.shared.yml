@@ -41,6 +41,10 @@ services:
       APPFORGE_DOCKER_NETWORK: appforge-edu-apps
       APPFORGE_DOCKER_DATA_VOLUME: appforge-edu-data
       APPFORGE_MAX_CONCURRENT_DEPLOYS: "1"
+      # Explicit educational opt-in: generated previews run inside the trusted
+      # Studio container. Keep this profile single-user and never accept
+      # untrusted prompts or source archives on the shared host.
+      APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW: "1"
       HOME: /tmp/appforge-home
     ports:
       - "127.0.0.1:${APPFORGE_SHARED_PORT:-3201}:3001"

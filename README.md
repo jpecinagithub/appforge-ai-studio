@@ -170,3 +170,9 @@ rotation and an internal application network. It deliberately keeps outbound
 access on the control network for LLM calls. Passing its readiness gate means
 the educational shared-host profile is isolated and healthy; it is not the
 dedicated-VM certification described by 7C.3.
+
+This single-user profile explicitly enables the local full-stack preview needed
+to create the six verification receipts. Generated preview code therefore runs
+inside the trusted Studio container. Do not expose project creation to other
+users or import untrusted source archives on a shared server; use the dedicated
+profile for that threat model.

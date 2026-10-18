@@ -143,6 +143,7 @@ describe('perfil educativo en host compartido', () => {
     expect(compose).toContain('APPFORGE_DOCKER_NETWORK: appforge-edu-apps');
     expect(compose).toContain('APPFORGE_DOCKER_DATA_VOLUME: appforge-edu-data');
     expect(compose).toContain('APPFORGE_MAX_CONCURRENT_DEPLOYS: "1"');
+    expect(compose).toContain('APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW: "1"');
     const mounts = compose.match(/\/var\/run\/docker\.sock:\/var\/run\/docker\.sock:rw/g) ?? [];
     expect(mounts).toHaveLength(1);
     expect(compose).toContain('appforge-edu-apps:\n    name: appforge-edu-apps\n    internal: true');
