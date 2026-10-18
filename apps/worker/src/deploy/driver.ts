@@ -153,6 +153,8 @@ export interface DeploymentDriver {
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult>;
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult>;
+  /** Reanuda el live detenido por un backup manual y confirma su health. */
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult>;
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult>;
@@ -217,6 +219,7 @@ export type FakeOpName =
   | 'runAuthenticatedVerification'
   | 'stopVerificationRuntime'
   | 'createLiveBackup'
+  | 'resumeCurrentLiveRuntime'
   | 'runLiveMigrations'
   | 'stopCurrentLiveRuntime'
   | 'startCandidateAsLive'
@@ -235,6 +238,7 @@ export const FAKE_OP_NAMES: readonly FakeOpName[] = [
   'runAuthenticatedVerification',
   'stopVerificationRuntime',
   'createLiveBackup',
+  'resumeCurrentLiveRuntime',
   'runLiveMigrations',
   'stopCurrentLiveRuntime',
   'startCandidateAsLive',
@@ -414,6 +418,7 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedVerification', args); }
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopVerificationRuntime', args); }
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> { return this.run('createLiveBackup', args); }
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('resumeCurrentLiveRuntime', args); }
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult> { return this.run('runLiveMigrations', args); }
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopCurrentLiveRuntime', args); }
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult> { return this.run('startCandidateAsLive', args); }

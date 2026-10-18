@@ -1685,7 +1685,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
    * el live: el servicio nunca debe quedar parado por un backup fallido
    * (revisión Codex, NO-GO 2, bloqueo 2).
    */
-  private async recoverStoppedLive(args: LiveBackupArgs, containerName: string): Promise<DriverResult> {
+  private async recoverStoppedLive(args: DriverOpArgs, containerName: string): Promise<DriverResult> {
     // La señal de la operación original puede estar ya abortada por timeout.
     // La recuperación necesita un presupuesto independiente o el runner ni
     // siquiera ejecutaría `docker start`.
@@ -1713,6 +1713,24 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return err('BACKUP_RECOVERY_UNHEALTHY', `live restarted but health check failed: ${health.error}`);
     }
     return ok({ recovered: 'true' });
+  }
+
+  async resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    try {
+      const names = this.names(args.projectId, args.deploymentId);
+      if (!(await resourceExists(this.runner, 'container', names.liveContainer))) {
+        return err('LIVE_MISSING', 'live container is missing; cannot resume it after backup');
+      }
+      await this.assertLiveSlot(args.projectId, names.liveContainer);
+      if (await this.containerRunning(names.liveContainer)) {
+        return await this.runHealthCheck({ ...args, runtime: 'live' });
+      }
+      return await this.recoverStoppedLive(args, names.liveContainer);
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
+      return err('RESUME_LIVE_ERROR', (e as Error).message);
+    }
   }
 
   async stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {

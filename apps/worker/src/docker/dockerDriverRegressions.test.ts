@@ -1690,6 +1690,56 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     });
   }
 
+  test('resumeCurrentLiveRuntime reanuda un live detenido y exige health antes de confirmar', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const live = stub.containers.get(LIVE) as { State: { Running: boolean } };
+    live.State.Running = false;
+    mockHealthOk(d);
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(true);
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+    expect(live.State.Running).toBe(true);
+  });
+
+  test('resumeCurrentLiveRuntime con live ya activo comprueba health sin reiniciarlo', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthFail(d);
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('HEALTH_CHECK_FAILED');
+    expect(stub.calledWith('start', LIVE)).toBe(false);
+  });
+
+  test('resumeCurrentLiveRuntime rechaza un contenedor ajeno sin arrancarlo', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const live = stub.containers.get(LIVE) as {
+      Config: { Labels: Record<string, string> };
+      State: { Running: boolean };
+    };
+    live.State.Running = false;
+    live.Config.Labels['com.appforge.project-id'] = DID2;
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('FOREIGN_RESOURCE');
+    expect(stub.calledWith('start', LIVE)).toBe(false);
+    expect(live.State.Running).toBe(false);
+  });
+
   test('contenedor ausente + volumen live con datos → backup hadDatabase=true vía temporal endurecido', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
     const db = openDb();

@@ -91,6 +91,7 @@ describe('POST database backup — 7C.2', () => {
     expect(first.body).not.toContain(dataDir);
     expect(first.body).not.toContain('project-backups');
     expect(driver.callsOf('createLiveBackup')).toHaveLength(1);
+    expect(driver.callsOf('resumeCurrentLiveRuntime')).toHaveLength(1);
 
     const replay = await app.inject({
       method: 'POST',
@@ -101,6 +102,7 @@ describe('POST database backup — 7C.2', () => {
     expect(replay.headers['idempotency-replayed']).toBe('true');
     expect(replay.json()).toEqual(first.json());
     expect(driver.callsOf('createLiveBackup')).toHaveLength(1);
+    expect(driver.callsOf('resumeCurrentLiveRuntime')).toHaveLength(1);
 
     const history = await app.inject({
       method: 'GET',
@@ -159,5 +161,34 @@ describe('POST database backup — 7C.2', () => {
     });
     expect(response.statusCode).toBe(502);
     expect(response.json().error.code).toBe('BACKUP_INVALID_RESULT');
+    expect(driver.callsOf('resumeCurrentLiveRuntime')).toHaveLength(0);
+  });
+
+  it('does not report success unless the stopped live runtime recovers healthy', async () => {
+    await app.close();
+    driver = new FakeDeploymentDriver({
+      db,
+      backupId: 'bk_recovery_failure',
+      behavior: { resumeCurrentLiveRuntime: 'fail' },
+      failError: { resumeCurrentLiveRuntime: `cannot start ${dataDir} password=secret-value` },
+    });
+    app = buildServer({
+      db,
+      dataDir,
+      templatesDir: TEMPLATES_DIR,
+      adminToken: TOKEN,
+      deploymentDriver: driver,
+    });
+    await app.ready();
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/database/backup`,
+      headers: auth('backup-key-0005'),
+    });
+    expect(response.statusCode).toBe(502);
+    expect(response.json().error.code).toBe('BACKUP_LIVE_RECOVERY_FAILED');
+    expect(response.body).toContain('backupId=bk_recovery_failure');
+    expect(response.body).not.toContain(dataDir);
+    expect(response.body).not.toContain('secret-value');
   });
 });

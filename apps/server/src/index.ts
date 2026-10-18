@@ -1043,10 +1043,13 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
 
     try {
       const deploymentId = randomUUID();
-      const result = await deployDriver.createLiveBackup({
+      const driverArgs = {
         projectId: id,
         deploymentId,
         candidateId: `cand-${deploymentId.slice(0, 8)}`,
+      };
+      const result = await deployDriver.createLiveBackup({
+        ...driverArgs,
         previousLiveVersion: runtime.liveImage,
         signal: AbortSignal.timeout(10 * 60_000),
       });
@@ -1068,6 +1071,20 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
           dataDir,
         );
         return finish(502, err('BACKUP_INVALID_RESULT', diagnostic));
+      }
+      // createLiveBackup deliberately leaves the live container quiesced for
+      // deployment promotion. A standalone backup must explicitly resume and
+      // health-check it with an independent recovery budget.
+      const resumed = await deployDriver.resumeCurrentLiveRuntime({
+        ...driverArgs,
+        signal: AbortSignal.timeout(120_000),
+      });
+      if (!resumed.ok) {
+        const diagnostic = sanitizeOperationDiagnostic(
+          resumed.error ?? resumed.code ?? 'live runtime did not recover after backup',
+          dataDir,
+        );
+        return finish(502, err('BACKUP_LIVE_RECOVERY_FAILED', `${diagnostic}; backupId=${data.backupId}`));
       }
       return finish(201, {
         backupId: data.backupId,
