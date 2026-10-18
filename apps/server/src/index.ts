@@ -20,6 +20,7 @@ import type {
   BuildRecord,
   ChatMessage,
   DeploymentInfo,
+  MigrationRecord,
   Project,
   ProjectRuntime,
   RevisionInfo,
@@ -259,6 +260,21 @@ function rowToBuild(r: Record<string, any>): BuildRecord {
 
 function rowToRevision(r: Record<string, any>): RevisionInfo {
   return { id: r.id, projectId: r.project_id, label: r.label, gitSha: r.git_sha, createdAt: r.created_at };
+}
+
+function rowToMigration(r: Record<string, any>): MigrationRecord {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    version: Number(r.version),
+    name: r.name,
+    status: r.status,
+    startedAt: r.started_at,
+    finishedAt: r.finished_at ?? null,
+    durationMs: r.duration_ms ?? null,
+    logs: r.logs ?? '',
+    error: r.error ?? null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +984,16 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   });
 
   // ----------------------------------------------------- managed operations
+  app.get('/api/projects/:id/migrations', async (req) => {
+    const { id } = req.params as { id: string };
+    const project = needProject(id);
+    if (project.type !== 'dynamic') return { items: [] };
+    const rows = db
+      .prepare('SELECT * FROM migrations WHERE project_id=? ORDER BY version DESC, started_at DESC, id DESC')
+      .all(id) as Array<Record<string, unknown>>;
+    return { items: rows.map(rowToMigration) };
+  });
+
   app.post('/api/projects/:id/database/backup', async (req, reply) => {
     const { id } = req.params as { id: string };
     const project = needProject(id);

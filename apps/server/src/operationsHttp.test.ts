@@ -60,6 +60,32 @@ afterEach(async () => {
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
+describe('GET migrations — 7C.2', () => {
+  it('returns the persisted migration history in descending version order', async () => {
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO migrations(id,project_id,version,name,status,started_at,finished_at,duration_ms,logs,error)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run('mig-001', PROJECT_ID, 1, '001_init.sql', 'success', now, now, 12, 'applied', null);
+    db.prepare(
+      `INSERT INTO migrations(id,project_id,version,name,status,started_at,finished_at,duration_ms,logs,error)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    ).run('mig-002', PROJECT_ID, 2, '002_add_todos.sql', 'failed', now, now, 8, '', 'constraint');
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${PROJECT_ID}/migrations`,
+      headers: auth(),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items).toEqual([
+      expect.objectContaining({ id: 'mig-002', version: 2, status: 'failed', error: 'constraint' }),
+      expect.objectContaining({ id: 'mig-001', version: 1, status: 'success', logs: 'applied' }),
+    ]);
+  });
+});
+
 describe('POST database backup — 7C.2', () => {
   it('requires administrative authentication and an idempotency key', async () => {
     const unauthenticated = await app.inject({
