@@ -885,6 +885,7 @@ d('docker integration (fase 7A)', () => {
     // Recuperación administrativa física: deriva la identidad del live
     // actual, restaura staging → swap, arranca la MISMA imagen y exige health.
     okRes(await h.driver.recoverCurrentLiveBackup({ ...args3, backupId }));
+    okRes(await h.driver.runAuthenticatedLiveVerification(args3));
 
     // La versión anterior sirve y los datos anteriores están intactos.
     const rec = await h.driver.reconcileRuntime(args3);

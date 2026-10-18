@@ -56,6 +56,10 @@ import {
   reconcileDeployments,
   reconcileProjectRuntimes,
   requestDeploymentCancel,
+  transitionDeployment,
+  finalizeLiveDeployment,
+  setDeploymentBackup,
+  setDeploymentPreviousLive,
   runDeploymentPipeline,
   isValidBackupId,
   sanitizeDeploymentError,
@@ -237,17 +241,71 @@ export async function recoverInterruptedAdministrativeOperations(
     };
     if (driver) {
       try {
-        const checkpoint = operation.checkpoint as { phase?: unknown; backupId?: unknown } | null;
+        const checkpoint = operation.checkpoint as {
+          phase?: unknown;
+          backupId?: unknown;
+          sourceDeploymentId?: unknown;
+          currentImage?: unknown;
+          rollbackDeploymentId?: unknown;
+          targetImage?: unknown;
+        } | null;
         const backupId = typeof checkpoint?.backupId === 'string' && isValidBackupId(checkpoint.backupId)
           ? checkpoint.backupId
           : null;
         const requiresRestore =
-          (operation.operation === 'migrations' || operation.operation === 'rollback') &&
+          operation.operation === 'migrations' &&
           checkpoint?.phase === 'backup_ready' &&
           backupId !== null;
-        recovery = requiresRestore
-          ? await driver.recoverCurrentLiveBackup({ ...args, backupId })
-          : await driver.resumeCurrentLiveRuntime(args);
+        const rollbackCheckpoint =
+          operation.operation === 'rollback' &&
+          (checkpoint?.phase === 'safety_backup_ready' || checkpoint?.phase === 'commit_ready') &&
+          backupId !== null &&
+          typeof checkpoint.sourceDeploymentId === 'string' &&
+          /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(checkpoint.sourceDeploymentId) &&
+          typeof checkpoint.currentImage === 'string' &&
+          APPFORGE_IMAGE_REF_RE.test(checkpoint.currentImage);
+        if (rollbackCheckpoint) {
+          if (
+            checkpoint?.phase === 'commit_ready' &&
+            typeof checkpoint.rollbackDeploymentId === 'string' &&
+            typeof checkpoint.targetImage === 'string'
+          ) {
+            const committed = getDeploymentRecord(db, checkpoint.rollbackDeploymentId);
+            const runtime = getProjectRuntimeRecord(db, operation.projectId);
+            if (committed?.status === 'live' && runtime?.status === 'running' && runtime.liveImage === checkpoint.targetImage) {
+              completeOperation(db, operation.id, 200, { deployment: toDeploymentInfo(committed) });
+              continue;
+            }
+          }
+          const rollbackArgs = {
+            projectId: operation.projectId,
+            deploymentId: checkpoint.sourceDeploymentId as string,
+            candidateId: `cand-${(checkpoint.sourceDeploymentId as string).slice(0, 8)}`,
+            signal: args.signal,
+          };
+          const stopped = await driver.stopCurrentLiveRuntime(rollbackArgs);
+          const restored = await driver.restoreBackup({ ...rollbackArgs, backupId });
+          const started = restored.ok
+            ? await driver.startPreviousVersion({
+                ...rollbackArgs,
+                previousLiveVersion: checkpoint.currentImage as string,
+              })
+            : restored;
+          const healthy = started.ok
+            ? await driver.runHealthCheck({ ...rollbackArgs, runtime: 'live' })
+            : started;
+          recovery = stopped.ok && restored.ok && started.ok && healthy.ok
+            ? { ok: true }
+            : {
+                ok: false,
+                code: 'ROLLBACK_RESTART_RECOVERY_FAILED',
+                error: `stop=${stopped.code}; restore=${restored.code}; start=${started.code}; health=${healthy.code}`,
+              };
+        } else {
+          recovery = requiresRestore
+            ? await driver.recoverCurrentLiveBackup({ ...args, backupId })
+            : await driver.resumeCurrentLiveRuntime(args);
+        }
       } catch (e) {
         recovery = { ok: false, code: 'RECOVERY_EXCEPTION', error: (e as Error)?.message ?? String(e) };
       }
@@ -1300,6 +1358,241 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       .prepare('SELECT * FROM migrations WHERE project_id=? ORDER BY version DESC, started_at DESC, id DESC')
       .all(id) as Array<Record<string, unknown>>;
     return { items: rows.map(rowToMigration) };
+  });
+
+  app.post('/api/projects/:id/rollback', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const project = needProject(id);
+    if (project.type !== 'dynamic') {
+      reply.code(400);
+      return err('INVALID_TYPE', 'Manual rollback is only available for dynamic projects');
+    }
+    if (!adminToken) {
+      reply.code(503);
+      return err('ADMIN_AUTH_NOT_CONFIGURED', 'Administrative authentication is not configured');
+    }
+    if (!deployDriver) {
+      reply.code(501);
+      return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
+    }
+    const rawKey = req.headers['idempotency-key'];
+    const idempotencyKey = Array.isArray(rawKey) ? '' : (rawKey ?? '');
+    let reservation;
+    try {
+      reservation = reserveOperation(db, {
+        idempotencyKey,
+        actor: 'admin',
+        operation: 'rollback',
+        projectId: id,
+        payload: {},
+      });
+    } catch (e) {
+      if (e instanceof OperationAuditError && e.code === 'INVALID_IDEMPOTENCY_KEY') {
+        reply.code(400);
+        return err(e.code, e.message);
+      }
+      throw e;
+    }
+    if (reservation.kind === 'conflict') {
+      reply.code(409);
+      return err('IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+    }
+    if (reservation.kind === 'in_progress') {
+      reply.code(409);
+      return err('OPERATION_IN_PROGRESS', 'The idempotent operation is still running');
+    }
+    if (reservation.kind === 'replay') {
+      reply.header('Idempotency-Replayed', 'true').code(reservation.responseStatus);
+      return reservation.response;
+    }
+    const finish = (status: number, body: unknown): unknown => {
+      completeOperation(db, reservation.record.id, status, body);
+      reply.code(status);
+      return body;
+    };
+    const runtime = getProjectRuntimeRecord(db, id);
+    if (!runtime || runtime.status !== 'running' || !APPFORGE_IMAGE_REF_RE.test(runtime.liveImage)) {
+      return finish(409, err('RUNTIME_NOT_READY', 'Project has no verified running live runtime to roll back'));
+    }
+    const source = listDeploymentRecords(db, id).find((deployment) =>
+      deployment.status === 'live' &&
+      APPFORGE_IMAGE_REF_RE.test(deployment.previousLiveVersion ?? '') &&
+      isValidBackupId(deployment.backupId),
+    );
+    if (!source || !source.previousLiveVersion || !source.backupId) {
+      return finish(409, err('ROLLBACK_NOT_AVAILABLE', 'No coherent previous image and backup are available'));
+    }
+    if (getActiveDeployment(db, id)) {
+      return finish(409, err('DEPLOYMENT_ACTIVE', 'A deployment is already active for this project'));
+    }
+    if (!acquireProjectOperationLock(db, {
+      projectId: id,
+      operationId: reservation.record.id,
+      operation: 'rollback',
+    })) {
+      return finish(409, err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project'));
+    }
+    const releaseCapacity = acquireDeploymentCapacity(deployDriver);
+    if (!releaseCapacity) {
+      releaseProjectOperationLock(db, reservation.record.id);
+      return finish(409, err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted'));
+    }
+
+    let rollbackDeployment: DeploymentRecord | null = null;
+    let safetyBackupId: string | null = null;
+    const sourceArgs = {
+      projectId: id,
+      deploymentId: source.id,
+      candidateId: source.candidateId ?? `cand-${source.id.slice(0, 8)}`,
+    };
+    const failDeployment = (diagnostic: string): void => {
+      if (!rollbackDeployment) return;
+      try {
+        rollbackDeployment = transitionDeployment(db, rollbackDeployment.id, 'failed', {
+          diagnostic,
+          error: diagnostic,
+        });
+      } catch {
+        // The original sanitized failure remains in operation_audit.
+      }
+    };
+    const recoverCurrent = async (): Promise<string | null> => {
+      if (!safetyBackupId) return null;
+      const recoverySignal = AbortSignal.timeout(5 * 60_000);
+      const stopped = await deployDriver.stopCurrentLiveRuntime({ ...sourceArgs, signal: recoverySignal });
+      const restored = await deployDriver.restoreBackup({ ...sourceArgs, backupId: safetyBackupId, signal: recoverySignal });
+      const started = restored.ok
+        ? await deployDriver.startPreviousVersion({
+            ...sourceArgs,
+            previousLiveVersion: runtime.liveImage,
+            signal: recoverySignal,
+          })
+        : restored;
+      const healthy = started.ok
+        ? await deployDriver.runHealthCheck({ ...sourceArgs, runtime: 'live', signal: recoverySignal })
+        : started;
+      if (stopped.ok && restored.ok && started.ok && healthy.ok) return null;
+      return sanitizeOperationDiagnostic(
+        `rollback compensation failed: stop=${stopped.code}; restore=${restored.code}; start=${started.code}; health=${healthy.code}`,
+        dataDir,
+      );
+    };
+
+    try {
+      rollbackDeployment = createDeployment(db, { projectId: id, target: 'oracle' });
+      // En el deployment de rollback, "previous" significa el live que esta
+      // operación sustituye. Así un rollback posterior puede recuperar el
+      // estado actual usando el safety backup, no el backup objetivo antiguo.
+      setDeploymentPreviousLive(db, rollbackDeployment.id, runtime.liveImage);
+      rollbackDeployment = transitionDeployment(db, rollbackDeployment.id, 'building', {
+        diagnostic: 'manual rollback: creating safety backup of current live',
+      });
+      const safety = await deployDriver.createLiveBackup({
+        projectId: id,
+        deploymentId: rollbackDeployment.id,
+        candidateId: `cand-${rollbackDeployment.id.slice(0, 8)}`,
+        previousLiveVersion: runtime.liveImage,
+        signal: AbortSignal.timeout(10 * 60_000),
+      });
+      const safetyData = safety.data ?? {};
+      const safetySize = Number(safetyData.sizeBytes);
+      const safetyCreatedAt = safetyData.createdAt ?? '';
+      const safetyValid =
+        safety.ok &&
+        isValidBackupId(safetyData.backupId) &&
+        safetyData.backupValidated === 'true' &&
+        safetyData.hadDatabase === 'true' &&
+        Number.isSafeInteger(safetySize) && safetySize > 0 &&
+        Number.isFinite(Date.parse(safetyCreatedAt)) &&
+        new Date(safetyCreatedAt).toISOString() === safetyCreatedAt;
+      if (!safetyValid) {
+        const resumed = await deployDriver.resumeCurrentLiveRuntime({ ...sourceArgs, signal: AbortSignal.timeout(120_000) });
+        const diagnostic = sanitizeOperationDiagnostic(
+          `${safety.code ?? 'ROLLBACK_SAFETY_BACKUP_FAILED'}: ${safety.error ?? 'invalid safety backup evidence'}${resumed.ok ? '' : `; live recovery failed: ${resumed.code}`}`,
+          dataDir,
+        );
+        failDeployment(diagnostic);
+        return finish(502, err('ROLLBACK_SAFETY_BACKUP_FAILED', diagnostic));
+      }
+      safetyBackupId = safetyData.backupId!;
+      setDeploymentBackup(db, rollbackDeployment.id, safetyBackupId);
+      checkpointOperation(db, reservation.record.id, {
+        phase: 'safety_backup_ready',
+        backupId: safetyBackupId,
+        sourceDeploymentId: source.id,
+        rollbackDeploymentId: rollbackDeployment.id,
+        currentImage: runtime.liveImage,
+        targetBackupId: source.backupId,
+        targetImage: source.previousLiveVersion,
+      });
+
+      rollbackDeployment = transitionDeployment(db, rollbackDeployment.id, 'migrating', {
+        diagnostic: 'manual rollback: restoring prior validated backup',
+      });
+      const restored = await deployDriver.restoreBackup({
+        ...sourceArgs,
+        backupId: source.backupId,
+        signal: AbortSignal.timeout(5 * 60_000),
+      });
+      const started = restored.ok
+        ? await deployDriver.startPreviousVersion({
+            ...sourceArgs,
+            previousLiveVersion: source.previousLiveVersion,
+            signal: AbortSignal.timeout(120_000),
+          })
+        : restored;
+      rollbackDeployment = transitionDeployment(db, rollbackDeployment.id, 'verifying', {
+        diagnostic: 'manual rollback: verifying restored runtime',
+      });
+      const healthy = started.ok
+        ? await deployDriver.runHealthCheck({ ...sourceArgs, runtime: 'live', signal: AbortSignal.timeout(120_000) })
+        : started;
+      const authenticated = healthy.ok
+        ? await deployDriver.runAuthenticatedLiveVerification({ ...sourceArgs, signal: AbortSignal.timeout(120_000) })
+        : healthy;
+      if (!restored.ok || !started.ok || !healthy.ok || !authenticated.ok) {
+        const original = sanitizeOperationDiagnostic(
+          `manual rollback failed: restore=${restored.code}; start=${started.code}; health=${healthy.code}; auth=${authenticated.code}`,
+          dataDir,
+        );
+        const recoveryError = await recoverCurrent();
+        const diagnostic = recoveryError ? `${original}; ${recoveryError}` : original;
+        failDeployment(diagnostic);
+        return finish(502, err(recoveryError ? 'ROLLBACK_AND_RECOVERY_FAILED' : 'ROLLBACK_FAILED', diagnostic));
+      }
+      rollbackDeployment = transitionDeployment(db, rollbackDeployment.id, 'promoting', {
+        diagnostic: 'manual rollback: restored runtime verified',
+      });
+      checkpointOperation(db, reservation.record.id, {
+        phase: 'commit_ready',
+        backupId: safetyBackupId,
+        sourceDeploymentId: source.id,
+        rollbackDeploymentId: rollbackDeployment.id,
+        currentImage: runtime.liveImage,
+        targetBackupId: source.backupId,
+        targetImage: source.previousLiveVersion,
+      });
+      rollbackDeployment = finalizeLiveDeployment(db, rollbackDeployment.id, {
+        runtime: {
+          projectId: id,
+          containerName: runtime.containerName,
+          liveImage: source.previousLiveVersion,
+          previousImage: runtime.liveImage,
+          status: 'running',
+        },
+        diagnostic: 'manual rollback completed after health and authenticated verification',
+      });
+      return finish(200, { deployment: toDeploymentInfo(rollbackDeployment) });
+    } catch (e) {
+      const original = sanitizeOperationDiagnostic((e as Error)?.message ?? String(e), dataDir);
+      const recoveryError = await recoverCurrent();
+      const diagnostic = recoveryError ? `${original}; ${recoveryError}` : original;
+      failDeployment(diagnostic);
+      return finish(502, err(recoveryError ? 'ROLLBACK_AND_RECOVERY_FAILED' : 'ROLLBACK_FAILED', diagnostic));
+    } finally {
+      releaseCapacity();
+      releaseProjectOperationLock(db, reservation.record.id);
+    }
   });
 
   app.post('/api/projects/:id/database/backup', async (req, reply) => {

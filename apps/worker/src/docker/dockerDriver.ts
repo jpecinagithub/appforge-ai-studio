@@ -1474,13 +1474,12 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
-  async runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> {
+  private async runAuthenticatedFlow(args: DriverOpArgs, containerName: string): Promise<DriverResult> {
     assertDriverArgs(args);
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     const fail = (step: string, detail: string): DriverResult => err('AUTH_FLOW_FAILED', `${step}: ${detail}`);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
-      const ip = await this.containerIp(names.verifyContainer);
+      const ip = await this.containerIp(containerName);
       const base = `http://${ip}:8080`;
       const dep8 = id8(args.deploymentId);
       const emailA = `verify-a-${dep8}@example.com`;
@@ -1530,6 +1529,22 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return ok();
     } catch (e) {
       if (e instanceof DockerDriverError) return err(e.code, e.message);
+      return err('AUTH_FLOW_ERROR', (e as Error).message);
+    }
+  }
+
+  async runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> {
+    const names = this.names(args.projectId, args.deploymentId);
+    return this.runAuthenticatedFlow(args, names.verifyContainer);
+  }
+
+  async runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    try {
+      const identity = await this.currentLiveIdentity(args.projectId);
+      return await this.runAuthenticatedFlow(args, identity.containerName);
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('AUTH_FLOW_ERROR', (e as Error).message);
     }
   }

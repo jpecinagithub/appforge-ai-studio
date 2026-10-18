@@ -151,6 +151,8 @@ export interface DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult>;
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult>;
+  /** Ejecuta el mismo flujo autenticado contra el slot live canónico. */
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult>;
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult>;
   /** Reanuda el live detenido por un backup manual y confirma su health. */
@@ -221,6 +223,7 @@ export type FakeOpName =
   | 'startVerificationRuntime'
   | 'runHealthCheck'
   | 'runAuthenticatedVerification'
+  | 'runAuthenticatedLiveVerification'
   | 'stopVerificationRuntime'
   | 'createLiveBackup'
   | 'resumeCurrentLiveRuntime'
@@ -242,6 +245,7 @@ export const FAKE_OP_NAMES: readonly FakeOpName[] = [
   'startVerificationRuntime',
   'runHealthCheck',
   'runAuthenticatedVerification',
+  'runAuthenticatedLiveVerification',
   'stopVerificationRuntime',
   'createLiveBackup',
   'resumeCurrentLiveRuntime',
@@ -427,6 +431,7 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('startVerificationRuntime', args); }
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult> { return this.run('runHealthCheck', args); }
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedVerification', args); }
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedLiveVerification', args); }
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopVerificationRuntime', args); }
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> { return this.run('createLiveBackup', args); }
   resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('resumeCurrentLiveRuntime', args); }

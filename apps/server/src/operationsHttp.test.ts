@@ -20,6 +20,8 @@ const TEMPLATES_DIR = path.resolve(HERE, '..', '..', '..', 'templates');
 const TOKEN = 'test-operation-admin-token';
 const PROJECT_ID = '11111111-1111-4111-8111-111111111111';
 const LIVE_IMAGE = 'appforge/app-11111111:dep-abcdef12-123456789abc';
+const SOURCE_DEPLOYMENT_ID = '22222222-2222-4222-8222-222222222222';
+const PREVIOUS_IMAGE = 'appforge/app-11111111:dep-12345678-abcdef123456';
 
 let db: Database.Database;
 let dataDir: string;
@@ -49,6 +51,19 @@ function seedMigrationFiles(): void {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, '001_init.sql'), 'CREATE TABLE users(id TEXT PRIMARY KEY);\n');
   fs.writeFileSync(path.join(dir, '002_todos.sql'), 'CREATE TABLE todos(id TEXT PRIMARY KEY);\n');
+}
+
+function seedRollbackSource(): void {
+  const now = nowIso();
+  db.prepare(
+    `INSERT INTO deployments(
+       id,project_id,target,status,url,created_at,logs,candidate_id,
+       previous_live_version,backup_id,cancel_requested,started_at,updated_at,finished_at,error
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    SOURCE_DEPLOYMENT_ID, PROJECT_ID, 'oracle', 'live', null, now, '',
+    'cand-22222222', PREVIOUS_IMAGE, 'bk_previous_live', 0, now, now, now, null,
+  );
 }
 
 beforeEach(async () => {
@@ -131,6 +146,64 @@ describe('restart recovery — 7C.2', () => {
     expect(await recoverInterruptedAdministrativeOperations(db, driver, dataDir)).toBe(1);
     expect(driver.callsOf('resumeCurrentLiveRuntime')).toHaveLength(1);
     expect(driver.callsOf('recoverCurrentLiveBackup')).toHaveLength(0);
+  });
+
+  it('restores the current-live safety backup after an interrupted manual rollback', async () => {
+    const reserved = reserveOperation(db, {
+      actor: 'admin',
+      idempotencyKey: 'restart-rollback-0001',
+      operation: 'rollback',
+      projectId: PROJECT_ID,
+      payload: {},
+    });
+    if (reserved.kind !== 'started') throw new Error('expected started');
+    checkpointOperation(db, reserved.record.id, {
+      phase: 'safety_backup_ready',
+      backupId: 'bk_restart_rollback',
+      sourceDeploymentId: SOURCE_DEPLOYMENT_ID,
+      currentImage: LIVE_IMAGE,
+    });
+
+    expect(await recoverInterruptedAdministrativeOperations(db, driver, dataDir)).toBe(1);
+    expect(driver.callsOf('stopCurrentLiveRuntime')).toHaveLength(1);
+    expect(driver.callsOf('restoreBackup')).toHaveLength(1);
+    expect(driver.callsOf('startPreviousVersion')[0]?.args).toMatchObject({ previousLiveVersion: LIVE_IMAGE });
+    expect(driver.callsOf('runHealthCheck')).toHaveLength(1);
+  });
+
+  it('replays a committed rollback after restart instead of undoing it', async () => {
+    seedRollbackSource();
+    const rollback = db.prepare(
+      `INSERT INTO deployments(
+         id,project_id,target,status,url,created_at,logs,candidate_id,
+         previous_live_version,backup_id,cancel_requested,started_at,updated_at,finished_at,error
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`,
+    ).get(
+      '33333333-3333-4333-8333-333333333333', PROJECT_ID, 'oracle', 'live', null, nowIso(), '',
+      'cand-33333333', PREVIOUS_IMAGE, 'bk_previous_live', 0, nowIso(), nowIso(), nowIso(), null,
+    ) as { id: string };
+    db.prepare('UPDATE project_runtime SET live_image=?,previous_image=?,status=? WHERE project_id=?').run(
+      PREVIOUS_IMAGE, LIVE_IMAGE, 'running', PROJECT_ID,
+    );
+    const reserved = reserveOperation(db, {
+      actor: 'admin', idempotencyKey: 'restart-rollback-committed', operation: 'rollback', projectId: PROJECT_ID, payload: {},
+    });
+    if (reserved.kind !== 'started') throw new Error('expected started');
+    checkpointOperation(db, reserved.record.id, {
+      phase: 'commit_ready',
+      backupId: 'bk_restart_rollback',
+      sourceDeploymentId: SOURCE_DEPLOYMENT_ID,
+      rollbackDeploymentId: rollback.id,
+      currentImage: LIVE_IMAGE,
+      targetImage: PREVIOUS_IMAGE,
+    });
+
+    expect(await recoverInterruptedAdministrativeOperations(db, driver, dataDir)).toBe(1);
+    expect(driver.callsOf('restoreBackup')).toHaveLength(0);
+    const replay = reserveOperation(db, {
+      actor: 'admin', idempotencyKey: 'restart-rollback-committed', operation: 'rollback', projectId: PROJECT_ID, payload: {},
+    });
+    expect(replay).toMatchObject({ kind: 'replay', responseStatus: 200 });
   });
 });
 
@@ -249,6 +322,96 @@ describe('POST migrations — 7C.2', () => {
     expect(response.json().error.code).toBe('MIGRATION_RECOVERY_FAILED');
     expect(response.body).not.toContain(dataDir);
     expect(response.body).not.toContain('private-value');
+  });
+});
+
+describe('POST manual rollback — 7C.2', () => {
+  it('requires administrative authentication and an idempotency key', async () => {
+    const unauthenticated = await app.inject({
+      method: 'POST', url: `/api/projects/${PROJECT_ID}/rollback`, headers: { 'idempotency-key': 'rollback-key-auth' },
+    });
+    expect(unauthenticated.statusCode).toBe(401);
+    const missingKey = await app.inject({
+      method: 'POST', url: `/api/projects/${PROJECT_ID}/rollback`, headers: auth(),
+    });
+    expect(missingKey.statusCode).toBe(400);
+    expect(missingKey.json().error.code).toBe('INVALID_IDEMPOTENCY_KEY');
+  });
+
+  it('derives the previous image and backup internally, verifies live, and replays idempotently', async () => {
+    seedRollbackSource();
+    await app.close();
+    driver = new FakeDeploymentDriver({
+      db,
+      backupId: 'bk_current_safety',
+      backupSizeBytes: 4096,
+      backupHadDatabase: true,
+    });
+    app = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR, adminToken: TOKEN, deploymentDriver: driver });
+    await app.ready();
+    const headers = auth('rollback-key-0001');
+    const first = await app.inject({ method: 'POST', url: `/api/projects/${PROJECT_ID}/rollback`, headers });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json().deployment).toMatchObject({ status: 'live', previousLiveVersion: LIVE_IMAGE });
+    expect(driver.callsOf('createLiveBackup')).toHaveLength(1);
+    expect(driver.callsOf('restoreBackup')).toHaveLength(1);
+    expect(driver.callsOf('startPreviousVersion')[0]?.args).toMatchObject({ previousLiveVersion: PREVIOUS_IMAGE });
+    expect(driver.callsOf('runAuthenticatedLiveVerification')).toHaveLength(1);
+    const runtime = db.prepare('SELECT live_image,previous_image,status FROM project_runtime WHERE project_id=?').get(
+      PROJECT_ID,
+    ) as { live_image: string; previous_image: string; status: string };
+    expect(runtime).toEqual({ live_image: PREVIOUS_IMAGE, previous_image: LIVE_IMAGE, status: 'running' });
+
+    const replay = await app.inject({ method: 'POST', url: `/api/projects/${PROJECT_ID}/rollback`, headers });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.headers['idempotency-replayed']).toBe('true');
+    expect(replay.json()).toEqual(first.json());
+    expect(driver.callsOf('restoreBackup')).toHaveLength(1);
+  });
+
+  it('fails closed without a coherent previous image and backup', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/rollback`,
+      headers: auth('rollback-key-0002'),
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe('ROLLBACK_NOT_AVAILABLE');
+    expect(driver.callsOf('createLiveBackup')).toHaveLength(0);
+  });
+
+  it('restores the safety backup and keeps project_runtime unchanged if authenticated verification fails', async () => {
+    seedRollbackSource();
+    await app.close();
+    driver = new FakeDeploymentDriver({
+      db,
+      backupId: 'bk_current_safety_failure',
+      backupSizeBytes: 4096,
+      backupHadDatabase: true,
+      behavior: { runAuthenticatedLiveVerification: 'fail' },
+    });
+    app = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR, adminToken: TOKEN, deploymentDriver: driver });
+    await app.ready();
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${PROJECT_ID}/rollback`,
+      headers: auth('rollback-key-0003'),
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json().error.code).toBe('ROLLBACK_FAILED');
+    expect(driver.callsOf('restoreBackup')).toHaveLength(2);
+    expect(driver.callsOf('startPreviousVersion')).toHaveLength(2);
+    expect(driver.callsOf('stopCurrentLiveRuntime')).toHaveLength(1);
+    const runtime = db.prepare('SELECT live_image,previous_image,status FROM project_runtime WHERE project_id=?').get(
+      PROJECT_ID,
+    ) as { live_image: string; previous_image: string | null; status: string };
+    expect(runtime).toEqual({ live_image: LIVE_IMAGE, previous_image: null, status: 'running' });
+    const deployment = db.prepare(
+      "SELECT status FROM deployments WHERE project_id=? AND id<>? ORDER BY created_at DESC LIMIT 1",
+    ).get(PROJECT_ID, SOURCE_DEPLOYMENT_ID) as { status: string };
+    expect(deployment.status).toBe('failed');
   });
 });
 

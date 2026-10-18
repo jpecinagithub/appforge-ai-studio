@@ -47,6 +47,8 @@ export {
   listDeploymentEvents,
   transitionDeployment,
   finalizeLiveDeployment,
+  setDeploymentBackup,
+  setDeploymentPreviousLive,
   recordEvent,
   requestDeploymentCancel,
   isDeploymentCancelRequested,
