@@ -1,3 +1,4 @@
+/* oxlint-disable react/set-state-in-effect -- polling synchronizes persisted production state */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Archive, Database, ExternalLink, RefreshCw, Rocket, RotateCcw, Square } from 'lucide-react';
 import { ApiError, api, isDemoMode, publicAppUrlFor } from '../api/client';
@@ -80,8 +81,9 @@ export function OperationsPane() {
   );
   const activeOperation = operations.find((item) => item.status === 'running') ?? null;
   const driverAvailable = driver?.configured === true && (driver.available === null || driver.available > 0);
+  const runtimeRunning = runtime?.status === 'running';
   const mutable = project.type === 'dynamic' && driverAvailable && !activeDeployment && !activeOperation && !busy;
-  const canRollback = mutable && deployments.some(
+  const canRollback = mutable && runtimeRunning && deployments.some(
     (item) => item.status === 'live' && item.previousLiveVersion && item.backupId,
   );
 
@@ -158,10 +160,10 @@ export function OperationsPane() {
         <Btn variant="primary" size="sm" disabled={!mutable} onClick={() => void act('deploy', () => api.deploy(project.id))}>
           {busy === 'deploy' ? <Spinner /> : <Rocket size={14} />}{es ? 'Desplegar' : 'Deploy'}
         </Btn>
-        <Btn size="sm" disabled={!mutable || !runtime} onClick={() => void act('backup', () => api.createDatabaseBackup(project.id))}>
+        <Btn size="sm" disabled={!mutable || !runtimeRunning} onClick={() => void act('backup', () => api.createDatabaseBackup(project.id))}>
           {busy === 'backup' ? <Spinner /> : <Archive size={14} />}{es ? 'Crear backup' : 'Create backup'}
         </Btn>
-        <Btn size="sm" disabled={!mutable || !runtime} onClick={() => void act('migrations', () => api.runMigrations(project.id))}>
+        <Btn size="sm" disabled={!mutable || !runtimeRunning} onClick={() => void act('migrations', () => api.runMigrations(project.id))}>
           {busy === 'migrations' ? <Spinner /> : <Database size={14} />}{es ? 'Aplicar migraciones' : 'Run migrations'}
         </Btn>
         <Btn variant="danger" size="sm" disabled={!canRollback} onClick={() => {
@@ -185,6 +187,11 @@ export function OperationsPane() {
                 : activeOperation
                   ? `${es ? 'Operación activa' : 'Active operation'}: ${activeOperation.operation}`
                   : (es ? 'Sin capacidad disponible.' : 'No capacity available.')}
+          </p>
+        )}
+        {mutable && !runtimeRunning && (
+          <p className="self-center text-xs text-zinc-500 dark:text-zinc-400">
+            {es ? 'Backup, migraciones y rollback requieren un runtime live sano.' : 'Backup, migrations and rollback require a healthy live runtime.'}
           </p>
         )}
       </div>

@@ -192,13 +192,14 @@ appforge/
 
 ## 9. Aplicaciones dinámicas (Fase 2 — especificación)
 
-> **Estado a 2026-10-16**: la Fase 3 implementó esta sección
+> **Estado a 2026-10-18**: la Fase 3 implementó esta sección
 > (`templates/dynamic-react-node`) y el piloto superó el criterio de
 > §9.16 (3 pasadas E2E en Oracle), por lo que la puerta de
 > compatibilidad (`apps/server/src/compatibility.ts`) ya admite las
-> capacidades dinámicas. Las Fases 5–7 (herramientas del agente,
-> pipeline y despliegue en Oracle desde el Studio) siguen pendientes;
-> no habilitar nada de eso en la UI antes de su validación.
+> capacidades dinámicas. Las Fases 5, 6, 7A y 7B están cerradas; 7C.1 y
+> 7C.2 están implementadas en la rama de entrega. La certificación real
+> 7C.3 en Oracle sigue pendiente y no puede declararse superada sin sus
+> tres recorridos consecutivos y el paquete de evidencia de §9.24.
 
 ### 9.1 Stack fijado del piloto
 
@@ -891,7 +892,7 @@ PR #10, sin fusionar):**
    runtime no queda publicado (revierte todo; el deployment termina en
    `failed` vía catch-all). Idempotente si ya está en `live`.
 
-**Fase 7 — pendiente (exclusiones expresas de Fase 6):**
+**Exclusiones expresas de Fase 6 (posteriormente implementadas en Fase 7):**
 `DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
 socket Docker; red `appforge-apps`; límites CPU/RAM/PIDs reales;
 contenedores de verificación reales; backup real de SQLite live;
@@ -902,7 +903,7 @@ en Oracle. Los §9.13/§9.14/§9.15 describen ese objetivo con Docker; la
 Fase 6 implementa la misma máquina de estados y semántica contra el
 fake driver.
 
-**Sin UI de despliegue en Fase 6:** no hay botón que prometa despliegue
+**Sin UI de despliegue en Fase 6:** en aquel cierre no había botón que prometiera despliegue
 real a Oracle. Cuando la infraestructura no está configurada, la API
 responde `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`.
 
@@ -1212,14 +1213,14 @@ orquestador de Fase 6.
   final. Sin secretos, Docker socket productivo, Oracle, Vercel manual ni
   cambios de producción.
 
-**Excluido y reservado a 7C:** compose/socket/red productivos, despliegue en
+**Alcance que 7B reservó a 7C:** compose/socket/red productivos, despliegue en
 Oracle, proxy expuesto por nginx, dominio/DNS/TLS, observabilidad/alertas de
 producción, UI de despliegue y recorrido final en infraestructura real.
-También quedan fuera de 7B los endpoints operativos aún no implementados de
-§9.20 (`POST migrations`, rollback manual y backup manual): requieren definir
-autorización operativa, idempotencia y retención en el entorno real; no se
-simulan ni se publican a medias. Los endpoints de deploy/listado/cancel/runtime
-y preview ya existentes sí quedan conectados y cubiertos en 7B.
+También quedaron fuera de 7B los endpoints operativos de §9.20 (`POST
+migrations`, rollback manual y backup manual). 7C.2 los implementa con
+autorización operativa, idempotencia, auditoría persistente y retención real.
+Los endpoints de deploy/listado/cancel/runtime y preview ya estaban conectados
+y cubiertos en 7B.
 
 ### 9.24 Producción Oracle y operación autónoma (Fase 7C — contrato cerrado)
 

@@ -6,9 +6,9 @@ packages it. Real generated code, real builds, real previews — no mockups.
 
 **Created by jpecina.**
 
-> Status: **Phase 1 in development.** The studio backend/frontend are being
-> built by another team against `CONTRACT.md`. This repo currently contains
-> the verified project templates, infrastructure, and docs.
+> Status (2026-10-18): **Phases 1–7B closed; 7C.1 and 7C.2 implemented.**
+> Real Oracle certification (7C.3) remains pending and is not claimed by this
+> repository until three consecutive unattended runs produce sanitized evidence.
 
 ## How it works
 
@@ -19,7 +19,8 @@ packages it. Real generated code, real builds, real previews — no mockups.
    panel (`/p/:projectId/`).
 4. **Iterate** — request changes in the chat; the agent patches files
    incrementally and rebuilds.
-5. **Ship** — download a ZIP (Phase 1) or deploy to Vercel (Phase 3).
+5. **Ship** — download a ZIP or, for a verified dynamic project, operate the
+   audited Oracle deployment pipeline from the Production operations tab.
 
 ## Quickstart (local dev)
 
@@ -56,10 +57,10 @@ explicitly **not** real AI.
 ```
 appforge/
   CONTRACT.md               # the single source of truth (API, DB, agent, tools)
-  apps/studio/              # React frontend (Vercel) — other team
-  apps/server/              # Fastify API + coordination — other team
-  apps/worker/              # agent orchestrator + tool registry — other team
-  packages/shared/          # shared TS types — other team
+  apps/studio/              # React frontend
+  apps/server/              # Fastify API + coordination
+  apps/worker/              # agent orchestrator + tool registry
+  packages/shared/          # shared TS types
   templates/static-react/   # ✅ VERIFIED: Vite+React+TS+plain CSS base template
   templates/dynamic-react-node/ # ✅ VERIFIED: dynamic pilot — Fastify+SQLite backend, Argon2 auth, migrations, Dockerfile (3 E2E passes on Oracle, 2026-10-16)
   infra/                    # Dockerfile, docker-compose.yml, Caddyfile, scripts/
@@ -86,12 +87,10 @@ run's event log.
 | F | ZIP download: complete code, lockfile, README, no secrets/artifacts | ✅ verified on Oracle 2026-10-13 (audit, 22 KB ZIP) |
 | G | Deploy static app to Vercel, verify URL | ⏳ Phase 3 |
 
-**Verified so far:** `templates/static-react` installs cleanly and
-`npm run build` (typecheck + production build) succeeds, producing
-`dist/index.html` (checked 2026-10-12). The `infra/` Docker/Caddy files
-are syntactically valid YAML/shell but have **not** been exercised —
-there is no Docker available in this environment, so container behavior
-is untested until Oracle.
+**Verified so far:** both project templates build and test reproducibly on
+Ubuntu and Windows. The Docker driver has strict real-Docker integration tests,
+and the production Compose stack has a Linux smoke test in CI. This evidence is
+not a substitute for the still-pending 7C.3 run on the target Oracle VM.
 
 ## Roadmap
 
@@ -105,8 +104,10 @@ is untested until Oracle.
   backends, deployment states and history.
 - **Phase 4** — Agent improvements: smarter context, diffs, restores,
   token optimization, metrics.
-- **Phase 5** — Final polish: responsive, PWA, i18n (ES/EN), analytics,
-  docs, tests.
+- **Phases 5–7B** — agent tools, full-stack preview, persistent deployment
+  pipeline, hardened Docker driver, application publishing and proxy: closed.
+- **Phase 7C** — production install and managed operations implemented;
+  certification on the real Oracle host remains pending.
 
 ## Deploying the studio itself (Oracle Cloud)
 
