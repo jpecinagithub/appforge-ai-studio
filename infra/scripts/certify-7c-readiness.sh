@@ -63,8 +63,8 @@ grep -Fq "\"commit\":\"$commit\"" "$install_evidence" \
 
 admin_token="$(awk -F= '$1 == "APPFORGE_ADMIN_TOKEN" { print substr($0, index($0,"=")+1); exit }' "$ENV_FILE" | tr -d '\r')"
 [ "${#admin_token}" -ge 32 ] || fail "administrative token is missing"
-driver_json="$(curl --fail --silent --show-error \
-  -H "Authorization: Bearer $admin_token" http://127.0.0.1/api/deployment-driver)"
+driver_json="$(printf 'Authorization: Bearer %s\n' "$admin_token" \
+  | curl --fail --silent --show-error -H @- http://127.0.0.1/api/deployment-driver)"
 unset admin_token
 printf '%s' "$driver_json" | grep -Eq '"configured"[[:space:]]*:[[:space:]]*true' \
   || fail "the real deployment driver is not configured"
