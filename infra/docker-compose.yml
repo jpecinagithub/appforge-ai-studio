@@ -1,38 +1,130 @@
-# AppForge AI Studio — single-server deployment (Oracle Cloud / any Linux host).
-# Run from this directory:  docker compose up -d --build
+# AppForge AI Studio — single-host production layout (Oracle / Linux).
+# Run from infra/: docker compose --env-file ../.env up -d --build
+
+name: appforge
 
 services:
+  data-init:
+    image: busybox:1.37.0
+    user: "0:0"
+    network_mode: none
+    command: ["sh", "-eu", "-c", "[ \"$(stat -c %u:%g /data/appforge)\" = 1000:1000 ] || chown -R 1000:1000 /data/appforge; chmod 0700 /data/appforge"]
+    volumes:
+      - appforge-data:/data/appforge
+    restart: "no"
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "FOWNER"]
+    security_opt:
+      - no-new-privileges:true
+
   studio:
     build:
       context: ..
       dockerfile: infra/Dockerfile
     container_name: appforge-studio
+    user: "1000:1000"
+    # Set DOCKER_GID to: stat -c %g /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-998}"
     env_file:
-      - ../.env # repo-root env created from .env.example
+      - ../.env
     environment:
-      - DATA_DIR=/data/appforge
-      - PORT=3001
-    ports:
-      - "3001:3001"
+      DATA_DIR: /data/appforge
+      PORT: "3001"
+      APPFORGE_PRODUCTION: "1"
+      APPFORGE_TEMPLATES_DIR: /app/templates
+      APPFORGE_DEPLOY_DRIVER: docker
+      APPFORGE_ENABLE_DOCKER_DEPLOY: "1"
+      APPFORGE_DOCKER_NETWORK: appforge-apps
+      APPFORGE_DOCKER_DATA_VOLUME: appforge-data
+      APPFORGE_MAX_CONCURRENT_DEPLOYS: "${APPFORGE_MAX_CONCURRENT_DEPLOYS:-1}"
+      HOME: /tmp/appforge-home
+    expose:
+      - "3001"
     volumes:
       - appforge-data:/data/appforge
+      # Host-equivalent privilege, limited to this trusted orchestrator.
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    networks:
+      - appforge-control
+      - appforge-apps
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m,mode=1777
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3001/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    stop_grace_period: 40s
     restart: unless-stopped
 
   caddy:
-    image: caddy:2
+    image: caddy:2.10.2-alpine
     container_name: appforge-caddy
+    environment:
+      APPFORGE_SITE_ADDRESS: "${APPFORGE_SITE_ADDRESS:-:80}"
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks:
+      - appforge-control
     depends_on:
-      - studio
+      studio:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     restart: unless-stopped
 
 volumes:
-  appforge-data: # projects, SQLite db, revisions, logs — survives rebuilds
+  appforge-data:
+    name: appforge-data
+    labels:
+      com.appforge.managed: "true"
+      com.appforge.component: studio-data
   caddy-data:
+    name: appforge-caddy-data
   caddy-config:
+    name: appforge-caddy-config
+
+networks:
+  appforge-control:
+    name: appforge-control
+  appforge-apps:
+    name: appforge-apps
+    internal: true
+    labels:
+      com.appforge.managed: "true"
+      com.appforge.component: network

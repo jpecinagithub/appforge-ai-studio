@@ -371,6 +371,25 @@ function ok(data?: Record<string, string>): DriverResult {
   return { ok: true, data };
 }
 
+interface CurrentLiveIdentity {
+  containerName: string;
+  deploymentId: string;
+  fingerprint: string;
+  image: string;
+  volume: string;
+}
+
+/** Opaque, API-safe metadata. Host paths and manifest filenames never leave the driver. */
+function validatedBackupData(manifest: BackupManifest): Record<string, string> {
+  return {
+    backupId: manifest.backupId,
+    backupValidated: 'true',
+    createdAt: manifest.createdAt,
+    sizeBytes: String(manifest.files.reduce((total, file) => total + file.size, 0)),
+    hadDatabase: String(manifest.hadDatabase),
+  };
+}
+
 export class DockerDeploymentDriver implements DeploymentDriver {
   readonly name = 'docker';
   readonly maxConcurrentDeploys: number;
@@ -480,6 +499,46 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (labels[LABEL_ROLE] !== 'live') {
       throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' is not a live container`);
     }
+  }
+
+  /**
+   * Identidad autoconsistente del live actual. No confía en SQLite ni en
+   * parámetros HTTP: nombre, labels e imagen deben concordar exactamente.
+   */
+  private async currentLiveIdentity(projectId: string): Promise<CurrentLiveIdentity> {
+    const containerName = `appforge-app-${id8(projectId)}`;
+    const info = (await inspectResource(this.runner, 'container', containerName)) as {
+      Config?: { Labels?: Record<string, string>; Image?: string };
+    };
+    const labels = info?.Config?.Labels ?? {};
+    if (labels[MANAGED_LABEL] !== 'true') {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `refusing to touch unmanaged container '${containerName}'`);
+    }
+    if ((labels[LABEL_PROJECT] ?? '').toLowerCase() !== projectId.toLowerCase()) {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' belongs to another project`);
+    }
+    if (labels[LABEL_ROLE] !== 'live') {
+      throw new DockerDriverError('FOREIGN_RESOURCE', `container '${containerName}' is not a live container`);
+    }
+    const deploymentId = labels[LABEL_DEPLOYMENT] ?? '';
+    const fingerprint = labels[LABEL_FINGERPRINT] ?? '';
+    assertUuid(deploymentId, 'deployment-id');
+    assertFingerprint(fingerprint);
+    const expected = resourceNames(projectId, deploymentId, fingerprint);
+    const image = String(info?.Config?.Image ?? '');
+    if (image !== expected.image) {
+      throw new DockerDriverError(
+        'FOREIGN_RESOURCE',
+        `live image reference does not match its deployment/fingerprint labels`,
+      );
+    }
+    return {
+      containerName,
+      deploymentId,
+      fingerprint: fingerprint.toLowerCase(),
+      image,
+      volume: expected.liveVolume,
+    };
   }
 
   private async containerRunning(name: string): Promise<boolean> {
@@ -1024,16 +1083,26 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     volume: string,
     role: ResourceRole,
     timeoutMs: number,
+    liveIdentity?: CurrentLiveIdentity,
   ): Promise<DriverResult> {
-    const names = this.names(args.projectId, args.deploymentId);
-    const labels = this.opLabels(args.projectId, args.deploymentId, role);
+    const names = liveIdentity ? null : this.names(args.projectId, args.deploymentId);
+    const image = liveIdentity?.image ?? names!.image;
+    const labels: ManagedLabels = liveIdentity
+      ? {
+          projectId: args.projectId,
+          deploymentId: liveIdentity.deploymentId,
+          role,
+          fingerprint: liveIdentity.fingerprint,
+        }
+      : this.opLabels(args.projectId, args.deploymentId, role);
+    const envDeploymentId = liveIdentity?.deploymentId ?? args.deploymentId;
     const migName = `appforge-mig-${id8(args.deploymentId)}`;
     const runArgs = hardenedRunArgs({
       name: migName,
-      image: names.image,
+      image,
       volume,
       labels,
-      envFile: this.ensureEnvFile(args.projectId, args.deploymentId),
+      envFile: this.ensureEnvFile(args.projectId, envDeploymentId),
       network: this.config.network,
       role: 'migration',
       command: ['node', 'backend/dist/migrate.js'],
@@ -1045,7 +1114,9 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (r.code !== 0) {
       return err('MIGRATION_FAILED', `migrations exited ${r.code}: ${(r.stdout + '\n' + r.stderr).slice(0, 800)}`);
     }
-    return this.validateVolumeDatabase(volume, names.image, args.signal);
+    const verified = await this.validateVolumeDatabase(volume, image, args.signal);
+    if (!verified.ok) return verified;
+    return { ok: true, output: sanitizeSecrets(`${r.stdout}\n${r.stderr}`).slice(0, 64 * 1024) };
   }
 
   /** Extrae app.db del volumen y le pasa PRAGMA quick_check. */
@@ -1124,6 +1195,29 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('LIVE_MIGRATION_ERROR', (e as Error).message);
+    }
+  }
+
+  async runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
+    try {
+      const identity = await this.currentLiveIdentity(args.projectId);
+      if (await this.containerRunning(identity.containerName)) {
+        return err('LIVE_NOT_QUIESCED', 'manual migrations require the live runtime to be stopped by a validated backup');
+      }
+      const volumeCheck = await this.ensureLiveVolume(args.projectId, args.signal);
+      if (volumeCheck) return volumeCheck;
+      return await this.runMigrations(
+        args,
+        identity.volume,
+        'migration',
+        MIGRATION_TIMEOUT_MS,
+        identity,
+      );
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
+      return err('MANUAL_MIGRATION_ERROR', (e as Error).message);
     }
   }
 
@@ -1341,8 +1435,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   async runHealthCheck(args: HealthCheckArgs): Promise<DriverResult> {
     assertDriverArgs(args);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
-      const cname = args.runtime === 'verify' ? names.verifyContainer : names.liveContainer;
+      let cname: string;
+      if (args.runtime === 'verify') {
+        cname = this.names(args.projectId, args.deploymentId).verifyContainer;
+      } else {
+        // El health live también se usa por operaciones administrativas cuyo
+        // ID no tiene snapshot. El slot live es canónico por proyecto.
+        cname = `appforge-app-${id8(args.projectId)}`;
+        await this.assertLiveSlot(args.projectId, cname);
+      }
       const ip = await this.containerIp(cname);
       const url = `http://${ip}:8080/healthz`;
       let lastErr = 'no attempts';
@@ -1373,13 +1474,12 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     }
   }
 
-  async runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> {
+  private async runAuthenticatedFlow(args: DriverOpArgs, containerName: string): Promise<DriverResult> {
     assertDriverArgs(args);
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     const fail = (step: string, detail: string): DriverResult => err('AUTH_FLOW_FAILED', `${step}: ${detail}`);
     try {
-      const names = this.names(args.projectId, args.deploymentId);
-      const ip = await this.containerIp(names.verifyContainer);
+      const ip = await this.containerIp(containerName);
       const base = `http://${ip}:8080`;
       const dep8 = id8(args.deploymentId);
       const emailA = `verify-a-${dep8}@example.com`;
@@ -1429,6 +1529,22 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return ok();
     } catch (e) {
       if (e instanceof DockerDriverError) return err(e.code, e.message);
+      return err('AUTH_FLOW_ERROR', (e as Error).message);
+    }
+  }
+
+  async runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> {
+    const names = this.names(args.projectId, args.deploymentId);
+    return this.runAuthenticatedFlow(args, names.verifyContainer);
+  }
+
+  async runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    try {
+      const identity = await this.currentLiveIdentity(args.projectId);
+      return await this.runAuthenticatedFlow(args, identity.containerName);
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
       return err('AUTH_FLOW_ERROR', (e as Error).message);
     }
   }
@@ -1493,36 +1609,45 @@ export class DockerDeploymentDriver implements DeploymentDriver {
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
     try {
       const { projectId, deploymentId } = args;
-      const names = this.names(projectId, deploymentId);
+      // El backup manual recibe un operation/deploymentId nuevo que no tiene
+      // snapshot. El slot y volumen live dependen solo del proyecto; exigir un
+      // snapshot aquí rompería el endpoint HTTP aunque el runtime fuese sano.
+      const liveContainer = `appforge-app-${id8(projectId)}`;
+      const liveVolume = projectLiveVolumeName(projectId);
       const backupId = newBackupId();
       const dir = backupDirFor(this.config.dataDir, projectId, backupId);
       const stamp = new Date().toISOString();
       const hasPrevious =
         typeof args.previousLiveVersion === 'string' && APPFORGE_IMAGE_REF_RE.test(args.previousLiveVersion);
-      const liveContainerExists = await resourceExists(this.runner, 'container', names.liveContainer);
+      const liveContainerExists = await resourceExists(this.runner, 'container', liveContainer);
       if (!liveContainerExists) {
-        const liveVolumeExists = await resourceExists(this.runner, 'volume', names.liveVolume);
+        const liveVolumeExists = await resourceExists(this.runner, 'volume', liveVolume);
         // hadDatabase=false SOLO si no hay versión anterior, ni contenedor
         // live, ni volumen live con datos (revisión Codex, NO-GO 2, bloqueo
         // 2). "Contenedor live ausente" NO equivale a "primer despliegue".
         if (!hasPrevious && !liveVolumeExists) {
-          writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] });
+          const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] };
+          writeBackupManifest(dir, manifest);
           enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-          return ok({ backupId, backupValidated: 'true' });
+          return ok(validatedBackupData(manifest));
         }
         if (liveVolumeExists) {
           // Volumen live huérfano (existe sin contenedor): verificar sus
           // labels y respaldar sus datos con un contenedor temporal
           // endurecido.
-          const info = (await inspectResource(this.runner, 'volume', names.liveVolume)) as {
+          const info = (await inspectResource(this.runner, 'volume', liveVolume)) as {
             Labels?: Record<string, string>;
           };
           try {
             assertLiveVolumeLabels(info?.Labels, projectId);
           } catch {
-            return err('FOREIGN_RESOURCE', `refusing to back up foreign live volume '${names.liveVolume}'`);
+            return err('FOREIGN_RESOURCE', `refusing to back up foreign live volume '${liveVolume}'`);
           }
-          return await this.backupOrphanLiveVolume(args, names.liveVolume, backupId, stamp);
+          // Con versión live persistida se usa esa imagen validada. El caso
+          // de primer despliegue con volumen huérfano reutiliza el candidato,
+          // que sí debe tener snapshot.
+          const helperImage = hasPrevious ? args.previousLiveVersion! : this.names(projectId, deploymentId).image;
+          return await this.backupOrphanLiveVolume(args, liveVolume, helperImage, backupId, stamp);
         }
         // Una versión anterior persistida sin contenedor ni volumen es una
         // inconsistencia peligrosa, no un primer despliegue vacío. Afirmar
@@ -1532,17 +1657,17 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           'previousLiveVersion exists but both live container and live volume are missing; refusing an empty backup',
         );
       }
-      await this.assertLiveSlot(projectId, names.liveContainer);
+      await this.assertLiveSlot(projectId, liveContainer);
       // Detener de forma controlada antes de copiar.
-      await this.stopContainerBounded(names.liveContainer, args.signal, 30);
-      if (await this.containerRunning(names.liveContainer)) {
+      await this.stopContainerBounded(liveContainer, args.signal, 30);
+      if (await this.containerRunning(liveContainer)) {
         return err('BACKUP_STOP_FAILED', 'live container did not stop before backup');
       }
       // A partir de aquí el live está detenido: cualquier fallo o abort debe
       // intentar re-levantarlo y verificar health ANTES de devolver el error.
       // Nunca se deja el servicio parado por un backup fallido (bloqueo 2).
       try {
-        const copied = await this.copyDatabaseFilesFromContainer(args, names.liveContainer, dir);
+        const copied = await this.copyDatabaseFilesFromContainer(args, liveContainer, dir);
         if (!copied.some((c) => c.name === 'app.db')) {
           throw new DockerDriverError('BACKUP_SOURCE_MISSING', 'live container has no app.db');
         }
@@ -1551,17 +1676,18 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         } catch (e) {
           throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
         }
-        writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied });
+        const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied };
+        writeBackupManifest(dir, manifest);
         // Retención real (revisión Codex, NO-GO 2, bloqueo 1): se protegen los
         // backups referenciados por deployments activos y por el último live.
         enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-        return ok({ backupId, backupValidated: 'true' });
+        return ok(validatedBackupData(manifest));
       } catch (e) {
         const backupErr =
           e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
             ? err(e.code, e.message)
             : err('BACKUP_ERROR', (e as Error).message);
-        const recovered = await this.recoverStoppedLive(args, names.liveContainer);
+        const recovered = await this.recoverStoppedLive(args, liveContainer);
         if (!recovered.ok) {
           return err(
             'BACKUP_RECOVERY_FAILED',
@@ -1627,15 +1753,15 @@ export class DockerDeploymentDriver implements DeploymentDriver {
   private async backupOrphanLiveVolume(
     args: LiveBackupArgs,
     liveVolume: string,
+    helperImage: string,
     backupId: string,
     stamp: string,
   ): Promise<DriverResult> {
     const { projectId, deploymentId } = args;
     if (args.signal?.aborted) return err('OPERATION_ABORTED', 'aborted before start');
-    const names = this.names(projectId, deploymentId);
     const dir = backupDirFor(this.config.dataDir, projectId, backupId);
     const tmp = `appforge-tmp-backup-${randomUUID().slice(0, 8)}`;
-    const createArgs = hardenedTempVolumeArgs({ name: tmp, image: names.image, volume: liveVolume });
+    const createArgs = hardenedTempVolumeArgs({ name: tmp, image: helperImage, volume: liveVolume });
     assertNoForbiddenFlags(createArgs);
     const cc = await this.sh(createArgs, { timeoutMs: 30_000, signal: args.signal });
     if (cc.aborted) return err('OPERATION_ABORTED', 'orphan volume backup aborted');
@@ -1652,9 +1778,10 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
         }
       }
-      writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase, files: copied });
+      const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase, files: copied };
+      writeBackupManifest(dir, manifest);
       enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-      return ok({ backupId, backupValidated: 'true' });
+      return ok(validatedBackupData(manifest));
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
         return err(e.code, e.message);
@@ -1671,7 +1798,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
    * el live: el servicio nunca debe quedar parado por un backup fallido
    * (revisión Codex, NO-GO 2, bloqueo 2).
    */
-  private async recoverStoppedLive(args: LiveBackupArgs, containerName: string): Promise<DriverResult> {
+  private async recoverStoppedLive(args: DriverOpArgs, containerName: string): Promise<DriverResult> {
     // La señal de la operación original puede estar ya abortada por timeout.
     // La recuperación necesita un presupuesto independiente o el runner ni
     // siquiera ejecutaría `docker start`.
@@ -1699,6 +1826,24 @@ export class DockerDeploymentDriver implements DeploymentDriver {
       return err('BACKUP_RECOVERY_UNHEALTHY', `live restarted but health check failed: ${health.error}`);
     }
     return ok({ recovered: 'true' });
+  }
+
+  async resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    try {
+      const liveContainer = `appforge-app-${id8(args.projectId)}`;
+      if (!(await resourceExists(this.runner, 'container', liveContainer))) {
+        return err('LIVE_MISSING', 'live container is missing; cannot resume it after backup');
+      }
+      await this.assertLiveSlot(args.projectId, liveContainer);
+      if (await this.containerRunning(liveContainer)) {
+        return await this.runHealthCheck({ ...args, runtime: 'live' });
+      }
+      return await this.recoverStoppedLive(args, liveContainer);
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError) return err(e.code, e.message);
+      return err('RESUME_LIVE_ERROR', (e as Error).message);
+    }
   }
 
   async stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> {
@@ -2232,6 +2377,63 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         return err(e.code, e.message);
       }
       return err('RESTORE_ERROR', (e as Error).message);
+    }
+  }
+
+  async recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult> {
+    assertDriverArgs(args);
+    if (!isValidBackupId(args.backupId)) {
+      return err('INVALID_BACKUP_ID', 'recoverCurrentLiveBackup requires a valid backupId');
+    }
+    try {
+      // Se captura la identidad real ANTES del restore, porque restoreBackup
+      // elimina el contenedor live al sustituir físicamente el volumen.
+      const identity = await this.currentLiveIdentity(args.projectId);
+      const liveArgs: DriverOpArgs = {
+        projectId: args.projectId,
+        deploymentId: identity.deploymentId,
+        candidateId: `cand-${id8(identity.deploymentId)}`,
+        signal: args.signal,
+      };
+      const restored = await this.restoreBackup({ ...liveArgs, backupId: args.backupId });
+      if (!restored.ok) {
+        // El restore puede fallar antes de tocar el live (contenedor detenido
+        // todavía presente) o después de una compensación (contenedor ya
+        // eliminado). En ambos casos se intenta recuperar servicio sano sin
+        // ocultar que el estado pre-migración no pudo confirmarse.
+        let service: DriverResult;
+        if (await resourceExists(this.runner, 'container', identity.containerName)) {
+          service = await this.resumeCurrentLiveRuntime({ ...args, signal: args.signal });
+        } else {
+          service = await this.startPreviousVersion({
+            ...liveArgs,
+            previousLiveVersion: identity.image,
+          });
+          if (service.ok) service = await this.runHealthCheck({ ...liveArgs, runtime: 'live' });
+        }
+        return err(
+          service.ok ? 'MANUAL_RESTORE_FAILED' : 'MANUAL_RESTORE_AND_RECOVERY_FAILED',
+          `backup restore failed (${restored.code}): ${restored.error}; service recovery ${service.ok ? 'succeeded' : `failed (${service.code}): ${service.error}`}`,
+        );
+      }
+
+      const started = await this.startPreviousVersion({
+        ...liveArgs,
+        previousLiveVersion: identity.image,
+      });
+      if (!started.ok) {
+        return err('MANUAL_RECOVERY_START_FAILED', `${started.code}: ${started.error}`);
+      }
+      const health = await this.runHealthCheck({ ...liveArgs, runtime: 'live' });
+      if (!health.ok) {
+        return err('MANUAL_RECOVERY_UNHEALTHY', `${health.code}: ${health.error}`);
+      }
+      return ok({ restored: 'true', liveImage: identity.image });
+    } catch (e) {
+      if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
+        return err(e.code, e.message);
+      }
+      return err('MANUAL_RECOVERY_ERROR', (e as Error).message);
     }
   }
 

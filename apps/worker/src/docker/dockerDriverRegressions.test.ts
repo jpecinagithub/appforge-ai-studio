@@ -27,7 +27,7 @@ import {
 } from './commandRunner.js';
 import { ensureVerificationReceiptsTable, recordVerificationReceipt } from '../deploy/receipts.js';
 import { DYNAMIC_CHECK_ORDER, checkScopeFingerprint, type DynamicCheckKey } from '../dynamicTools.js';
-import { projectLiveVolumeName } from './resources.js';
+import { projectLiveVolumeName, resourceNames } from './resources.js';
 import { backupDirFor, writeBackupManifest, sha256File, type BackupManifest } from './sqliteBackup.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1421,6 +1421,9 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     ) as BackupManifest;
     expect(m.hadDatabase).toBe(true);
     expect(m.files.map((f) => f.name)).toContain('app.db');
+    expect(r.data?.createdAt).toBe(m.createdAt);
+    expect(r.data?.hadDatabase).toBe('true');
+    expect(Number(r.data?.sizeBytes)).toBe(m.files.reduce((total, file) => total + file.size, 0));
     expect(stub.calls.some((c) => c[0] === 'stop')).toBe(true); // el live se detuvo para copiar
   });
 
@@ -1687,6 +1690,128 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     });
   }
 
+  function giveLiveFullIdentity(dataDir: string, stub: StubDocker) {
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'deploy-snapshots', DID, '.appforge-manifest.json'), 'utf8'),
+    ) as { fingerprint: string };
+    const names = resourceNames(PID, DID, manifest.fingerprint);
+    const live = stub.containers.get(LIVE) as {
+      Config: { Labels: Record<string, string>; Image: string };
+      State: { Running: boolean };
+    };
+    live.Config.Labels = {
+      'com.appforge.managed': 'true',
+      'com.appforge.project-id': PID,
+      'com.appforge.deployment-id': DID,
+      'com.appforge.role': 'live',
+      'com.appforge.source-fingerprint': manifest.fingerprint,
+    };
+    live.Config.Image = names.image;
+    return { live, names };
+  }
+
+  test('resumeCurrentLiveRuntime reanuda un live detenido y exige health antes de confirmar', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const live = stub.containers.get(LIVE) as { State: { Running: boolean } };
+    live.State.Running = false;
+    mockHealthOk(d);
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(true);
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+    expect(live.State.Running).toBe(true);
+  });
+
+  test('resumeCurrentLiveRuntime con live ya activo comprueba health sin reiniciarlo', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    mockHealthFail(d);
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('HEALTH_CHECK_FAILED');
+    expect(stub.calledWith('start', LIVE)).toBe(false);
+  });
+
+  test('resumeCurrentLiveRuntime rechaza un contenedor ajeno sin arrancarlo', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const live = stub.containers.get(LIVE) as {
+      Config: { Labels: Record<string, string> };
+      State: { Running: boolean };
+    };
+    live.State.Running = false;
+    live.Config.Labels['com.appforge.project-id'] = DID2;
+
+    const r = await d.resumeCurrentLiveRuntime(opArgs(PID, DID));
+
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('FOREIGN_RESOURCE');
+    expect(stub.calledWith('start', LIVE)).toBe(false);
+    expect(live.State.Running).toBe(false);
+  });
+
+  test('backup manual y reanudación funcionan con un operation id sin snapshot', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const operationId = '99999999-8888-4777-8666-555555555555';
+    const args = {
+      projectId: PID,
+      deploymentId: operationId,
+      candidateId: `cand-${operationId.slice(0, 8)}`,
+    };
+
+    const backup = await d.createLiveBackup({
+      ...args,
+      previousLiveVersion: 'appforge/app-11111111:dep-aaaaaaaa-000000000000',
+    });
+    expect(backup.ok).toBe(true);
+    expect(backup.data?.backupValidated).toBe('true');
+    expect(fs.existsSync(path.join(dataDir, 'deploy-snapshots', operationId))).toBe(false);
+
+    mockHealthOk(d);
+    const resumed = await d.resumeCurrentLiveRuntime(args);
+    expect(resumed.ok).toBe(true);
+    expect(stub.calledWith('start', LIVE)).toBe(true);
+  });
+
+  test('runCurrentLiveMigrations usa la imagen live inspeccionada y exige runtime detenido', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupLive(dataDir, db, stub);
+    const { live, names } = giveLiveFullIdentity(dataDir, stub);
+    const operationId = '99999999-8888-4777-8666-555555555555';
+    const args = {
+      projectId: PID,
+      deploymentId: operationId,
+      candidateId: `cand-${operationId.slice(0, 8)}`,
+    };
+
+    const running = await d.runCurrentLiveMigrations(args);
+    expect(running.ok).toBe(false);
+    expect(running.code).toBe('LIVE_NOT_QUIESCED');
+
+    live.State.Running = false;
+    const migrated = await d.runCurrentLiveMigrations(args);
+    expect(migrated.ok).toBe(true);
+    const run = stub.calls.find((call) => call[0] === 'run' && call.includes(`appforge-mig-${operationId.slice(0, 8)}`));
+    expect(run).toBeDefined();
+    expect(run).toContain(names.image);
+    expect(fs.existsSync(path.join(dataDir, 'deploy-snapshots', operationId))).toBe(false);
+  });
+
   test('contenedor ausente + volumen live con datos → backup hadDatabase=true vía temporal endurecido', async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
     const db = openDb();
@@ -1712,6 +1837,9 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     ) as BackupManifest;
     expect(m.hadDatabase).toBe(true);
     expect(m.files.map((f) => f.name)).toContain('app.db');
+    expect(r.data?.createdAt).toBe(m.createdAt);
+    expect(r.data?.hadDatabase).toBe('true');
+    expect(Number(r.data?.sizeBytes)).toBe(m.files.reduce((total, file) => total + file.size, 0));
     // El temporal se creó endurecido: sin red, read-only, cap-drop ALL,
     // usuario 1001, sin labels de managed (no es un recurso inventariado).
     const createCall = stub.calls.find((c) => c[0] === 'create' && c.includes('-v') && c.some((a) => a.startsWith(`${liveVolume}:/data`)));
@@ -2242,5 +2370,47 @@ describe('NO-GO2 B3: restore failure-safe y propiedad del staging', () => {
     const after = stub.volumeFiles.get(liveVolume)?.get('app.db');
     expect(after).toBeDefined();
     expect(Buffer.compare(after!, originalBytes)).toBe(0);
+  });
+
+  test('recoverCurrentLiveBackup restaura físicamente y arranca la misma imagen live sana', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-reg-'));
+    const db = openDb();
+    const stub = new StubDocker();
+    const d = await setupBuilt(dataDir, db, stub);
+    const { bytes: backupBytes } = makeValidBackup(dataDir);
+    seedLiveVolumeWithData(stub);
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(dataDir, 'deploy-snapshots', DID, '.appforge-manifest.json'), 'utf8'),
+    ) as { fingerprint: string };
+    const names = resourceNames(PID, DID, manifest.fingerprint);
+    const labels = {
+      'com.appforge.managed': 'true',
+      'com.appforge.project-id': PID,
+      'com.appforge.deployment-id': DID,
+      'com.appforge.role': 'live',
+      'com.appforge.source-fingerprint': manifest.fingerprint,
+    };
+    stub.containers.set(LIVE, {
+      Config: { Labels: labels, User: '1001', Image: names.image },
+      State: { Running: false },
+    });
+    stub.containerTemplate = goodLiveInspect(labels, names.liveVolume, names.image);
+    (d as unknown as { runHealthCheck: (a: never) => Promise<unknown> }).runHealthCheck = async () => ({ ok: true });
+    const operationId = '99999999-8888-4777-8666-555555555555';
+
+    const recovered = await d.recoverCurrentLiveBackup({
+      projectId: PID,
+      deploymentId: operationId,
+      candidateId: `cand-${operationId.slice(0, 8)}`,
+      backupId: BACKUP_ID,
+    });
+
+    expect(recovered.ok).toBe(true);
+    expect(recovered.data?.liveImage).toBe(names.image);
+    const restored = stub.volumeFiles.get(names.liveVolume)?.get('app.db');
+    expect(restored).toBeDefined();
+    expect(Buffer.compare(restored!, backupBytes)).toBe(0);
+    const live = stub.containers.get(LIVE) as { State?: { Running?: boolean } };
+    expect(live.State?.Running).toBe(true);
   });
 });

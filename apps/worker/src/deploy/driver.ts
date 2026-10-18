@@ -151,8 +151,16 @@ export interface DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult>;
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult>;
+  /** Ejecuta el mismo flujo autenticado contra el slot live canónico. */
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult>;
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult>;
+  /** Reanuda el live detenido por un backup manual y confirma su health. */
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
+  /** Ejecuta las migraciones incluidas en la imagen live inspeccionada. */
+  runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult>;
+  /** Restaura un backup manual y recupera la misma imagen live sana. */
+  recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult>;
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult>;
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult>;
@@ -215,8 +223,12 @@ export type FakeOpName =
   | 'startVerificationRuntime'
   | 'runHealthCheck'
   | 'runAuthenticatedVerification'
+  | 'runAuthenticatedLiveVerification'
   | 'stopVerificationRuntime'
   | 'createLiveBackup'
+  | 'resumeCurrentLiveRuntime'
+  | 'runCurrentLiveMigrations'
+  | 'recoverCurrentLiveBackup'
   | 'runLiveMigrations'
   | 'stopCurrentLiveRuntime'
   | 'startCandidateAsLive'
@@ -233,8 +245,12 @@ export const FAKE_OP_NAMES: readonly FakeOpName[] = [
   'startVerificationRuntime',
   'runHealthCheck',
   'runAuthenticatedVerification',
+  'runAuthenticatedLiveVerification',
   'stopVerificationRuntime',
   'createLiveBackup',
+  'resumeCurrentLiveRuntime',
+  'runCurrentLiveMigrations',
+  'recoverCurrentLiveBackup',
   'runLiveMigrations',
   'stopCurrentLiveRuntime',
   'startCandidateAsLive',
@@ -291,6 +307,9 @@ export interface FakeDriverOptions {
    * createLiveBackup (defecto 'true'; 'false' simula backup no validado).
    */
   backupValidated?: string;
+  /** Metadatos del backup fake para diferenciar live con/sin base de datos. */
+  backupSizeBytes?: number;
+  backupHadDatabase?: boolean;
   /**
    * Decisor dinámico por operación (p. ej. fallar runHealthCheck solo para
    * runtime='live'). Tiene prioridad sobre `behavior`.
@@ -387,6 +406,9 @@ export class FakeDeploymentDriver implements DeploymentDriver {
             ? {
                 ...(this.opts.omitBackupId ? {} : { backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}` }),
                 backupValidated: this.opts.backupValidated ?? 'true',
+                createdAt: new Date().toISOString(),
+                sizeBytes: String(this.opts.backupSizeBytes ?? 0),
+                hadDatabase: String(this.opts.backupHadDatabase ?? false),
               }
             : undefined;
         return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
@@ -409,8 +431,12 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('startVerificationRuntime', args); }
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult> { return this.run('runHealthCheck', args); }
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedVerification', args); }
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedLiveVerification', args); }
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopVerificationRuntime', args); }
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> { return this.run('createLiveBackup', args); }
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('resumeCurrentLiveRuntime', args); }
+  runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult> { return this.run('runCurrentLiveMigrations', args); }
+  recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult> { return this.run('recoverCurrentLiveBackup', args); }
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult> { return this.run('runLiveMigrations', args); }
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopCurrentLiveRuntime', args); }
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult> { return this.run('startCandidateAsLive', args); }

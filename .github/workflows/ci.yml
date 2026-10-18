@@ -115,3 +115,72 @@ jobs:
           docker images -q --filter "label=com.appforge.managed=true" | xargs -r docker rmi -f || true
           docker network rm "af-test-net-${{ github.run_id }}" 2>/dev/null || true
           docker volume rm "af-test-data-${{ github.run_id }}" 2>/dev/null || true
+
+  # Fase 7C.1: validate and boot the exact production image/compose on a
+  # disposable Linux runner. It uses no Oracle access and no real secrets.
+  production-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create ephemeral production environment
+        shell: bash
+        run: |
+          cp .env.example .env
+          token=$(openssl rand -hex 32)
+          gid=$(stat -c %g /var/run/docker.sock)
+          sed -i "s/^APPFORGE_ADMIN_TOKEN=.*/APPFORGE_ADMIN_TOKEN=$token/" .env
+          sed -i 's|^CORS_ORIGIN=.*|CORS_ORIGIN=http://127.0.0.1|' .env
+          sed -i 's/^APPFORGE_PRODUCTION=.*/APPFORGE_PRODUCTION=1/' .env
+          sed -i "s/^DOCKER_GID=.*/DOCKER_GID=$gid/" .env
+          sed -i 's/^GROQ_API_KEY=.*/GROQ_API_KEY=ci-placeholder-key-000000000000/' .env
+          chmod 600 .env
+
+      - name: Run production preflight
+        shell: bash
+        run: |
+          bash -n infra/scripts/install.sh infra/scripts/preflight.sh infra/scripts/certify-7c-readiness.sh
+          cp .env /tmp/appforge-insecure.env
+          chmod 644 /tmp/appforge-insecure.env
+          if bash infra/scripts/preflight.sh --env /tmp/appforge-insecure.env --compose infra/docker-compose.yml; then
+            echo "preflight accepted an insecure env mode" >&2
+            exit 1
+          fi
+          chmod 600 /tmp/appforge-insecure.env
+          printf '\nAPPFORGE_ADMIN_TOKEN=duplicate-must-fail\n' >> /tmp/appforge-insecure.env
+          if bash infra/scripts/preflight.sh --env /tmp/appforge-insecure.env --compose infra/docker-compose.yml; then
+            echo "preflight accepted a duplicate secret key" >&2
+            exit 1
+          fi
+          rm -f /tmp/appforge-insecure.env
+          bash infra/scripts/preflight.sh --env .env --compose infra/docker-compose.yml
+
+      - name: Validate production compose
+        run: docker compose --env-file .env -f infra/docker-compose.yml config --quiet
+
+      - name: Build and boot trusted Studio
+        run: docker compose --env-file .env -f infra/docker-compose.yml up -d --build studio
+
+      - name: Verify production invariants
+        shell: bash
+        run: |
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' appforge-studio 2>/dev/null || true)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' appforge-studio)" = healthy
+          test "$(docker inspect --format '{{.Config.User}}' appforge-studio)" = "1000:1000"
+          docker exec appforge-studio curl --fail --silent http://127.0.0.1:3001/healthz
+          docker exec appforge-studio docker version --format '{{.Client.Version}}'
+          test "$(docker network inspect --format '{{.Internal}}' appforge-apps)" = true
+          test "$(docker network inspect --format '{{index .Labels "com.appforge.component"}}' appforge-apps)" = network
+          test "$(docker volume inspect --format '{{index .Labels "com.appforge.component"}}' appforge-data)" = studio-data
+
+      - name: Cleanup production smoke resources (always)
+        if: always()
+        shell: bash
+        run: |
+          docker compose --env-file .env -f infra/docker-compose.yml down -v --remove-orphans || true
+          rm -f .env

@@ -9,6 +9,11 @@ import type {
   RevisionInfo,
   Run,
   Settings,
+  DeploymentInfo,
+  ProjectRuntimeInfo,
+  AdministrativeOperationInfo,
+  MigrationInfo,
+  DeploymentDriverStatus,
 } from './types';
 
 /** Base del backend. Vacío = mismo origen (proxy de dev o despliegue conjunto). */
@@ -128,8 +133,9 @@ function qs(params: Record<string, string | number | undefined>): string {
   return s ? `?${s}` : '';
 }
 
-const post = (path: string, body?: unknown) =>
-  request<never>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) });
+function idempotencyHeaders(): Record<string, string> {
+  return { 'Idempotency-Key': crypto.randomUUID() };
+}
 
 export const api = {
   health: () => request<{ ok: boolean; version: string }>('/api/health'),
@@ -206,7 +212,36 @@ export const api = {
   patchSettings: (body: Partial<Settings>) =>
     request<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(body) }),
 
-  deploy: (id: string) => post(`/api/projects/${id}/deploy`),
+  deploy: (id: string) =>
+    request<DeploymentInfo>(`/api/projects/${id}/deploy`, {
+      method: 'POST',
+      headers: idempotencyHeaders(),
+      body: JSON.stringify({ target: 'oracle' }),
+    }),
+  listDeployments: (id: string) =>
+    request<{ items: DeploymentInfo[] }>(`/api/projects/${id}/deployments`),
+  cancelDeployment: (deploymentId: string) =>
+    request<DeploymentInfo>(`/api/deployments/${deploymentId}/cancel`, {
+      method: 'POST', headers: idempotencyHeaders(),
+    }),
+  getProjectRuntime: (id: string) => request<ProjectRuntimeInfo>(`/api/projects/${id}/runtime`),
+  listAdministrativeOperations: (id: string) =>
+    request<{ items: AdministrativeOperationInfo[] }>(`/api/projects/${id}/operations`),
+  listMigrations: (id: string) =>
+    request<{ items: MigrationInfo[] }>(`/api/projects/${id}/migrations`),
+  createDatabaseBackup: (id: string) =>
+    request<{ backupId: string; createdAt: string; sizeBytes: number; hadDatabase: boolean }>(
+      `/api/projects/${id}/database/backup`, { method: 'POST', headers: idempotencyHeaders() },
+    ),
+  runMigrations: (id: string) =>
+    request<{ items: MigrationInfo[] }>(`/api/projects/${id}/migrations`, {
+      method: 'POST', headers: idempotencyHeaders(),
+    }),
+  rollback: (id: string) =>
+    request<{ deployment: DeploymentInfo }>(`/api/projects/${id}/rollback`, {
+      method: 'POST', headers: idempotencyHeaders(),
+    }),
+  getDeploymentDriverStatus: () => request<DeploymentDriverStatus>('/api/deployment-driver'),
 };
 
 /** URL pública de la preview estática de un proyecto. */

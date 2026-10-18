@@ -16,7 +16,7 @@ import { Badge, ErrorBox, Spinner } from '../components/ui';
 import { timeAgo } from '../utils/format';
 import { apiErrorDetail, apiErrorKey } from '../utils/errors';
 
-const VALID_TABS: WorkspaceTab[] = ['preview', 'builds', 'code', 'console'];
+const VALID_TABS: WorkspaceTab[] = ['preview', 'builds', 'code', 'console', 'operations'];
 
 export function ProjectView() {
   const { id } = useParams<{ id: string }>();

@@ -690,10 +690,12 @@ describe('dynamic tools — fase 5A', () => {
   });
 
   test('buildChildEnv drops secrets and keeps only allowlisted variables', () => {
+    const previousNodeEnv = process.env.NODE_ENV;
     process.env.GROQ_API_KEY = 'secret-groq';
     process.env.OPENROUTER_API_KEY = 'secret-openrouter';
     process.env.APPFORGE_ADMIN_TOKEN = 'secret-admin';
     process.env.AF_TEST_SECRET = 'secret-custom';
+    process.env.NODE_ENV = 'production';
     const env = buildChildEnv();
     expect(env.GROQ_API_KEY).toBeUndefined();
     expect(env.OPENROUTER_API_KEY).toBeUndefined();
@@ -701,15 +703,19 @@ describe('dynamic tools — fase 5A', () => {
     expect(env.AF_TEST_SECRET).toBeUndefined();
     expect(env.PATH).toBe(process.env.PATH);
     expect(env.HOME).toBe(process.env.HOME);
+    expect(env.NODE_ENV).toBe('development');
     delete process.env.GROQ_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.APPFORGE_ADMIN_TOKEN;
     delete process.env.AF_TEST_SECRET;
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
   });
 
   test('buildChildEnv allows explicit DB_PATH and rejects unknown extra keys', () => {
-    const env = buildChildEnv({ DB_PATH: '/tmp/x.db' });
+    const env = buildChildEnv({ DB_PATH: '/tmp/x.db', NODE_ENV: 'test' });
     expect(env.DB_PATH).toBe('/tmp/x.db');
+    expect(env.NODE_ENV).toBe('test');
     expect(() => buildChildEnv({ EVIL_KEY: 'x' })).toThrow(/not allowlisted/);
   });
 

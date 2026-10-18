@@ -3,7 +3,7 @@ import { createContext, useContext } from 'react';
 import type { StreamEvent } from '../api/sse';
 import type { ChatMessage, Project, Run } from '../api/types';
 
-export type WorkspaceTab = 'preview' | 'builds' | 'code' | 'console';
+export type WorkspaceTab = 'preview' | 'builds' | 'code' | 'console' | 'operations';
 
 /**
  * Estado compartido de la vista de proyecto: lo produce ProjectView

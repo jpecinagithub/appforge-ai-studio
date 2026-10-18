@@ -17,12 +17,41 @@ export interface WorkerOptions {
   deploymentDriver?: DeploymentDriver;
 }
 
+export interface WorkerController {
+  /** Prevents new jobs from being claimed. It does not interrupt owned work. */
+  stop: () => void;
+  /** Waits for work owned by this process, bounded by the caller's budget. */
+  drain: (timeoutMs: number) => Promise<boolean>;
+  tick: () => Promise<void>;
+}
+
+/**
+ * Wait for the current snapshot of a task set. Callers must stop producers
+ * before invoking this helper. A false result means recovery is delegated to
+ * the persistent restart reconciliation, not that the tasks were cancelled.
+ */
+export async function waitForTaskSet(tasks: ReadonlySet<Promise<unknown>>, timeoutMs: number): Promise<boolean> {
+  if (tasks.size === 0) return true;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return false;
+
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    timer.unref?.();
+  });
+  const settled = Promise.allSettled([...tasks]).then(() => true as const);
+  const result = await Promise.race([settled, timedOut]);
+  if (timer) clearTimeout(timer);
+  return result && tasks.size === 0;
+}
+
 export function startWorker(
   db: Database.Database,
   opts: WorkerOptions,
-): { stop: () => void; tick: () => Promise<void> } {
+): WorkerController {
   let inflight = 0;
   let stopped = false;
+  const tasks = new Set<Promise<void>>();
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
@@ -47,7 +76,7 @@ export function startWorker(
 
       inflight += 1;
       const runOpts: RunAgentOptions = { dataDir: opts.dataDir, settings: opts.getSettings(), deploymentDriver: opts.deploymentDriver };
-      runAgentOnce(db, cand.id, runOpts)
+      const task = runAgentOnce(db, cand.id, runOpts)
         .catch((err: unknown) => {
           try {
             db.prepare("UPDATE runs SET status='error', finished_at=?, error=? WHERE id=? AND status='running'").run(
@@ -61,7 +90,10 @@ export function startWorker(
         })
         .finally(() => {
           inflight -= 1;
+          tasks.delete(task);
         });
+      tasks.add(task);
+      void task;
     } catch (err) {
       console.error('[worker] tick failed:', (err as Error)?.message ?? err);
     }
@@ -74,6 +106,7 @@ export function startWorker(
       stopped = true;
       clearInterval(timer);
     },
+    drain: (timeoutMs) => waitForTaskSet(tasks, timeoutMs),
     tick,
   };
 }
