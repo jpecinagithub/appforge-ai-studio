@@ -51,6 +51,28 @@ CREATE TABLE IF NOT EXISTS verification_receipts(
   project_id TEXT NOT NULL, check_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
   seq INTEGER NOT NULL, created_at TEXT NOT NULL,
   PRIMARY KEY (project_id, check_key));
+-- Fase 7C.2: idempotencia + auditoría de las operaciones administrativas.
+-- La clave se limita por actor en toda la API: reutilizarla para otra
+-- operación/proyecto/payload es un conflicto, nunca una segunda mutación.
+CREATE TABLE IF NOT EXISTS operation_audit(
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  response_status INTEGER,
+  response_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(actor, idempotency_key));
+CREATE TABLE IF NOT EXISTS project_operation_locks(
+  project_id TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL UNIQUE,
+  operation TEXT NOT NULL,
+  acquired_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(
   id INTEGER PRIMARY KEY CHECK(id=1), data_json TEXT);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id, created_at);
@@ -59,6 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, created_
 CREATE INDEX IF NOT EXISTS idx_builds_project ON builds(project_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_migrations_project ON migrations(project_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_deployment_events_deployment ON deployment_events(deployment_id, seq);
+CREATE INDEX IF NOT EXISTS idx_operation_audit_project ON operation_audit(project_id, created_at DESC);
 -- Fase 6: garantía transaccional — como máximo un deployment no terminal
 -- por proyecto (el índice parcial convierte la carrera en un error estable).
 CREATE UNIQUE INDEX IF NOT EXISTS uq_deployments_active_project

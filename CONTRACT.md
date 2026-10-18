@@ -725,7 +725,9 @@ donde se indica (`400 INVALID_TYPE` en otro caso).
 - `POST /api/projects/:id/rollback` → `DeploymentInfo` (nuevo registro;
   `409` si no hay `previous_image` o no hay backup pre-migración)
 - `POST /api/projects/:id/database/backup`
-  → `{"path":string,"createdAt":string,"sizeBytes":number}`
+  → `{"backupId":string,"createdAt":string,"sizeBytes":number,
+  "hadDatabase":boolean}`; nunca devuelve una ruta del host. En 7C exige
+  autenticación administrativa e `Idempotency-Key` según §9.24.
 - `GET /api/projects/:id/runtime` → `ProjectRuntime`
 - `GET /api/projects/:id/preview` → `{"url":"/a/:id/","status":"ready|starting|building|none"}`
   (`status` refleja el contenedor live; `none` si nunca se desplegó)

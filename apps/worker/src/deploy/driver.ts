@@ -387,6 +387,9 @@ export class FakeDeploymentDriver implements DeploymentDriver {
             ? {
                 ...(this.opts.omitBackupId ? {} : { backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}` }),
                 backupValidated: this.opts.backupValidated ?? 'true',
+                createdAt: new Date().toISOString(),
+                sizeBytes: '0',
+                hadDatabase: 'false',
               }
             : undefined;
         return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };

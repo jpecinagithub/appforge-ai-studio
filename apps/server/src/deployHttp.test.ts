@@ -41,6 +41,7 @@ import {
 } from 'appforge-worker';
 import { nowIso } from 'appforge-worker';
 import { projectDir } from './projects.js';
+import { acquireProjectOperationLock, releaseProjectOperationLock } from './operations.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
@@ -246,6 +247,29 @@ describe('POST /api/projects/:id/deploy (criterios 1, 18, 19, 20)', () => {
 });
 
 describe('concurrent deploys (criterio 4)', () => {
+  it('serializes deploy against another managed operation on the same project', async () => {
+    addProject('locked-project');
+    seedVerificationReceipts('locked-project');
+    expect(acquireProjectOperationLock(db, {
+      projectId: 'locked-project',
+      operationId: 'manual-backup-owner',
+      operation: 'database_backup',
+    })).toBe(true);
+    try {
+      const blocked = await app.inject({
+        method: 'POST',
+        url: '/api/projects/locked-project/deploy',
+        payload: { target: 'oracle' },
+      });
+      expect(blocked.statusCode).toBe(409);
+      expect((blocked.json() as { error: { code: string } }).error.code).toBe('PROJECT_OPERATION_ACTIVE');
+      const count = db.prepare('SELECT COUNT(*) AS n FROM deployments WHERE project_id=?').get('locked-project') as { n: number };
+      expect(count.n).toBe(0);
+    } finally {
+      releaseProjectOperationLock(db, 'manual-backup-owner');
+    }
+  });
+
   it('only one of two simultaneous requests creates a deployment', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });

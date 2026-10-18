@@ -371,6 +371,17 @@ function ok(data?: Record<string, string>): DriverResult {
   return { ok: true, data };
 }
 
+/** Opaque, API-safe metadata. Host paths and manifest filenames never leave the driver. */
+function validatedBackupData(manifest: BackupManifest): Record<string, string> {
+  return {
+    backupId: manifest.backupId,
+    backupValidated: 'true',
+    createdAt: manifest.createdAt,
+    sizeBytes: String(manifest.files.reduce((total, file) => total + file.size, 0)),
+    hadDatabase: String(manifest.hadDatabase),
+  };
+}
+
 export class DockerDeploymentDriver implements DeploymentDriver {
   readonly name = 'docker';
   readonly maxConcurrentDeploys: number;
@@ -1506,9 +1517,10 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         // live, ni volumen live con datos (revisión Codex, NO-GO 2, bloqueo
         // 2). "Contenedor live ausente" NO equivale a "primer despliegue".
         if (!hasPrevious && !liveVolumeExists) {
-          writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] });
+          const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: false, files: [] };
+          writeBackupManifest(dir, manifest);
           enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-          return ok({ backupId, backupValidated: 'true' });
+          return ok(validatedBackupData(manifest));
         }
         if (liveVolumeExists) {
           // Volumen live huérfano (existe sin contenedor): verificar sus
@@ -1551,11 +1563,12 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         } catch (e) {
           throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
         }
-        writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied });
+        const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase: true, files: copied };
+        writeBackupManifest(dir, manifest);
         // Retención real (revisión Codex, NO-GO 2, bloqueo 1): se protegen los
         // backups referenciados por deployments activos y por el último live.
         enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-        return ok({ backupId, backupValidated: 'true' });
+        return ok(validatedBackupData(manifest));
       } catch (e) {
         const backupErr =
           e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError
@@ -1652,9 +1665,10 @@ export class DockerDeploymentDriver implements DeploymentDriver {
           throw new DockerDriverError('BACKUP_QUICK_CHECK_FAILED', (e as Error).message);
         }
       }
-      writeBackupManifest(dir, { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase, files: copied });
+      const manifest: BackupManifest = { backupId, projectId, deploymentId, createdAt: stamp, hadDatabase, files: copied };
+      writeBackupManifest(dir, manifest);
       enforceRetention({ dataDir: this.config.dataDir, projectId, protectedIds: this.protectedBackupIds(projectId) });
-      return ok({ backupId, backupValidated: 'true' });
+      return ok(validatedBackupData(manifest));
     } catch (e) {
       if (e instanceof DockerDriverError || e instanceof ResourceError || e instanceof BackupError) {
         return err(e.code, e.message);

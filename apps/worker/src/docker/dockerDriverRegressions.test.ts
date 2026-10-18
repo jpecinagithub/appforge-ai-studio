@@ -1421,6 +1421,9 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     ) as BackupManifest;
     expect(m.hadDatabase).toBe(true);
     expect(m.files.map((f) => f.name)).toContain('app.db');
+    expect(r.data?.createdAt).toBe(m.createdAt);
+    expect(r.data?.hadDatabase).toBe('true');
+    expect(Number(r.data?.sizeBytes)).toBe(m.files.reduce((total, file) => total + file.size, 0));
     expect(stub.calls.some((c) => c[0] === 'stop')).toBe(true); // el live se detuvo para copiar
   });
 
@@ -1712,6 +1715,9 @@ describe('NO-GO2 B2: primer despliegue seguro y recuperación del live tras fall
     ) as BackupManifest;
     expect(m.hadDatabase).toBe(true);
     expect(m.files.map((f) => f.name)).toContain('app.db');
+    expect(r.data?.createdAt).toBe(m.createdAt);
+    expect(r.data?.hadDatabase).toBe('true');
+    expect(Number(r.data?.sizeBytes)).toBe(m.files.reduce((total, file) => total + file.size, 0));
     // El temporal se creó endurecido: sin red, read-only, cap-drop ALL,
     // usuario 1001, sin labels de managed (no es un recurso inventariado).
     const createCall = stub.calls.find((c) => c[0] === 'create' && c.includes('-v') && c.some((a) => a.startsWith(`${liveVolume}:/data`)));

@@ -30,12 +30,23 @@ import type {
 import { openDb } from './db.js';
 import { assessTechnologyCompatibility } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
+import {
+  acquireProjectOperationLock,
+  completeOperation,
+  listOperations,
+  OperationAuditError,
+  reconcileInterruptedOperations,
+  reconcileProjectOperationLocks,
+  releaseProjectOperationLock,
+  reserveOperation,
+} from './operations.js';
 import { APPFORGE_IMAGE_REF_RE, activateDockerDeployment, checkBrowser, checkBrowserAtUrl, createTools, requestCancel, runAgentOnce, runCmd, startWorker, getPreview, failPreview, reconcilePreviews, waitForTaskSet, type AgentSettings, type ToolContext } from 'appforge-worker';
 // Fase 6 — orquestador persistente del pipeline de despliegue (CONTRACT.md §9.21)
 import {
   DeploymentError,
   acquireDeploymentCapacity,
   createDeployment,
+  getActiveDeployment,
   getDeployment as getDeploymentRecord,
   getProjectRuntime as getProjectRuntimeRecord,
   listDeployments as listDeploymentRecords,
@@ -44,6 +55,8 @@ import {
   reconcileProjectRuntimes,
   requestDeploymentCancel,
   runDeploymentPipeline,
+  isValidBackupId,
+  sanitizeDeploymentError,
   type DeploymentDriver,
   type DeploymentRecord,
 } from 'appforge-worker';
@@ -74,6 +87,16 @@ export function parseShutdownTimeout(raw: string | undefined): number {
     throw new Error('APPFORGE_SHUTDOWN_TIMEOUT_MS must be an integer between 1000 and 300000');
   }
   return value;
+}
+
+function sanitizeOperationDiagnostic(raw: string, dataDir: string): string {
+  const sanitized = sanitizeDeploymentError(raw) ?? 'operation failed';
+  const candidates = new Set([dataDir, path.normalize(dataDir), dataDir.replace(/\\/g, '/'), dataDir.replace(/\//g, '\\')]);
+  let output = sanitized;
+  for (const candidate of candidates) {
+    if (candidate) output = output.split(candidate).join('[path]');
+  }
+  return output;
 }
 
 // ---------------------------------------------------------------------------
@@ -870,8 +893,21 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       reply.code(409);
       return err('VERIFICATION_GATE', gate.reason ?? '5A/5B verification checks are not current');
     }
+    // Preserve the public Fase 6 error code when the conflicting operation is
+    // specifically another deployment; the cross-operation lock below covers
+    // backup/migrations/rollback races.
+    if (getActiveDeployment(db, id)) {
+      reply.code(409);
+      return err('DEPLOYMENT_ACTIVE', 'There is already a deployment in progress for this project');
+    }
+    const projectLockId = `deploy-${randomUUID()}`;
+    if (!acquireProjectOperationLock(db, { projectId: id, operationId: projectLockId, operation: 'deploy' })) {
+      reply.code(409);
+      return err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project');
+    }
     const releaseCapacity = acquireDeploymentCapacity(deployDriver);
     if (!releaseCapacity) {
+      releaseProjectOperationLock(db, projectLockId);
       reply.code(409);
       return err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted');
     }
@@ -880,6 +916,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       dep = createDeployment(db, { projectId: id, target: body.target });
     } catch (e) {
       releaseCapacity();
+      releaseProjectOperationLock(db, projectLockId);
       if (e instanceof DeploymentError) {
         reply.code(e.statusCode);
         return err(e.code, e.message);
@@ -895,7 +932,10 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       verificationGate: () => persistedDynamicGateStatus(db, projectDir(dataDir, id), id),
     })
       .catch((e) => console.error('[deploy] pipeline crashed:', (e as Error).message))
-      .finally(releaseCapacity);
+      .finally(() => {
+        releaseCapacity();
+        releaseProjectOperationLock(db, projectLockId);
+      });
     void (opts.backgroundTasks ? opts.backgroundTasks.track(deploymentTask) : deploymentTask);
     reply.code(202);
     return toDeploymentInfo(dep);
@@ -925,6 +965,141 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       return err('DEPLOYMENT_NOT_FOUND', 'deployment not found');
     }
     return toDeploymentInfo(dep);
+  });
+
+  // ----------------------------------------------------- managed operations
+  app.post('/api/projects/:id/database/backup', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const project = needProject(id);
+    if (project.type !== 'dynamic') {
+      reply.code(400);
+      return err('INVALID_TYPE', 'Database backup is only available for dynamic projects');
+    }
+    // Unlike legacy development endpoints, production operations never become
+    // anonymously writable when the server was started without a token.
+    if (!adminToken) {
+      reply.code(503);
+      return err('ADMIN_AUTH_NOT_CONFIGURED', 'Administrative authentication is not configured');
+    }
+    if (!deployDriver) {
+      reply.code(501);
+      return err('DEPLOYMENT_DRIVER_NOT_CONFIGURED', 'Deployment infrastructure is not configured');
+    }
+    const rawKey = req.headers['idempotency-key'];
+    const idempotencyKey = Array.isArray(rawKey) ? '' : (rawKey ?? '');
+    let reservation;
+    try {
+      reservation = reserveOperation(db, {
+        idempotencyKey,
+        actor: 'admin',
+        operation: 'database_backup',
+        projectId: id,
+        payload: {},
+      });
+    } catch (e) {
+      if (e instanceof OperationAuditError && e.code === 'INVALID_IDEMPOTENCY_KEY') {
+        reply.code(400);
+        return err(e.code, e.message);
+      }
+      throw e;
+    }
+    if (reservation.kind === 'conflict') {
+      reply.code(409);
+      return err('IDEMPOTENCY_CONFLICT', 'Idempotency-Key was already used for a different request');
+    }
+    if (reservation.kind === 'in_progress') {
+      reply.code(409);
+      return err('OPERATION_IN_PROGRESS', 'The idempotent operation is still running');
+    }
+    if (reservation.kind === 'replay') {
+      reply.header('Idempotency-Replayed', 'true').code(reservation.responseStatus);
+      return reservation.response;
+    }
+
+    const finish = (status: number, body: unknown): unknown => {
+      completeOperation(db, reservation.record.id, status, body);
+      reply.code(status);
+      return body;
+    };
+    const runtime = getProjectRuntimeRecord(db, id);
+    if (!runtime || runtime.status !== 'running' || !APPFORGE_IMAGE_REF_RE.test(runtime.liveImage)) {
+      return finish(409, err('RUNTIME_NOT_READY', 'Project has no verified running live runtime to back up'));
+    }
+    if (getActiveDeployment(db, id)) {
+      return finish(409, err('DEPLOYMENT_ACTIVE', 'A deployment is already active for this project'));
+    }
+    if (!acquireProjectOperationLock(db, {
+      projectId: id,
+      operationId: reservation.record.id,
+      operation: 'database_backup',
+    })) {
+      return finish(409, err('PROJECT_OPERATION_ACTIVE', 'Another mutating operation is already active for this project'));
+    }
+    const releaseCapacity = acquireDeploymentCapacity(deployDriver);
+    if (!releaseCapacity) {
+      releaseProjectOperationLock(db, reservation.record.id);
+      return finish(409, err('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted'));
+    }
+
+    try {
+      const deploymentId = randomUUID();
+      const result = await deployDriver.createLiveBackup({
+        projectId: id,
+        deploymentId,
+        candidateId: `cand-${deploymentId.slice(0, 8)}`,
+        previousLiveVersion: runtime.liveImage,
+        signal: AbortSignal.timeout(10 * 60_000),
+      });
+      const data = result.data ?? {};
+      const sizeBytes = Number(data.sizeBytes);
+      const createdAt = data.createdAt ?? '';
+      const valid =
+        result.ok &&
+        isValidBackupId(data.backupId) &&
+        data.backupValidated === 'true' &&
+        Number.isSafeInteger(sizeBytes) &&
+        sizeBytes >= 0 &&
+        Number.isFinite(Date.parse(createdAt)) &&
+        new Date(createdAt).toISOString() === createdAt &&
+        (data.hadDatabase === 'true' || data.hadDatabase === 'false');
+      if (!valid) {
+        const diagnostic = sanitizeOperationDiagnostic(
+          result.error ?? result.code ?? 'driver returned invalid backup evidence',
+          dataDir,
+        );
+        return finish(502, err('BACKUP_INVALID_RESULT', diagnostic));
+      }
+      return finish(201, {
+        backupId: data.backupId,
+        createdAt,
+        sizeBytes,
+        hadDatabase: data.hadDatabase === 'true',
+      });
+    } catch (e) {
+      const diagnostic = sanitizeOperationDiagnostic((e as Error)?.message ?? String(e), dataDir);
+      return finish(502, err('BACKUP_FAILED', diagnostic));
+    } finally {
+      releaseCapacity();
+      releaseProjectOperationLock(db, reservation.record.id);
+    }
+  });
+
+  app.get('/api/projects/:id/operations', async (req) => {
+    const { id } = req.params as { id: string };
+    needProject(id);
+    return {
+      items: listOperations(db, id).map((operation) => ({
+        id: operation.id,
+        actor: operation.actor,
+        operation: operation.operation,
+        status: operation.status,
+        responseStatus: operation.responseStatus,
+        result: operation.response,
+        createdAt: operation.createdAt,
+        updatedAt: operation.updatedAt,
+        finishedAt: operation.finishedAt,
+      })),
+    };
   });
 
   app.get('/api/projects/:id/runtime', async (req, reply) => {
@@ -1281,6 +1456,8 @@ async function main(): Promise<void> {
   if (interruptedBuilds > 0) console.log(`[server] marked ${interruptedBuilds} interrupted build(s) as failed`);
   const interruptedMigrations = reconcileInterruptedMigrations(db);
   if (interruptedMigrations > 0) console.log(`[server] marked ${interruptedMigrations} interrupted migration(s) as failed`);
+  const interruptedOperations = reconcileInterruptedOperations(db);
+  if (interruptedOperations > 0) console.log(`[server] marked ${interruptedOperations} interrupted operation(s) as failed`);
   // Fase 5B: ephemeral previews never survive a restart.
   const stalePreviews = reconcilePreviews(db);
   if (stalePreviews > 0) console.log(`[server] discarded ${stalePreviews} stale preview(s)`);
@@ -1299,6 +1476,8 @@ async function main(): Promise<void> {
   // el driver inspecciona primero los recursos que realmente posee.
   const interruptedDeployments = await reconcileDeployments(db, deploymentDriver);
   if (interruptedDeployments > 0) console.log(`[server] marked ${interruptedDeployments} interrupted deployment(s) as failed`);
+  const staleOperationLocks = reconcileProjectOperationLocks(db);
+  if (staleOperationLocks > 0) console.log(`[server] released ${staleOperationLocks} stale project operation lock(s)`);
   if (deploymentDriver) {
     const runtimes = await reconcileProjectRuntimes(db, deploymentDriver);
     if (runtimes.checked > 0) {
