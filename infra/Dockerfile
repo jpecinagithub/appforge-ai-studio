@@ -33,6 +33,12 @@ COPY packages/shared packages/shared
 COPY templates templates
 COPY --from=studio-build /build/apps/studio/dist apps/studio/dist
 
+# The unattended installers use umask 077 while handling secrets. A Git update
+# can therefore materialize changed source files as 0600 on the host. Normalize
+# only the immutable image contents before dropping privileges; runtime data in
+# /data/appforge keeps its restrictive permissions.
+RUN chmod -R a+rX /app/apps /app/packages /app/templates
+
 ENV DATA_DIR=/data/appforge \
     APPFORGE_BROWSER_EXECUTABLE=/usr/bin/chromium \
     NODE_ENV=production \

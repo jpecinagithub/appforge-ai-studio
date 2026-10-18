@@ -146,6 +146,7 @@ describe('perfil educativo en host compartido', () => {
     const mounts = compose.match(/\/var\/run\/docker\.sock:\/var\/run\/docker\.sock:rw/g) ?? [];
     expect(mounts).toHaveLength(1);
     expect(compose).toContain('appforge-edu-apps:\n    name: appforge-edu-apps\n    internal: true');
+    expect(compose).toContain('stat -c %u:%g /data/appforge');
   });
 
   test('instalador no instala Docker y la puerta permite ajenos pero verifica aislamiento', () => {
@@ -155,5 +156,11 @@ describe('perfil educativo en host compartido', () => {
     expect(readiness).not.toContain('unrelated running containers exist');
     expect(readiness).toContain('foreign containers joined appforge-edu-apps');
     expect(readiness).toContain('Studio must be published on IPv4 loopback only');
+  });
+
+  test('la imagen normaliza permisos de fuentes antes de ejecutar sin root', () => {
+    const dockerfile = fs.readFileSync(path.join(REPO, 'infra', 'Dockerfile'), 'utf8');
+    expect(dockerfile).toContain('RUN chmod -R a+rX /app/apps /app/packages /app/templates');
+    expect(dockerfile.indexOf('RUN chmod -R a+rX')).toBeLessThan(dockerfile.indexOf('USER 1000:1000'));
   });
 });
