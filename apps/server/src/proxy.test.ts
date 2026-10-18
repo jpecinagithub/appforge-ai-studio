@@ -28,7 +28,7 @@ let dataDir: string;
 let baseUrl: string;
 let upstream: http.Server;
 let upstreamPort: number;
-let upstreamSaw: Array<{ method: string; url: string; authorization?: string; cookie?: string; body: string }> = [];
+let upstreamSaw: Array<{ method: string; url: string; authorization?: string; cookie?: string; contentType?: string; body: string }> = [];
 
 // Fake preview backend: echoes method/url/headers/body as JSON.
 function startUpstream(): Promise<void> {
@@ -43,6 +43,7 @@ function startUpstream(): Promise<void> {
           url: req.url ?? '',
           authorization: req.headers.authorization,
           cookie: req.headers.cookie,
+          contentType: req.headers['content-type'],
           body,
         });
         const isAsset = (req.url ?? '').endsWith('.js');
@@ -169,6 +170,18 @@ describe('dynamic preview proxy /a/:projectId', () => {
       expect(last.url).toBe('/api/todos/1');
       expect(JSON.parse(last.body)).toEqual({ title: 'hello' });
     }
+  });
+
+  it('does not leak the internal passthrough content type on a bodyless POST', async () => {
+    const id = await createDynamicProject('Proxy bodyless POST');
+    registerPreview(id);
+    const res = await fetch(`${baseUrl}/a/${id}/api/auth/logout`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const last = upstreamSaw[upstreamSaw.length - 1]!;
+    expect(last.method).toBe('POST');
+    expect(last.url).toBe('/api/auth/logout');
+    expect(last.contentType).toBeUndefined();
+    expect(last.body).toBe('');
   });
 
   it('passes cookies through and returns Set-Cookie', async () => {

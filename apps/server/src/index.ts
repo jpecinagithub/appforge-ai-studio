@@ -2062,7 +2062,12 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     const fwdHeaders = new Headers();
     for (const [k, v] of Object.entries(req.headers)) {
       const lk = k.toLowerCase();
-      if (lk === 'host' || lk === 'authorization' || HOP_BY_HOP.has(lk)) continue;
+      // `content-type` has been replaced by our private passthrough parser in
+      // preParsing. Never forward that internal value to the application;
+      // restore only the original client value below. This is especially
+      // important for bodyless POSTs (for example logout), where forwarding
+      // application/x-appforge-passthrough makes Fastify answer 415.
+      if (lk === 'host' || lk === 'authorization' || lk === 'content-type' || HOP_BY_HOP.has(lk)) continue;
       if (Array.isArray(v)) { for (const vv of v) fwdHeaders.append(k, vv); }
       else if (v !== undefined) fwdHeaders.set(k, v);
     }
