@@ -2128,9 +2128,18 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     if (setCookies.length > 0) outHeaders['set-cookie'] = setCookies;
     // The Workspace preview embeds the app in a sandboxed iframe (opaque
     // origin): every subresource and API fetch is a CORS request. The /a/
-    // proxy is unauthenticated by design, so a wildcard is safe here
-    // (browsers still refuse to send credentials with `*`).
-    outHeaders['access-control-allow-origin'] = '*';
+    // proxy is unauthenticated by design. Browsers reject the '*' wildcard
+    // when the app fetches with credentials:'include', so answer sandboxed
+    // (Origin: null) callers with an explicit null origin + credentials.
+    // Never echo arbitrary origins: that would turn user sessions into a
+    // cross-site credential leak.
+    if (req.headers.origin === 'null') {
+      outHeaders['access-control-allow-origin'] = 'null';
+      outHeaders['access-control-allow-credentials'] = 'true';
+      outHeaders['vary'] = 'Origin';
+    } else {
+      outHeaders['access-control-allow-origin'] = '*';
+    }
 
     // Never load an unbounded upstream body: fast-reject on a declared
     // Content-Length, then stream with a hard cap (also guards against
