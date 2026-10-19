@@ -628,7 +628,13 @@ const MIME: Record<string, string> = {
 /** Serve a static file over a hijacked reply (headers must precede writeHead). */
 function sendFile(abs: string, raw: import('node:http').ServerResponse): void {
   const stream = fs.createReadStream(abs);
-  raw.writeHead(200, { 'Content-Type': MIME[path.extname(abs).toLowerCase()] ?? 'application/octet-stream' });
+  // Public build artifacts: the Workspace preview embeds projects in a
+  // sandboxed iframe (opaque origin), so module scripts, stylesheets and
+  // fonts are CORS fetches and need an explicit allowlist.
+  raw.writeHead(200, {
+    'Content-Type': MIME[path.extname(abs).toLowerCase()] ?? 'application/octet-stream',
+    'Access-Control-Allow-Origin': '*',
+  });
   stream.on('error', () => {
     try { raw.end(); } catch { /* ignore */ }
   });
@@ -2120,6 +2126,11 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     // them into one comma-joined value).
     const setCookies = (upstream.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
     if (setCookies.length > 0) outHeaders['set-cookie'] = setCookies;
+    // The Workspace preview embeds the app in a sandboxed iframe (opaque
+    // origin): every subresource and API fetch is a CORS request. The /a/
+    // proxy is unauthenticated by design, so a wildcard is safe here
+    // (browsers still refuse to send credentials with `*`).
+    outHeaders['access-control-allow-origin'] = '*';
 
     // Never load an unbounded upstream body: fast-reject on a declared
     // Content-Length, then stream with a hard cap (also guards against

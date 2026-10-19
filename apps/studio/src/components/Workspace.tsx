@@ -18,7 +18,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { ApiError, api, isDemoMode, openProjectPreview, previewUrlFor } from '../api/client';
+import { ApiError, api, isDemoMode, liveAppUrlFor, openProjectPreview, previewUrlFor } from '../api/client';
 import { demoPreviewHtml } from '../api/demo';
 import type { StreamEvent } from '../api/sse';
 import { useProjectWork } from '../project/work';
@@ -233,7 +233,7 @@ function PreviewPane() {
         </IconBtn>
         <IconBtn
           label={t('preview.openStandalone')}
-          onClick={() => openProjectPreview(project.id)}
+          onClick={() => openProjectPreview(project.id, project.type)}
         >
           <ExternalLink size={15} />
         </IconBtn>
@@ -247,7 +247,7 @@ function PreviewPane() {
         <div className="mx-auto h-full" style={{ width: DEVICE_WIDTH[device], maxWidth: '100%' }}>
           <iframe
             key={`${previewKey}-${reloadKey}`}
-            src={demoDocument ? undefined : previewUrlFor(project.id)}
+            src={demoDocument ? undefined : project.type === 'dynamic' ? liveAppUrlFor(project.id) : previewUrlFor(project.id)}
             srcDoc={demoDocument ?? undefined}
             title="preview"
             sandbox="allow-scripts allow-forms allow-modals"

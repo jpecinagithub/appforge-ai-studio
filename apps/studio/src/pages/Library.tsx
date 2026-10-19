@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2, X } from 'lucide-react';
-import { api, apiResourceUrl, downloadArchive, isDemoMode, openProjectPreview, publicAppUrlFor } from '../api/client';
+import { api, apiResourceUrl, downloadArchive, isDemoMode, liveAppUrlFor, openProjectPreview, publicAppUrlFor } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
 import {
@@ -213,7 +213,11 @@ export function Library() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {filtered.map((p) => {
             const deployed = !demoMode && p.previewUrl != null;
-            const appUrl = deployed ? publicAppUrlFor(p.id) : null;
+            const appUrl = deployed
+              ? p.type === 'dynamic'
+                ? liveAppUrlFor(p.id)
+                : publicAppUrlFor(p.id)
+              : null;
             const domain = appUrl ? new URL(appUrl).host : null;
             return (
             <Card key={p.id} className="group flex flex-col overflow-hidden">
@@ -278,7 +282,7 @@ export function Library() {
                   <Btn
                     variant="primary"
                     size="sm"
-                    onClick={() => openProjectPreview(p.id)}
+                    onClick={() => openProjectPreview(p.id, p.type)}
                     disabled={!p.previewUrl}
                   >
                     <Globe2 className="h-3.5 w-3.5" />
