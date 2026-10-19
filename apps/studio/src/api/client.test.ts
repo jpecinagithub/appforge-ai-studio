@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { API_BASE, api, apiResourceUrl } from './client';
+import { API_BASE, api, apiResourceUrl, liveAppUrlFor } from './client';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -10,6 +10,16 @@ describe('apiResourceUrl', () => {
 
   it('preserves absolute asset URLs', () => {
     expect(apiResourceUrl('https://cdn.example.com/thumbnail.webp')).toBe('https://cdn.example.com/thumbnail.webp');
+  });
+});
+
+describe('liveAppUrlFor', () => {
+  it('builds the live dynamic-app URL under /a/', () => {
+    expect(liveAppUrlFor('my-project')).toBe(`${API_BASE}/a/my-project/`);
+  });
+
+  it('encodes project ids', () => {
+    expect(liveAppUrlFor('project/with spaces?')).toBe(`${API_BASE}/a/project%2Fwith%20spaces%3F/`);
   });
 });
 

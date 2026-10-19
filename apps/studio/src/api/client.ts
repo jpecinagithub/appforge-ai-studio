@@ -249,6 +249,11 @@ export function previewUrlFor(projectId: string): string {
   return apiResourceUrl(`/p/${encodeURIComponent(projectId)}/`);
 }
 
+/** URL de la app viva con backend (proxy dinámico /a) para proyectos dynamic. */
+export function liveAppUrlFor(projectId: string): string {
+  return apiResourceUrl(`/a/${encodeURIComponent(projectId)}/`);
+}
+
 /** URL absoluta compartible de una app servida por Oracle. */
 export function publicAppUrlFor(projectId: string, origin?: string): string {
   const fallbackOrigin = origin ?? (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
@@ -256,9 +261,10 @@ export function publicAppUrlFor(projectId: string, origin?: string): string {
 }
 
 /** Abre la preview real o, en demo, un documento local funcional. */
-export function openProjectPreview(projectId: string): void {
+export function openProjectPreview(projectId: string, type: 'static' | 'dynamic' = 'static'): void {
   if (!isDemoMode()) {
-    window.open(previewUrlFor(projectId), '_blank', 'noopener');
+    const url = type === 'dynamic' ? liveAppUrlFor(projectId) : previewUrlFor(projectId);
+    window.open(url, '_blank', 'noopener');
     return;
   }
   const html = demoPreviewHtml(projectId);
