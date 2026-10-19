@@ -119,6 +119,23 @@ describe('dynamic preview proxy /a/:projectId', () => {
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
   });
 
+  it('answers sandboxed iframe callers (Origin: null) with an explicit null origin', async () => {
+    const id = await createDynamicProject('Proxy null-origin');
+    registerPreview(id);
+    const res = await fetch(`${baseUrl}/a/${id}/api/todos`, { headers: { origin: 'null' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('null');
+    expect(res.headers.get('access-control-allow-credentials')).toBe('true');
+  });
+
+  it('never echoes arbitrary origins', async () => {
+    const id = await createDynamicProject('Proxy evil-origin');
+    registerPreview(id);
+    const res = await fetch(`${baseUrl}/a/${id}/api/todos`, { headers: { origin: 'https://evil.example' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+    expect(res.headers.get('access-control-allow-credentials')).toBeNull();
+  });
   it('answers CORS preflights (handled by @fastify/cors) without hitting the project backend', async () => {
     const id = await createDynamicProject('Proxy preflight');
     registerPreview(id);
