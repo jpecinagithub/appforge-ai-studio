@@ -57,6 +57,7 @@ import {
 import { FakeDeploymentDriver, type DriverOpArgs, type FakeOpBehavior, type FakeOpName, type HealthCheckArgs } from './driver.js';
 import { createDynamicTools } from '../dynamicTools.js';
 import { nowIso } from '../tools.js';
+import { ensurePreviewsTable, getPreview } from '../previewManager.js';
 
 let db: Database.Database;
 let dir: string;
@@ -278,6 +279,17 @@ describe('Fase 7B wiring', () => {
 // ---------------------------------------------------------------------------
 
 describe('full pipeline (criterio 1)', () => {
+  it.each([false, true])('retires the public preview only after successful promotion (buildFails=%s)', async (buildFails) => {
+    addProject('p-preview');
+    ensurePreviewsTable(db);
+    db.prepare("INSERT INTO previews(project_id,port,status,updated_at) VALUES(?,?,'ready',?)").run('p-preview', 12345, nowIso());
+    const driver = new FakeDeploymentDriver({ db, ...(buildFails ? { behavior: { buildCandidate: 'fail' as const } } : {}) });
+    const final = await runDeploymentPipeline(db, driver, { projectId: 'p-preview', target: 'oracle', verificationGate: gateOk });
+    expect(final.status).toBe(buildFails ? 'failed' : 'live');
+    expect(getPreview(db, 'p-preview')?.status).toBe(buildFails ? 'ready' : 'stopped');
+    if (!buildFails) expect(getPreview(db, 'p-preview')?.port).toBeNull();
+  });
+
   it('runs pending → building → migrating → verifying → promoting → live', async () => {
     addProject('p1');
     const driver = new FakeDeploymentDriver({ db });

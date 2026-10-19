@@ -659,6 +659,12 @@ export async function runDeploymentPipeline(
     if (!r.result.ok) return rollbackOnce(`live health check failed for candidate (${describeResult(r.result)})${abortNote(r.aborted)}`);
 
     // ---- 5. promoting → live ---------------------------------------------
+    // /a/:projectId prefers a ready preview. Retire it only after the live
+    // candidate is healthy, otherwise a successful publication still serves
+    // the throwaway preview database instead of the persistent runtime.
+    const { stopPreview } = await import('../previewManager.js');
+    await stopPreview(db, projectId, 'Replaced by verified live deployment');
+
     // Revisión Codex final (bloqueo 4): finalización ATÓMICA en una sola
     // transacción SQLite: project_runtime + transición a live + evento. Si
     // falla cualquiera de las escrituras, el nuevo runtime NO queda
