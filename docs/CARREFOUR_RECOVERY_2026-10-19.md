@@ -7,6 +7,7 @@
 - Repairs to `backend/src/routes/cart.ts` without `area: backend` created a shadow file below `frontend/`; the actual backend stayed broken.
 - The frontend duplicated its API client, used optional response fields incorrectly, and sent absolute `/api` requests despite deployment below a path prefix.
 - Generic authenticated verification required the example todo UI, preventing other domains from passing legitimately.
+- The shared-host nginx proxy stripped `/appforge/` but did not rewrite the session cookie Path. Registration appeared successful publicly while subsequent authenticated requests failed.
 
 ## Platform changes
 
@@ -27,6 +28,17 @@ Recover the template's configuration, Node SQLite, Argon2id and random revocable
 - 50 targeted worker tests passed; the final additional repeated-starter regression passed in the 7-test completion-gate suite.
 - Carrefour frontend/backend compile and 22 API tests pass, including invalid quantities, forged sessions, user isolation, idempotency, stock conflicts, rollback and session recovery.
 - Final production verification is recorded separately with the maintenance run and deployment in AppForge.
+- All six checks passed on the repaired sources. Docker deployment `959fba64-c276-419f-8eed-d40e3a8f184f` reached `live`.
+- Public Chromium flow passed: catalog/filter/search, registration, cart quantity changes and reload, checkout totals/stock/cart clearing, logout protection and login history. Mobile layout has no horizontal overflow and its photographs load. No JavaScript errors or failed network requests occurred.
+- Restarting `appforge-app-bdc402c3` preserved the browser session, order and inventory in the persistent database.
+
+## Shared-host operational fixes
+
+Within the existing `/appforge/` nginx location, add `proxy_cookie_path /a/ /appforge/a/;`. This retains each project's cookie scope while matching its external URL. On this host the active configuration is the regular file `/etc/nginx/sites-enabled/mi-gps`, not the stale copy in `sites-available`. Back up the active file, run `nginx -t`, and reload only after validation.
+
+Build the Studio image from the Linux Git checkout. Copying a Windows checkout with CRLF line endings changed the trusted Dockerfile bytes; the deployment driver correctly refused the mismatch. Rebuilding from commit `0e07e9c` in Linux resolved it without weakening the trust check.
+
+Public store: https://jpecina.duckdns.org/appforge/a/bdc402c3-9871-4024-abf1-823ab2c3a065/ . This educational store records orders and inventory; it does not process payments or shipments. Its seven category photographs are explicitly illustrative.
 
 ## Recovery copies
 
