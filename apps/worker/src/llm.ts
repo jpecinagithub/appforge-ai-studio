@@ -158,8 +158,10 @@ export function parseResponse(body: unknown): LlmResponse {
     let args: Record<string, unknown> = {};
     try {
       args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
-    } catch {
-      throw new LlmError('LLM_BAD_TOOL_ARGS', `Invalid JSON arguments for tool ${tc.function?.name}`);
+      if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('not an object');
+    } catch (error) {
+      const position = /position (\d+)/.exec(String((error as Error).message))?.[1];
+      throw new LlmError('LLM_BAD_TOOL_ARGS', `Invalid JSON arguments for tool ${tc.function?.name} (${String(tc.function?.arguments ?? '').length} characters${position ? `, position ${position}` : ''}); expected a JSON object`);
     }
     toolCalls.push({ id: String(tc.id ?? ''), name: String(tc.function?.name ?? ''), arguments: args });
   }

@@ -6,3 +6,6 @@ it('rejects truncated tool calls before they can write incomplete files', () => 
 it('rejects malformed tool arguments with a recoverable error', () => {
   expect(() => parseResponse({ choices: [{ message: { tool_calls: [{ function: { name: 'write_file', arguments: '{broken' } }] } }] })).toThrow('Invalid JSON');
 });
+it.each(['null', '[]', '"a string"', '42'])('rejects non-object tool arguments: %s', (argumentsValue) => {
+  expect(() => parseResponse({choices:[{message:{tool_calls:[{function:{name:'write_file',arguments:argumentsValue}}]}}]})).toThrow('expected a JSON object');
+});

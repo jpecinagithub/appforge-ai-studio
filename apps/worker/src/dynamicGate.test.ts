@@ -30,6 +30,7 @@ vi.mock('./llm.js', async (importOriginal) => {
 import { runAgentOnce, type AgentSettings } from './agent.js';
 import { FAKE_SERVER } from './previewFixture.js';
 import { getPreview } from './previewManager.js';
+import { LlmError } from './llm.js';
 
 // ---------------------------------------------------------------------------
 // Minimal dynamic fixture (working npm scripts, no network)
@@ -240,6 +241,22 @@ const SIX_CHECKS = [
 ];
 
 describe('dynamic completion gate', () => {
+  it('bounds malformed model responses and preserves the full request in single-file recovery', async () => {
+    const runId=setupRun(makeGateProject());
+    db.prepare('UPDATE runs SET prompt=? WHERE id=?').run('Build a store. '+'.'.repeat(4000)+' KEEP_THE_LAST_REQUIREMENT',runId);
+    model.mockRejectedValue(new LlmError('LLM_BAD_TOOL_ARGS','Invalid JSON arguments for tool write_files'));
+    await runAgentOnce(db,runId,{dataDir,settings});
+    expect(model).toHaveBeenCalledTimes(4);
+    expect(runStatus(runId).status).toBe('error');
+    expect(runStatus(runId).error).toContain('Four consecutive');
+    const recovery=model.mock.calls[1];
+    expect(JSON.stringify(recovery[1])).toContain('KEEP_THE_LAST_REQUIREMENT');
+    expect(recovery[2].some((tool:{name:string})=>tool.name==='write_files')).toBe(false);
+    expect(recovery[2].some((tool:{name:string})=>tool.name==='write_file')).toBe(true);
+    expect(toolCallCount(runId,'write_files')).toBe(0);
+    db.close();
+  });
+
   it('also rejects the unchanged starter on a later retry', async () => {
     const fixture = makeGateProject();
     fs.mkdirSync(path.join(fixture, 'frontend', 'src'), { recursive: true });

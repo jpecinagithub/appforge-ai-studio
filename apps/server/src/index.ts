@@ -29,7 +29,7 @@ import type {
   Settings,
 } from 'appforge-shared';
 import { openDb } from './db.js';
-import { assessTechnologyCompatibility } from './compatibility.js';
+import { assessTechnologyCompatibility, inferProjectType } from './compatibility.js';
 import { buildFileTree, createProject, deleteProject, frontendDir, getProject, nowIso, projectDir, resolveIn, rowToProject } from './projects.js';
 import {
   acquireProjectOperationLock,
@@ -508,7 +508,8 @@ const DeployCreate = z.object({ target: z.string().min(1).max(40) });
 const ProjectCreate = z.object({
   name: z.string().min(1).max(120),
   description: z.string().max(2000).optional().default(''),
-  type: z.enum(['static', 'dynamic']).optional().default('static'),
+  type: z.enum(['static', 'dynamic']).optional(),
+  prompt: z.string().max(20_000).optional(),
 });
 const ProjectPatch = z.object({
   name: z.string().min(1).max(120).optional(),
@@ -828,7 +829,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
   // ------------------------------------------------------------------- runs
   app.post('/api/projects/:id/runs', async (req, reply) => {
     const { id } = req.params as { id: string };
-    needProject(id);
+    const project = needProject(id);
     const body = RunCreate.parse(req.body);
     const active = db.prepare("SELECT id FROM runs WHERE project_id=? AND status IN ('queued','running') LIMIT 1").get(id);
     if (active) {
@@ -851,6 +852,12 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
       const row = db.prepare('SELECT * FROM runs WHERE id=?').get(runId) as Record<string, any>;
       reply.code(201);
       return rowToRun(row);
+    }
+    if (project.type === 'static' && inferProjectType(body.prompt) === 'dynamic') {
+      reply.code(409);
+      return err('PROJECT_TYPE_MISMATCH', body.language === 'en'
+        ? 'This request needs a backend. Create a Dynamic project (or use Automatic project type) before starting generation.'
+        : 'Esta solicitud necesita backend. Crea un proyecto Dinámico (o selecciona tipo Automático) antes de iniciar la generación.');
     }
     db.prepare('INSERT INTO runs(id, project_id, prompt, status, created_at, started_at, finished_at, stats_json, error) VALUES (?,?,?,?,?,?,?,?,?)').run(
       runId, id, body.prompt, 'queued', created, null, null, null, null,

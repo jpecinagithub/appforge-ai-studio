@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
 import type { FileNode, Project } from 'appforge-shared';
+import { inferProjectType } from './compatibility.js';
 
 export const nowIso = () => new Date().toISOString();
 
@@ -118,6 +119,7 @@ export interface CreateProjectInput {
   name: string;
   description?: string;
   type?: 'static' | 'dynamic';
+  prompt?: string;
 }
 
 /**
@@ -129,7 +131,8 @@ export interface CreateProjectInput {
 export function createProject(db: Database.Database, dataDir: string, templatesDir: string, input: CreateProjectInput): Project {
   const id = randomUUID();
   const dir = projectDir(dataDir, id);
-  const isDynamic = input.type === 'dynamic';
+  const type = input.type ?? inferProjectType(input.prompt ?? '');
+  const isDynamic = type === 'dynamic';
   for (const sub of (isDynamic ? ['metadata', 'logs'] : ['frontend', 'metadata', 'logs'])) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
   }
@@ -147,7 +150,7 @@ export function createProject(db: Database.Database, dataDir: string, templatesD
   const created = nowIso();
   db.prepare(
     'INSERT INTO projects(id,name,description,type,status,model,created_at,updated_at,preview_url,production_url,config_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-  ).run(id, input.name, input.description ?? '', input.type ?? 'static', 'active', null, created, created, null, null, '{}');
+  ).run(id, input.name, input.description ?? '', type, 'active', null, created, created, null, null, '{}');
   return getProject(db, id)!;
 }
 

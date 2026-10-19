@@ -270,6 +270,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const isDynamicProject = project?.type === 'dynamic';
   // Dynamic tool definitions are exposed ONLY to dynamic projects.
   const ALL_TOOL_DEFS = isDynamicProject ? [...TOOL_DEFS, ...DYNAMIC_TOOL_DEFS] : TOOL_DEFS;
+  let singleFileMode = false;
+  let malformedResponses = 0;
+  const availableToolDefs = () => singleFileMode ? ALL_TOOL_DEFS.filter(tool => tool.name !== 'write_files') : ALL_TOOL_DEFS;
   const ctx: ToolContext = {
     db,
     projectId: project.id,
@@ -408,19 +411,20 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 
   const compactRecoveryHistory = (reason: string): LlmMessage[] => [{
     role: 'system',
-    content: systemPrompt(settings.language, ALL_TOOL_DEFS.map((d) => d.name), isDynamicProject),
+    content: systemPrompt(settings.language, availableToolDefs().map((d) => d.name), isDynamicProject),
   }, {
     role: 'user',
     content: [
       'RECOVERY MODE. Continue from the current files; do not restart or rewrite working parts.',
       `The previous model call failed transiently: ${reason}`,
-      `Original goal:\n${String(run.prompt).slice(0, 3500)}`,
+      `Original goal (preserve all requirements):\n${String(run.prompt).slice(0, 20000)}`,
       `Current diagnostic:\n${(lastError ?? '(none)').slice(0, 8000)}`,
       ...['src/App.tsx', 'src/index.css', 'package.json'].map((file) => {
         try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, file.endsWith('.tsx') ? 18000 : 7000)}`; }
         catch { return `--- ${file}: missing ---`; }
       }),
       'Take the smallest concrete next action with tools. After edits, rebuild and verify interactions.',
+      ...(singleFileMode ? ['JSON RECOVERY: write_files is unavailable. Call write_file or patch_file for ONE small complete file per response. Keep each file under 150 lines; split code into modules. Return valid JSON tool arguments, with escaped newlines and quotes. Do not attempt to return the entire application in one response.'] : []),
     ].join('\n\n'),
   }];
 
@@ -555,13 +559,22 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     let resp;
     const llmT0 = Date.now();
     try {
-      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs }, history, ALL_TOOL_DEFS);
+      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs, ...(singleFileMode ? { maxTokens: Math.min(llmConfig!.maxTokens, 4096) } : {}) }, history, availableToolDefs());
     } catch (e) {
       if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
         stats.errors++;
+        stats.llmCalls++;
+        stats.llmMs += Date.now() - llmT0;
+        malformedResponses++;
         lastError = e.message;
-        history.push({ role: 'user', content: `${e.message} The invalid response made no file changes. Retry with smaller complete files or patches.` });
         emit(db, runId, 'log', { text: e.message });
+        if (malformedResponses >= 4) {
+          finishError(`${e.message}. Four consecutive invalid model responses; no file changes were made by those responses.`, e.code);
+          return;
+        }
+        singleFileMode = true;
+        history = compactRecoveryHistory(`${e.message}. The invalid response made no file changes.`);
+        emit(db, runId, 'status', { phase: 'recovering_model', code: e.code, attempt: malformedResponses, strategy: 'single_file' });
         if (iter >= limits.maxIterations) repairing = true;
         continue;
       }
@@ -580,6 +593,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       return;
     }
     stats.llmCalls += 1;
+    malformedResponses = 0;
     stats.llmMs += Date.now() - llmT0;
     stats.tokensIn += resp.usage.promptTokens;
     stats.tokensOut += resp.usage.completionTokens;
