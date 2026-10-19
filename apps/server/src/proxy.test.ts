@@ -111,6 +111,27 @@ describe('dynamic preview proxy /a/:projectId', () => {
     expect(last.url).toBe('/api/todos?page=2');
   });
 
+  it('adds Access-Control-Allow-Origin to proxied responses (sandboxed iframe preview)', async () => {
+    const id = await createDynamicProject('Proxy CORS');
+    registerPreview(id);
+    const res = await fetch(`${baseUrl}/a/${id}/api/todos`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+
+  it('answers CORS preflights (handled by @fastify/cors) without hitting the project backend', async () => {
+    const id = await createDynamicProject('Proxy preflight');
+    registerPreview(id);
+    const seen = upstreamSaw.length;
+    const res = await fetch(`${baseUrl}/a/${id}/api/auth/login`, {
+      method: 'OPTIONS',
+      headers: { origin: 'https://studio.example', 'access-control-request-method': 'POST' },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-origin')).toBe('*');
+    expect(upstreamSaw.length).toBe(seen);
+  });
+
   it('falls back to a validated live runtime and reports it as ready', async () => {
     const id = await createDynamicProject('Live 7B');
     db.prepare(
@@ -359,5 +380,21 @@ describe('dynamic preview proxy /a/:projectId', () => {
     expect(gz.headers.get('content-encoding')).toBeNull();
 
     await new Promise<void>((r) => streamer.close(() => r()));
+  });
+});
+
+describe('static preview /p/:projectId (sandboxed iframe)', () => {
+  it('serves build assets with Access-Control-Allow-Origin', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/projects', payload: { name: 'Static CORS', type: 'static' } });
+    expect(res.statusCode).toBe(201);
+    const id = (res.json() as { id: string }).id;
+    const distDir = path.join(dataDir, 'projects', id, 'frontend', 'dist', 'assets');
+    fs.mkdirSync(distDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'projects', id, 'frontend', 'dist', 'index.html'), '<!doctype html><html></html>');
+    fs.writeFileSync(path.join(distDir, 'app.js'), 'console.log("hi")');
+    const got = await fetch(`${baseUrl}/p/${id}/assets/app.js`);
+    expect(got.status).toBe(200);
+    expect(got.headers.get('access-control-allow-origin')).toBe('*');
+    expect(await got.text()).toBe('console.log("hi")');
   });
 });
