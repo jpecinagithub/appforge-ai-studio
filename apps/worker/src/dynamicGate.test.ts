@@ -240,6 +240,44 @@ const SIX_CHECKS = [
 ];
 
 describe('dynamic completion gate', () => {
+  it('also rejects the unchanged starter on a later retry', async () => {
+    const fixture = makeGateProject();
+    fs.mkdirSync(path.join(fixture, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(fixture, 'backend', 'src'), { recursive: true });
+    const runId = setupRun(fixture);
+    const projectId = (db.prepare('SELECT project_id FROM runs WHERE id=?').get(runId) as { project_id: string }).project_id;
+    db.prepare('INSERT INTO runs(id,project_id,status) VALUES (?,?,?)').run('prior-attempt', projectId, 'error');
+    const templates = path.join(dataDir, 'templates');
+    fs.cpSync(fixture, path.join(templates, 'dynamic-react-node'), { recursive: true });
+    vi.stubEnv('APPFORGE_TEMPLATES_DIR', templates);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([...SIX_CHECKS.map(n => toolCall(n)), ...Array.from({ length: 9 }, () => final('Store complete'))]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runStatus(runId).status).toBe('error');
+      expect(runStatus(runId).error).toContain('NO_IMPLEMENTATION');
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+      delete process.env.APPFORGE_TEMPLATES_DIR;
+      db.close();
+    }
+  }, 240000);
+
+  it('rejects an untouched starter even when every check passes', async () => {
+    const runId = setupRun(makeGateProject());
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([...SIX_CHECKS.map(n => toolCall(n)), ...Array.from({length: 9}, () => final('Store complete'))]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runStatus(runId).status).toBe('error');
+      expect(runStatus(runId).error).toContain('NO_IMPLEMENTATION');
+    } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; db.close(); }
+  }, 240000);
+
+
   it('blocks finishing when the model never runs the tools', async () => {
     const runId = setupRun(makeGateProject());
     script([
@@ -267,6 +305,7 @@ describe('dynamic completion gate', () => {
     vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
     try {
       script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
         toolCall('run_api_tests'),
         toolCall('run_frontend_build'),
         toolCall('run_backend_build'),
@@ -294,6 +333,7 @@ describe('dynamic completion gate', () => {
     vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
     try {
       script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
         ...SIX_CHECKS.map((n) => toolCall(n)),
         toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }),
         final('Done after the tweak.'),
@@ -319,6 +359,7 @@ describe('dynamic completion gate', () => {
     vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
     try {
       script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
         ...SIX_CHECKS.map((n) => toolCall(n)),
         final('All checks green, app complete.'),
       ]);

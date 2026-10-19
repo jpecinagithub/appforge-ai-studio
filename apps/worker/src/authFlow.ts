@@ -11,9 +11,8 @@
  *   2. register user A
  *   3. Set-Cookie carries HttpOnly and SameSite
  *   4. session recovery (GET /api/auth/me as A)
- *   5. create + list a record as A
  *   6. register user B
- *   7. isolation: B gets 404 for A's record
+ *   7. independent identity for B
  *   8. back to user A (session still valid)
  *   9. logout as A
  *   10. /api/auth/me as A -> 401
@@ -21,8 +20,7 @@
  * Phase 2 — real Chromium against /a/:projectId/ using the stable
  * data-testid selectors defined in the template (never translated text
  * or visual positions alone):
- *   register from the UI, authenticated content visible, create a record
- *   from the UI and see the exact result, reload (session recovery),
+ *   register from the UI, authenticated identity visible, reload (session recovery),
  *   logout, back to the auth screen.
  */
 
@@ -139,7 +137,7 @@ export function assertSessionCookie(
 }
 
 /** Phase 1: deterministic API checks through the published preview. */
-export async function apiAuthFlow(base: string, projectId: string): Promise<{ userA: string; todoTitle: string }> {
+export async function apiAuthFlow(base: string, projectId: string): Promise<{ userA: string }> {
   const a: Api = { base, jar: new Jar() };
   const b: Api = { base, jar: new Jar() };
   const expectedCookiePath = `/a/${projectId}/`;
@@ -177,24 +175,6 @@ export async function apiAuthFlow(base: string, projectId: string): Promise<{ us
     check((body as { user?: { email?: string } })?.user?.email === emailA, 'me email matches A');
   }
 
-  // 5. create + list a record as A
-  const todoTitle = `flow-todo-${Date.now()}`;
-  let todoId = '';
-  {
-    const { status, body } = await apiJson(a, '/api/todos', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: todoTitle }),
-    });
-    check(status === 200 || status === 201, 'create todo', `status ${status}`);
-    todoId = String((body as { todo?: { id?: string }; id?: string })?.todo?.id ?? (body as { id?: string })?.id ?? '');
-    check(todoId.length > 0, 'todo id returned', JSON.stringify(body).slice(0, 200));
-    const listed = await apiJson(a, '/api/todos');
-    check(listed.status === 200, 'list todos', `status ${listed.status}`);
-    const items = ((listed.body as { items?: Array<{ id?: string; title?: string }> })?.items ?? []) as Array<{ id?: string; title?: string }>;
-    check(items.some((t) => t.id === todoId && t.title === todoTitle), 'todo listed');
-  }
-
   // 6. register user B
   {
     const { status } = await apiJson(b, '/api/auth/register', {
@@ -205,10 +185,12 @@ export async function apiAuthFlow(base: string, projectId: string): Promise<{ us
     check(status === 200 || status === 201, 'register B', `status ${status}`);
   }
 
-  // 7. isolation: B gets 404 for A's record
+  // Independent sessions must identify different users. Domain isolation is
+  // exercised by the mandatory project API tests, without assuming /todos.
   {
-    const { status } = await apiJson(b, `/api/todos/${encodeURIComponent(todoId)}`);
-    check(status === 404, 'isolation B->A todo', `status ${status}`);
+    const bMe = await apiJson(b, '/api/auth/me');
+    check(bMe.status === 200, 'me as B');
+    check((bMe.body as { user?: { email?: string } })?.user?.email === emailB, 'B session is isolated');
   }
 
   // 8. back to user A (session still valid)
@@ -230,11 +212,11 @@ export async function apiAuthFlow(base: string, projectId: string): Promise<{ us
     check(status === 401, 'me after logout is 401', `status ${status}`);
   }
 
-  return { userA: emailA, todoTitle };
+  return { userA: emailA };
 }
 
 /** Phase 2: real Chromium against the published preview URL. */
-export async function browserAuthFlow(uiUrl: string, email: string, todoTitle: string): Promise<void> {
+export async function browserAuthFlow(uiUrl: string, email: string): Promise<void> {
   const steps: BrowserStep[] = [
     // Register from the UI (stable data-testid selectors, not translated text).
     { action: 'click', selector: '[data-testid="auth-toggle-mode"]' },
@@ -243,17 +225,12 @@ export async function browserAuthFlow(uiUrl: string, email: string, todoTitle: s
     { action: 'click', selector: '[data-testid="auth-submit"]' },
     // Authenticated content visible.
     { action: 'expect_text', selector: '[data-testid="user-email"]', value: email },
-    // Create a record from the UI; the exact result must be visible.
-    { action: 'fill', selector: '[data-testid="new-todo-input"]', value: todoTitle },
-    { action: 'click', selector: '[data-testid="add-todo-button"]' },
-    { action: 'expect_text', selector: '[data-testid="todo-list"]', value: todoTitle },
     // Reload: the session must recover via the HttpOnly cookie.
     { action: 'reload' },
     { action: 'expect_text', selector: '[data-testid="user-email"]', value: email },
-    { action: 'expect_text', selector: '[data-testid="todo-list"]', value: todoTitle },
     // Logout: back to the auth screen.
     { action: 'click', selector: '[data-testid="logout-button"]' },
-    { action: 'expect_text', selector: '[data-testid="auth-screen"]', value: 'Sign in' },
+    { action: 'expect_visible', selector: '[data-testid="auth-screen"]' },
   ];
   const r = await checkBrowserAtUrl(uiUrl, steps, 90_000);
   if (!r.ok) {
@@ -295,11 +272,10 @@ export async function testAuthenticatedFlow(ctx: ToolContext): Promise<ToolResul
   const uiUrl = `${publishedBase}/`;
 
   try {
-    const { userA, todoTitle } = await apiAuthFlow(publishedBase, projectId);
+    await apiAuthFlow(publishedBase, projectId);
     // The browser registers its own user (fresh session through the UI).
-    await browserAuthFlow(uiUrl, emailFor('ui'), `ui-todo-${Date.now()}`);
+    await browserAuthFlow(uiUrl, emailFor('ui'));
     recordDynamicCheckForTest(ctx, 'authenticatedFlow');
-    void userA; void todoTitle;
     return {
       ok: true,
       data: { status: 'passed', phases: ['api', 'browser'], url: uiUrl },

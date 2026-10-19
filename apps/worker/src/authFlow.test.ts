@@ -119,11 +119,10 @@ afterEach(async () => {
 });
 
 describe('test_authenticated_flow', () => {
-  test('deterministic API phase: register, cookie, session, CRUD, isolation, logout, 401', async () => {
+  test('deterministic API phase: register, cookie, isolated identities, logout, 401', async () => {
     const base = `${fx!.proxy.url}/a/${fx!.projectId}`;
-    const { userA, todoTitle } = await apiAuthFlow(base, fx!.projectId);
+    const { userA } = await apiAuthFlow(base, fx!.projectId);
     expect(userA).toContain('@example.com');
-    expect(todoTitle).toContain('flow-todo-');
   });
 
   test('full tool: api + browser phases through the published preview', async () => {

@@ -61,6 +61,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     'DYNAMIC PROJECT (type=dynamic): this project uses the dynamic full-stack template.',
     '- Project root layout: frontend/ (Vite+React app), backend/ (Fastify+SQLite API), migrations/ (SQL files), tests/ (*.test.mjs API tests).',
     '- File tools accept an explicit "area" on this project: {"area":"backend","path":"src/routes/items.ts"}. Areas: frontend (frontend/**/*), backend (backend/src/**/*), migrations (migrations/*.sql), tests (tests/*.test.mjs). Default area is frontend. Never invent paths outside an area: package.json, lockfiles, Dockerfile, docker-compose.yml, scripts/, .env, data/, dist/ and node_modules/ are AppForge-controlled and rejected.',
+    '- Preserve the template session/authentication modules, runtime configuration and relative API URL resolver. Extend domain routes rather than replacing these working contracts. Keep auth-screen, auth-toggle-mode, auth-email, auth-password, auth-submit, user-email and logout-button data-testid selectors. Domain CRUD, isolation and transactions require app-specific API tests; the generic authentication check does not test business behavior.',
     '- MANDATORY ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. The dynamic tools take no arguments: paths and commands are fixed and confined to the active project.',
     '- Do NOT declare a dynamic app finished until all six succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
     '- run_migrations always runs against a temporary verification database; it never touches a live database.',
@@ -70,8 +71,8 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
     '',
     'PROJECT LAYOUT:',
-    '- All file tools (list_files, read_file, write_file, patch_file, create_directory) work RELATIVE TO frontend/ — e.g. use "src/App.tsx", NOT "frontend/src/App.tsx".',
-    '- frontend/ holds the Vite+React+TypeScript app. ALL source code goes there.',
+    isDynamic ? '- File tools resolve paths relative to an explicit area. For backend code use area=backend, path=src/routes/shop.ts. Never write backend/src/... inside frontend.' : '- File tools resolve paths relative to frontend/: use src/App.tsx, never frontend/src/App.tsx.',
+    isDynamic ? '- Frontend code belongs in area=frontend, API code in area=backend, SQL in area=migrations and domain integration tests in area=tests. Paths never include the area prefix.' : '- frontend/ holds all static application source code.',
     '- PROJECT_CONTEXT.md (at the project root, outside frontend/) has project notes; read it first via read_file with path "../PROJECT_CONTEXT.md" is NOT allowed — instead it is injected in your context.',
     '',
     `Available tools: ${toolNames.join(', ')}.`,
@@ -80,15 +81,15 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     'RULES:',
     '1. Keep an internal plan of at most 5 tasks. Do not narrate the plan; just work.',
     '2. For a new app, use write_files to create ALL related files in ONE call. Keep simple apps in App.tsx + index.css; split only when useful. For edits, read the relevant file then patch_file.',
-    '3. run_build installs dependencies automatically and checks strict TypeScript. Do not spend turns installing first, listing files already in context, or running a separate typecheck. Fix ALL reported errors together before rebuilding.',
-    '4. Call test_preview with interaction steps for EVERY distinct visible control: search, filters, details, main actions, then reload to verify persistence. Use click/fill/select followed by exact expect_text assertions of the changed result. Split independent cases into separate calls if needed. Then start_preview. A successful compile does not prove that buttons work. Interactive apps cannot finish without a successful interaction test of the current source.',
+    isDynamic ? '3. run_frontend_build and run_backend_build install their dependencies and report strict compiler diagnostics. Repair the reported source in its correct area before repeating a failed build.' : '3. run_build installs dependencies automatically and checks strict TypeScript. Do not spend turns installing first, listing files already in context, or running a separate typecheck. Fix ALL reported errors together before rebuilding.',
+    isDynamic ? '4. Implement domain integration tests in area=tests for the requested business operations, persistence and cross-user isolation. Then run the six mandatory dynamic checks. The example todo tests alone do not verify a different business domain.' : '4. Call test_preview with interaction steps for EVERY distinct visible control: search, filters, details, main actions, then reload to verify persistence. Use click/fill/select followed by exact expect_text assertions of the changed result. Split independent cases into separate calls if needed. Then start_preview. A successful compile does not prove that buttons work. Interactive apps cannot finish without a successful interaction test of the current source.',
     '5. NEVER claim something is finished without verifying it (build output, preview URL). No fake progress.',
     '6. Do not repeat a failed build without editing its cause. Do not give up after the first failure: diagnostics are returned so you can repair them. NEVER delete project files.',
-    '7. NEVER run "npm run dev" (it starts a server that never exits and wastes the run). To build: run_build. To preview: start_preview.',
+    isDynamic ? '7. Do not start long-lived processes with run_command. Use start_fullstack_preview after the four build/migration/API checks, then test_authenticated_flow. Deployment is a separate operation.' : '7. NEVER run "npm run dev" (it starts a server that never exits and wastes the run). To build: run_build. To preview: start_preview.',
     '8. write_file content must ALWAYS be a string with the complete file text. For .json files, write the JSON text — never pass a JSON object/array as content.',
     `9. Your final message to the user must be a SHORT Markdown summary in ${userLang}: what was built, features, test/build results, preview status, limitations.`,
     '10. React uses the automatic JSX runtime: import only hooks you use; use import type for interfaces. Do not give a component and an imported data type the same name (CarCard vs CarData). noUnusedLocals/noUnusedParameters/verbatimModuleSyntax are enabled. Never weaken tsconfig or the build script to hide errors.',
-    '11. Only import packages declared in package.json; prefer native React and CSS for interface chrome and icons. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
+    isDynamic ? '11. Use only dependencies already declared in the selected area package.json. Keep Vite base="./" and resolveApiUrl(document.baseURI) from the template: this app is hosted below /a/<projectId>/, possibly behind another prefix. Absolute /api requests reach the wrong service.' : '11. Only import packages declared in package.json; prefer native React and CSS for interface chrome and icons. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
     '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
     '13. For content-led cards, catalogs, destinations, products, people or hero sections, use acquire_image to obtain relevant real photography instead of drawing the subject with generic SVG/CSS. Search specifically, use the returned local publicUrl, preserve the .license.json receipt, and show a discreet visible creator/source credit. Never invent external photo URLs, hotlink random search results, or imply that a representative photo depicts the exact item for sale. If acquisition fails, use a polished neutral placeholder clearly labeled as illustrative — never a childish drawing of the product.',
     '14. This template uses plain CSS only. Do not install or use Tailwind, shadcn, CSS-in-JS, Sass, PostCSS plugins, UI frameworks, or utility-class libraries. Write semantic className values in React and define every class in src/index.css (or imported .css files). Prefer a small design-token block with CSS custom properties and ordinary responsive CSS.',
@@ -313,6 +314,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         `\nCURRENT CORE FILES:\n${['package.json', 'tsconfig.app.json', 'src/App.tsx', 'src/index.css'].map((file) => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, 14000)}`; } catch { return `--- ${file}: missing ---`; }
         }).join('\n')}`,
+        ...(isDynamicProject ? [`\nDYNAMIC TEMPLATE CONTRACTS (project-relative paths; preserve these contracts):\n${['backend/package.json', 'backend/src/server.ts', 'backend/src/auth/routes.ts', 'backend/src/db/index.ts', 'frontend/src/api.ts', 'frontend/src/api-url.ts'].map(file => {
+          try { return `--- ${file} ---\n${fs.readFileSync(path.join(projectDir, file), 'utf8').slice(0, 9000)}`; } catch { return `--- ${file}: missing ---`; }
+        }).join('\n')}`] : []),
         `\nRECENT CONVERSATION:\n${recent || '(none)'}`,
         `\nUSER REQUEST:\n${run.prompt}`,
       ].join('\n'),
@@ -338,10 +342,21 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   let lastRepairState = '';
   let proposedSummary = '';
   const initialFingerprint = sourceFingerprint(frontendDir);
+  const initialProjectFingerprint = sourceFingerprint(projectDir);
+  const isFirstRun = (db.prepare('SELECT COUNT(*) AS n FROM runs WHERE project_id=? AND id<>?').get(project.id, runId) as { n: number }).n === 0;
+  const unchangedStarter = () => {
+    const templatesDir = process.env.APPFORGE_TEMPLATES_DIR;
+    if (!templatesDir) return false;
+    const starter = path.join(templatesDir, 'dynamic-react-node');
+    return ['frontend/src', 'backend/src', 'migrations', 'tests'].every(dir => {
+      const original = path.join(starter, dir), current = path.join(projectDir, dir);
+      return fs.existsSync(original) && fs.existsSync(current) && sourceFingerprint(original) === sourceFingerprint(current);
+    });
+  };
 
   const perform = async (name: string, args: Record<string, unknown>, id: string = randomUUID()): Promise<ToolResult> => {
     if (cancelledNow()) return { ok: false, code: 'CANCELLED', error: t('cancelled'), durationMs: 0 };
-    const beforeFingerprint = sourceFingerprint(frontendDir);
+    const beforeFingerprint = sourceFingerprint(isDynamicProject ? projectDir : frontendDir);
     const remaining = limits.runTimeoutMs - (Date.now() - lastProgressAt);
     if (remaining <= 0) return { ok: false, code: 'RUN_TIMEOUT', error: t('runTimeout'), durationMs: 0 };
     ctx.cmdTimeoutMs = Math.min(limits.cmdTimeoutMs, remaining);
@@ -356,7 +371,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
     stats.toolCalls++;
     if (name === 'run_build' || name === 'start_preview') stats.buildMs += result.durationMs;
-    const tracked = ['write_file', 'write_files', 'patch_file', 'acquire_image', 'install_dependencies', 'run_build', 'test_preview', 'start_preview'].includes(name);
+    const tracked = ['write_file', 'write_files', 'patch_file', 'acquire_image', 'install_dependencies', 'run_build', 'test_preview', 'start_preview', ...DYNAMIC_TOOL_DEFS.map(d => d.name)].includes(name);
     const fileTool = ['write_file', 'write_files', 'patch_file', 'delete_file', 'acquire_image'].includes(name);
     const filePaths = name === 'write_files'
       ? ((args.files as Array<{ path?: string }> | undefined) ?? []).map((file) => file.path ?? '?')
@@ -382,7 +397,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         if (asset?.path) modifiedFiles.push(asset.path);
         if (asset?.attributionPath) modifiedFiles.push(asset.attributionPath);
       }
-      if (fileTool && sourceFingerprint(frontendDir) !== beforeFingerprint) lastProgressAt = Date.now();
+      if (fileTool && sourceFingerprint(isDynamicProject ? projectDir : frontendDir) !== beforeFingerprint) lastProgressAt = Date.now();
       // A later source change invalidates dynamic verification receipts;
       // the agent must re-run the affected checks in order.
       if (isDynamicProject && fileTool) invalidateDynamicChecks(ctx);
@@ -442,7 +457,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   };
 
   const complete = () => {
-    const summary = proposedSummary || t('verifiedSummary');
+    const summary = proposedSummary || t(isDynamicProject ? 'verifiedDynamicSummary' : 'verifiedSummary');
     addAssistantMessage(db, project.id, summary);
     try { rewriteProjectContext({ projectDir, projectName: project.name, prompt: run.prompt, modifiedFiles: [...new Set(modifiedFiles)], summary, lastError: null, runId, status: 'done' }); } catch { /* best effort */ }
     updateRun(db, runId, { status: 'done', finishedAt: nowIso(), stats, error: null });
@@ -458,11 +473,14 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       // unless all six checks are valid on the CURRENT sources and were
       // completed in canonical order. This never depends on the prompt.
       const gate = dynamicGateStatus(ctx);
-      if (!gate.complete) {
+      const untouchedTemplate = unchangedStarter() || (isFirstRun && sourceFingerprint(projectDir) === initialProjectFingerprint);
+      if (!gate.complete || untouchedTemplate) {
         const reasons: string[] = [];
+        if (untouchedTemplate) reasons.push('NO_IMPLEMENTATION: only the starter template was checked; implement the user request before finishing');
         if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
         if (!gate.orderValid) reasons.push('checks were not completed in the required order');
-        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.`;
+        const diagnostics = [...criticalFailures.entries()].filter(([key]) => key !== 'dynamicChecks').map(([, value]) => value).join('\n').slice(0, 12000);
+        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.\n${diagnostics}`;
         criticalFailures.set('dynamicChecks', lastError);
         repairing = true;
         const state = repairStateKey(sourceFingerprint(projectDir), lastError);
@@ -602,6 +620,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
 }
 
 const ES: Record<string, string> = {
+  verifiedDynamicSummary: 'Compilaciones, migraciones, pruebas API y sesión en navegador verificadas. Preview disponible. Consulta Deploy para el estado de publicación.',
   verifiedSummary: 'Cambios completados. Compilación y carga en Chromium verificadas para escritorio y móvil. La web está disponible en Preview y en la Librería.',
   errorPrefix: 'La ejecución ha fallado:',
   noProject: 'El proyecto ya no existe.',
@@ -618,6 +637,7 @@ const ES: Record<string, string> = {
 };
 
 const EN: Record<string, string> = {
+  verifiedDynamicSummary: 'Builds, migrations, API tests and browser session verified. Preview is available. Check Deploy for publication status.',
   verifiedSummary: 'Changes completed. Build and Chromium rendering verified on desktop and mobile. The app is available in Preview and the Library.',
   errorPrefix: 'The run failed:',
   noProject: 'The project no longer exists.',

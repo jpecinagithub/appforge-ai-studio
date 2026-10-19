@@ -66,6 +66,27 @@ function makeDb(): Database.Database {
 }
 
 describe('dynamic editing areas', () => {
+  test('misplaced project-root paths cannot create or patch shadow backend files', async () => {
+    const db = makeDb();
+    const dir = makeProject('dynamic');
+    const ctx = makeCtx(db, dir, 'dynamic');
+    const tools = createTools();
+    for (const prefix of ['backend', 'frontend', 'migrations', 'tests']) {
+      const r = await tools.write_file(ctx, { path: `${prefix}/src/broken.ts`, content: 'bad' });
+      expect(r.ok).toBe(false);
+      expect(r.error).toContain(`area="${prefix}"`);
+      expect(existsSync(path.join(dir, 'frontend', prefix))).toBe(false);
+    }
+    mkdirSync(path.join(dir, 'frontend', 'backend', 'src'), { recursive: true });
+    writeFileSync(path.join(dir, 'frontend', 'backend', 'src', 'server.ts'), 'shadow');
+    const rejected = await tools.patch_file(ctx, { path: './backend/src/server.ts', search: 'shadow', replace: 'wrong' });
+    expect(rejected.ok).toBe(false);
+    expect(readFileSync(path.join(dir, 'frontend', 'backend', 'src', 'server.ts'), 'utf8')).toBe('shadow');
+    const repaired = await tools.patch_file(ctx, { area: 'backend', path: 'src/server.ts', search: 'export const x = 1;', replace: 'export const x = 2;' });
+    expect(repaired.ok).toBe(true);
+    expect(readFileSync(path.join(dir, 'backend', 'src', 'server.ts'), 'utf8')).toContain('x = 2');
+    db.close();
+  });
   test('read/write/patch per area', async () => {
     const db = makeDb();
     const dir = makeProject('dynamic');

@@ -5,7 +5,7 @@ import { chromium, type Page, type BrowserContext } from 'playwright-core';
 import type { ToolResult } from 'appforge-shared';
 
 export interface BrowserStep {
-  action: 'click' | 'fill' | 'select' | 'expect_text' | 'reload';
+  action: 'click' | 'fill' | 'select' | 'expect_text' | 'expect_visible' | 'reload';
   selector?: string;
   value?: string;
 }
@@ -199,7 +199,8 @@ async function browserStep(page: Page, step: BrowserStep): Promise<void> {
   }
   if (!step.selector) throw new Error(`${step.action} requires a CSS selector`);
   const target = page.locator(step.selector);
-  if (step.action === 'click') await target.click();
+  if (step.action === 'expect_visible') await target.waitFor({ state: 'visible' });
+  else if (step.action === 'click') await target.click();
   else if (step.action === 'fill') await target.fill(step.value ?? '');
   else if (step.action === 'select') await target.selectOption(step.value ?? '');
   else throw new Error(`Unknown browser action: ${step.action}`);
