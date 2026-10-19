@@ -71,7 +71,6 @@ const ALLOWED_ENV_KEYS = new Set([
   'LANGUAGE',
   'TERM',
   'CI',
-  'NODE_ENV',
   'NPM_CONFIG_CACHE',
   'NPM_CONFIG_PREFIX',
 ]);
@@ -80,7 +79,11 @@ const ALLOWED_ENV_KEYS = new Set([
 const ALLOWED_EXTRA_ENV_KEYS = new Set(['DB_PATH', 'PORT', 'HOST', 'NODE_ENV', 'PUBLIC_PATH', 'SESSION_COOKIE_NAME']);
 
 export function buildChildEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
+  // Studio itself runs with NODE_ENV=production, but build/install commands
+  // need devDependencies (TypeScript, Vite and React declarations). Never
+  // inherit the host value: generated runtime processes override this
+  // explicitly with NODE_ENV=test/production where appropriate.
+  const env: NodeJS.ProcessEnv = { NODE_ENV: 'development' };
   for (const k of ALLOWED_ENV_KEYS) {
     const v = process.env[k];
     if (v !== undefined) env[k] = v;
@@ -1162,6 +1165,11 @@ async function deployProjectTool(ctx: ToolContext, args: Record<string, unknown>
     );
   }
   const { runDeploymentPipeline, DeploymentError } = await import('./deploy/orchestrator.js');
+  const { acquireDeploymentCapacity } = await import('./deploy/driver.js');
+  const releaseCapacity = acquireDeploymentCapacity(driver);
+  if (!releaseCapacity) {
+    return fail('DEPLOYMENT_CAPACITY', 'Deployment capacity is currently exhausted', durationMs());
+  }
   try {
     const final = await runDeploymentPipeline(ctx.db, driver, {
       projectId: ctx.projectId,
@@ -1190,5 +1198,7 @@ async function deployProjectTool(ctx: ToolContext, args: Record<string, unknown>
       return fail(e.code, e.message, durationMs());
     }
     return fail('DEPLOY_ERROR', `deployment failed: ${(e as Error).message}`.slice(0, 2000), durationMs());
+  } finally {
+    releaseCapacity();
   }
 }

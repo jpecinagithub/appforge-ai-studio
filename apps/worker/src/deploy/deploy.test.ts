@@ -44,12 +44,15 @@ import {
   listDeploymentEvents,
   recordEvent,
   reconcileDeployments,
+  reconcileProjectRuntimes,
   requestDeploymentCancel,
   runDeploymentPipeline,
   transitionDeployment,
   upsertProjectRuntime,
   MAX_EVENT_OUTPUT_CHARS,
   MAX_DEPLOYMENT_LOGS_CHARS,
+  acquireDeploymentCapacity,
+  activeDeploymentCapacity,
 } from '../index.js';
 import { FakeDeploymentDriver, type DriverOpArgs, type FakeOpBehavior, type FakeOpName, type HealthCheckArgs } from './driver.js';
 import { createDynamicTools } from '../dynamicTools.js';
@@ -176,6 +179,100 @@ describe('state machine (criterio 3)', () => {
   });
 });
 
+describe('Fase 7B wiring', () => {
+  it('persists the immutable candidate version reported by a real driver', async () => {
+    addProject('p7b-image');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      requiresCandidateVersion: boolean;
+    };
+    driver.requiresCandidateVersion = true;
+    const originalBuild = driver.buildCandidate.bind(driver);
+    driver.buildCandidate = async (args) => ({
+      ...(await originalBuild(args)),
+      data: { candidateVersion: 'appforge/app-1234abcd:dep-5678abcd-0123456789ab' },
+    });
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-image', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('live');
+    expect(getProjectRuntime(db, 'p7b-image')?.liveImage)
+      .toBe('appforge/app-1234abcd:dep-5678abcd-0123456789ab');
+  });
+
+  it('fails closed when a real driver omits the immutable candidate version', async () => {
+    addProject('p7b-missing-image');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      requiresCandidateVersion: boolean;
+    };
+    driver.requiresCandidateVersion = true;
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-missing-image', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('failed');
+    expect(final.error).toMatch(/immutable candidate version/i);
+    expect(getProjectRuntime(db, 'p7b-missing-image')).toBeNull();
+  });
+
+  it('prunes only after live and preserves a healthy deployment when pruning reports failures', async () => {
+    addProject('p7b-prune');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & {
+      pruneManagedImages: (projectId: string, keep?: string[]) => Promise<{ removed: string[]; failures: string[] }>;
+    };
+    let protectedImages: string[] = [];
+    driver.pruneManagedImages = async (_projectId, keep = []) => {
+      protectedImages = keep;
+      return { removed: ['old-image'], failures: ['one stale image stayed busy'] };
+    };
+    const final = await runDeploymentPipeline(db, driver, {
+      projectId: 'p7b-prune', target: 'oracle', verificationGate: gateOk,
+    });
+    expect(final.status).toBe('live');
+    expect(protectedImages).toContain(final.candidateId);
+    const prune = listDeploymentEvents(db, final.id).find((event) => event.event === 'prune_managed_images');
+    expect(prune?.status).toBe('failed');
+    expect(prune?.error).toMatch(/stale image/i);
+  });
+
+  it('shares and releases deployment capacity per driver instance', () => {
+    const driver = new FakeDeploymentDriver() as FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    driver.maxConcurrentDeploys = 1;
+    const release = acquireDeploymentCapacity(driver);
+    expect(release).not.toBeNull();
+    expect(activeDeploymentCapacity(driver)).toBe(1);
+    expect(acquireDeploymentCapacity(driver)).toBeNull();
+    release?.();
+    release?.();
+    expect(activeDeploymentCapacity(driver)).toBe(0);
+    expect(acquireDeploymentCapacity(driver)).not.toBeNull();
+  });
+
+  it('reconciles persisted runtime as stopped and fails closed on image mismatch', async () => {
+    addProject('p7b-runtime');
+    const dep = createDeployment(db, { projectId: 'p7b-runtime', target: 'oracle' });
+    transitionDeployment(db, dep.id, 'building');
+    transitionDeployment(db, dep.id, 'migrating');
+    transitionDeployment(db, dep.id, 'verifying');
+    transitionDeployment(db, dep.id, 'promoting');
+    const image = 'appforge/app-1234abcd:dep-5678abcd-0123456789ab';
+    const { finalizeLiveDeployment } = await import('./stateMachine.js');
+    finalizeLiveDeployment(db, dep.id, {
+      runtime: { projectId: 'p7b-runtime', containerName: 'appforge-app-p7b-runt', liveImage: image, previousImage: null, status: 'running' },
+    });
+    let resultImage = image;
+    const driver = {
+      reconcileRuntime: async () => ({
+        ok: true,
+        data: { liveFound: 'true', liveRunning: 'false', liveImage: resultImage, volumeExists: 'true' },
+      }),
+    };
+    expect(await reconcileProjectRuntimes(db, driver)).toEqual({ checked: 1, unavailable: 0 });
+    expect(getProjectRuntime(db, 'p7b-runtime')?.status).toBe('stopped');
+    resultImage = 'appforge/app-deadbeef:dep-deadbeef-deadbeefdead';
+    expect((await reconcileProjectRuntimes(db, driver)).unavailable).toBe(1);
+    expect(getProjectRuntime(db, 'p7b-runtime')?.status).toBe('missing');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Criterio 1 — camino completo
 // ---------------------------------------------------------------------------
@@ -263,7 +360,7 @@ describe('two projects are independent (criterio 5)', () => {
 describe('failures before promoting (criterios 6–9)', () => {
   it('build failure → failed, no promotion, candidate cleaned (criterio 6)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { buildCandidate: 'fail' } });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
@@ -273,12 +370,12 @@ describe('failures before promoting (criterios 6–9)', () => {
     expect(driver.callsOf('discardCandidate').length).toBe(1);
     expect(driver.callsOf('runLiveMigrations').length).toBe(0);
     expect(driver.callsOf('startCandidateAsLive').length).toBe(0);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 
   it('verification migration failure → failed, live intact (criterio 7)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { runVerificationMigrations: 'fail' } });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
@@ -286,12 +383,12 @@ describe('failures before promoting (criterios 6–9)', () => {
     expect(final.status).toBe('failed');
     expect(driver.callsOf('discardVerificationDatabase').length).toBe(1);
     expect(driver.callsOf('runLiveMigrations').length).toBe(0);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 
   it('verification failure → failed and verify runtime always stopped (criterio 8)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { runAuthenticatedVerification: 'fail' } });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
@@ -300,12 +397,12 @@ describe('failures before promoting (criterios 6–9)', () => {
     const order = driver.calls.map((c) => c.op);
     expect(order.indexOf('stopVerificationRuntime')).toBeGreaterThan(order.indexOf('runAuthenticatedVerification'));
     expect(driver.callsOf('createLiveBackup').length).toBe(0);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 
   it('backup failure → failed, live migrations never run (criterio 9)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { createLiveBackup: 'fail' } });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
@@ -314,7 +411,7 @@ describe('failures before promoting (criterios 6–9)', () => {
     expect(final.error).toMatch(/backup/i);
     expect(driver.callsOf('runLiveMigrations').length).toBe(0);
     expect(driver.callsOf('stopCurrentLiveRuntime').length).toBe(0);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 });
 
@@ -325,7 +422,7 @@ describe('failures before promoting (criterios 6–9)', () => {
 describe('rollback semantics (criterios 10–12)', () => {
   it('live migration failure → single rollback → rolled_back (criterio 10)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, behavior: { runLiveMigrations: 'fail' } });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
@@ -334,25 +431,25 @@ describe('rollback semantics (criterios 10–12)', () => {
     expect(driver.callsOf('restoreBackup').length).toBe(1);
     expect(driver.callsOf('startPreviousVersion').length).toBe(1);
     expect(final.backupId).not.toBeNull();
-    expect(final.previousLiveVersion).toBe('old-img');
+    expect(final.previousLiveVersion).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     // project_runtime sigue reflejando la versión anterior: nunca dos live.
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 
   it('candidate without live health → previous version restored (criterio 11)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({ db, decide: failFirstLiveHealth() });
     const final = await runDeploymentPipeline(db, driver, {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
     });
     expect(final.status).toBe('rolled_back');
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 
   it('failed rollback → failed with both diagnostics, no retry loop (criterio 12)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       behavior: { runLiveMigrations: 'fail', restoreBackup: 'fail' },
@@ -436,7 +533,7 @@ describe('cancellation before the critical section (criterio 13)', () => {
 describe('cancellation during promoting (criterio 14)', () => {
   it('completes a safe promotion (never hangs)', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       hooks: { runLiveMigrations: (call) => { requestDeploymentCancel(db, call.args.deploymentId); } },
@@ -452,7 +549,7 @@ describe('cancellation during promoting (criterio 14)', () => {
 
   it('rolls back on failure even with cancel requested', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     const driver = new FakeDeploymentDriver({
       db,
       hooks: { runLiveMigrations: (call) => { requestDeploymentCancel(db, call.args.deploymentId); } },
@@ -462,7 +559,7 @@ describe('cancellation during promoting (criterio 14)', () => {
       projectId: 'p1', target: 'oracle', verificationGate: gateOk,
     });
     expect(final.status).toBe('rolled_back');
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 });
 
@@ -523,7 +620,7 @@ describe('restart recovery (criterio 15)', () => {
 describe('runtime updated only after live health (criterio 16)', () => {
   it('does not point at the candidate mid-promotion', async () => {
     addProject('p1');
-    seedRuntime('p1', 'old-img');
+    seedRuntime('p1', 'appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
     const driver = new FakeDeploymentDriver({
@@ -539,11 +636,11 @@ describe('runtime updated only after live health (criterio 16)', () => {
       await new Promise((r) => setTimeout(r, 10));
     }
     expect(driver.callsOf('startCandidateAsLive').length).toBe(1);
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
     release();
     const final = await running;
     expect(final.status).toBe('rolled_back');
-    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('old-img');
+    expect(getProjectRuntime(db, 'p1')!.liveImage).toBe('appforge/app-aaaaaaaa:dep-bbbbbbbb-cccccccccccc');
   });
 });
 
@@ -669,6 +766,23 @@ describe('deploy_project tool (criterio 20)', () => {
     expect(r.ok).toBe(false);
     expect(r.code).toBe('INVALID_TYPE');
   });
+
+  it('shares the 7B capacity guard with HTTP before creating a deployment', async () => {
+    addProject('capacity-tool');
+    const driver = new FakeDeploymentDriver({ db }) as FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    driver.maxConcurrentDeploys = 1;
+    const release = acquireDeploymentCapacity(driver);
+    expect(release).not.toBeNull();
+    try {
+      const r = await createDynamicTools().deploy_project(toolCtx('capacity-tool', driver), {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('DEPLOYMENT_CAPACITY');
+      const count = db.prepare('SELECT COUNT(*) AS c FROM deployments WHERE project_id=?').get('capacity-tool') as { c: number };
+      expect(count.c).toBe(0);
+    } finally {
+      release?.();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -696,13 +810,18 @@ describe('no docker, shell or network (criterio 21)', () => {
         expect(src, `forbidden token '${token}'`).not.toContain(token);
       }
     }
-    // El fake es la única implementación del driver exportada.
+    // El fake sigue siendo la implementación determinista de pruebas.
     expect(FakeDeploymentDriver.name).toBe('FakeDeploymentDriver');
   });
 
-  it('does not export a DockerDeploymentDriver', async () => {
+  it('DockerDeploymentDriver existe (7A) pero es inerte sin kill switches', async () => {
+    // Fase 7A introduce el driver Docker, pero desactivado por defecto:
+    // sin el doble kill switch + red + volumen, el driver NO existe.
     const worker = await import('../index.js');
-    expect('DockerDeploymentDriver' in worker).toBe(false);
+    expect('DockerDeploymentDriver' in worker).toBe(true);
+    const { resolveDockerDriverConfig } = await import('../docker/dockerDriver.js');
+    expect(resolveDockerDriverConfig({}, '/data')).toBeNull();
+    expect(resolveDockerDriverConfig({ APPFORGE_DEPLOY_DRIVER: 'docker' }, '/data')).toBeNull();
     expect(worker.FakeDeploymentDriver).toBe(FakeDeploymentDriver);
   });
 

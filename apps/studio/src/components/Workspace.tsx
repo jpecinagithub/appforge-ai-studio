@@ -10,6 +10,7 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  ServerCog,
   Smartphone,
   Sparkles,
   Tablet,
@@ -17,7 +18,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { ApiError, api, isDemoMode, openProjectPreview, previewUrlFor } from '../api/client';
+import { ApiError, api, isDemoMode, liveAppUrlFor, openProjectPreview, previewUrlFor } from '../api/client';
 import { demoPreviewHtml } from '../api/demo';
 import type { StreamEvent } from '../api/sse';
 import { useProjectWork } from '../project/work';
@@ -27,6 +28,7 @@ import type { TKey } from '../i18n/strings';
 import { Badge, Btn, Empty, ErrorBox, IconBtn, Spinner, TextInput } from './ui';
 import { FileTree } from './FileTree';
 import { CodeEditor } from './CodeEditor';
+import { OperationsPane } from './OperationsPane';
 import { formatBytes, formatDateTime, formatDuration, timeAgo } from '../utils/format';
 import { apiErrorDetail, apiErrorKey } from '../utils/errors';
 import type {
@@ -42,6 +44,7 @@ const TABS: { id: WorkspaceTab; label: TKey; Icon: LucideIcon }[] = [
   { id: 'builds', label: 'ws.tabBuilds', Icon: Hammer },
   { id: 'code', label: 'ws.tabCode', Icon: Code2 },
   { id: 'console', label: 'ws.tabConsole', Icon: TerminalSquare },
+  { id: 'operations', label: 'ws.tabOperations', Icon: ServerCog },
 ];
 
 export function Workspace() {
@@ -50,7 +53,7 @@ export function Workspace() {
   return (
     <div className="flex h-full flex-col">
       <div
-        className="flex gap-1 border-b border-zinc-200 px-3 dark:border-zinc-800"
+        className="flex gap-1 overflow-x-auto border-b border-zinc-200 px-3 dark:border-zinc-800"
         role="tablist"
         aria-label={t('ws.workspace')}
       >
@@ -80,6 +83,7 @@ export function Workspace() {
         {workspaceTab === 'builds' && <BuildsPane />}
         {workspaceTab === 'code' && <CodePane />}
         {workspaceTab === 'console' && <ConsolePane />}
+        {workspaceTab === 'operations' && <OperationsPane />}
       </div>
     </div>
   );
@@ -229,7 +233,7 @@ function PreviewPane() {
         </IconBtn>
         <IconBtn
           label={t('preview.openStandalone')}
-          onClick={() => openProjectPreview(project.id)}
+          onClick={() => openProjectPreview(project.id, project.type)}
         >
           <ExternalLink size={15} />
         </IconBtn>
@@ -243,7 +247,7 @@ function PreviewPane() {
         <div className="mx-auto h-full" style={{ width: DEVICE_WIDTH[device], maxWidth: '100%' }}>
           <iframe
             key={`${previewKey}-${reloadKey}`}
-            src={demoDocument ? undefined : previewUrlFor(project.id)}
+            src={demoDocument ? undefined : project.type === 'dynamic' ? liveAppUrlFor(project.id) : previewUrlFor(project.id)}
             srcDoc={demoDocument ?? undefined}
             title="preview"
             sandbox="allow-scripts allow-forms allow-modals"

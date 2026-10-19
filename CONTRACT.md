@@ -192,13 +192,14 @@ appforge/
 
 ## 9. Aplicaciones dinámicas (Fase 2 — especificación)
 
-> **Estado a 2026-10-16**: la Fase 3 implementó esta sección
+> **Estado a 2026-10-18**: la Fase 3 implementó esta sección
 > (`templates/dynamic-react-node`) y el piloto superó el criterio de
 > §9.16 (3 pasadas E2E en Oracle), por lo que la puerta de
 > compatibilidad (`apps/server/src/compatibility.ts`) ya admite las
-> capacidades dinámicas. Las Fases 5–7 (herramientas del agente,
-> pipeline y despliegue en Oracle desde el Studio) siguen pendientes;
-> no habilitar nada de eso en la UI antes de su validación.
+> capacidades dinámicas. Las Fases 5, 6, 7A y 7B están cerradas; 7C.1 y
+> 7C.2 están implementadas en la rama de entrega. La certificación real
+> 7C.3 en Oracle sigue pendiente y no puede declararse superada sin sus
+> tres recorridos consecutivos y el paquete de evidencia de §9.24.
 
 ### 9.1 Stack fijado del piloto
 
@@ -725,7 +726,9 @@ donde se indica (`400 INVALID_TYPE` en otro caso).
 - `POST /api/projects/:id/rollback` → `DeploymentInfo` (nuevo registro;
   `409` si no hay `previous_image` o no hay backup pre-migración)
 - `POST /api/projects/:id/database/backup`
-  → `{"path":string,"createdAt":string,"sizeBytes":number}`
+  → `{"backupId":string,"createdAt":string,"sizeBytes":number,
+  "hadDatabase":boolean}`; nunca devuelve una ruta del host. En 7C exige
+  autenticación administrativa e `Idempotency-Key` según §9.24.
 - `GET /api/projects/:id/runtime` → `ProjectRuntime`
 - `GET /api/projects/:id/preview` → `{"url":"/a/:id/","status":"ready|starting|building|none"}`
   (`status` refleja el contenedor live; `none` si nunca se desplegó)
@@ -889,7 +892,7 @@ PR #10, sin fusionar):**
    runtime no queda publicado (revierte todo; el deployment termina en
    `failed` vía catch-all). Idempotente si ya está en `live`.
 
-**Fase 7 — pendiente (exclusiones expresas de Fase 6):**
+**Exclusiones expresas de Fase 6 (posteriormente implementadas en Fase 7):**
 `DockerDeploymentDriver`; `docker build/run/inspect`; montaje del
 socket Docker; red `appforge-apps`; límites CPU/RAM/PIDs reales;
 contenedores de verificación reales; backup real de SQLite live;
@@ -900,6 +903,429 @@ en Oracle. Los §9.13/§9.14/§9.15 describen ese objetivo con Docker; la
 Fase 6 implementa la misma máquina de estados y semántica contra el
 fake driver.
 
-**Sin UI de despliegue en Fase 6:** no hay botón que prometa despliegue
+**Sin UI de despliegue en Fase 6:** en aquel cierre no había botón que prometiera despliegue
 real a Oracle. Cuando la infraestructura no está configurada, la API
 responde `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`.
+
+### 9.22 Driver Docker y pruebas aisladas (Fase 7A — decisiones cerradas)
+
+**Alcance 7A** (implementado en `apps/worker/src/docker/`): `DockerCommandRunner`
+(sin shell, abortable), `DockerDeploymentDriver` completo contra la interfaz de
+Fase 6, snapshot inmutable con manifiesto SHA-256, modelo de recursos
+(labels `com.appforge.*`, nombres §5 de la especificación de Fase 7),
+endurecimiento de contenedores, variables/secretos, backup/restauración SQLite
+real, pruebas unitarias + integración Docker desechable. **Excluido de 7A**
+(para 7B/7C): activación en servidor/worker, proxy live, reconciliación tras
+reinicio, endpoints 7B, UI, socket en el compose productivo, Oracle/producción.
+
+**Kill switches** (todos obligatorios, §4 de la especificación de Fase 7):
+`APPFORGE_DEPLOY_DRIVER=docker` + `APPFORGE_ENABLE_DOCKER_DEPLOY=1` +
+`APPFORGE_DOCKER_NETWORK` + `APPFORGE_DOCKER_DATA_VOLUME` +
+`APPFORGE_MAX_CONCURRENT_DEPLOYS` (defecto 1). Sin ellos el driver no existe y
+la API conserva `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`; nunca hay fallback al
+fake. El límite de concurrencia es configurable y se aplica durante la vida del
+proceso (semáforo), además del bloqueo por proyecto de Fase 6.
+
+**Preflight**: Linux, CLI Docker ≥ 24.0, socket Unix real (`stat` confirma
+socket), `docker version` OK, red y volumen (se crean etiquetados si faltan),
+directorio de datos escribible. Fallo → 501 con diagnóstico sanitizado; el
+Studio sigue funcionando.
+
+**Identidad de recursos**: labels completas obligatorias
+(`com.appforge.managed=true`, `project-id`, `deployment-id`, `role`,
+`source-fingerprint`); nombres según §5 de la especificación de Fase 7
+(imagen `appforge/app-<id8>:dep-<dep8>-<sha12>`, live `appforge-app-<id8>`,
+verify `appforge-app-<id8>-verify-<dep8>`, volúmenes `appforge-project-<uuid>-data`
+y `appforge-verify-<deploymentId>-data`, red `appforge-apps` interna). Antes de
+reutilizar/eliminar un nombre se comparan las labels con los UUID completos;
+colisión o recurso sin labels → error estable. Solo se enumeran/limpian
+recursos con `com.appforge.managed=true`; prohibido `docker system prune` y
+borrados globales o por prefijo sin comprobar labels.
+
+**Snapshot inmutable**: `$DATA_DIR/deploy-snapshots/<deploymentId>/`; copia
+segura que rechaza symlinks (fail closed); exclusiones fijas (`.git/`,
+`node_modules/`, `dist/`, `.env*`, `*.db*`, `backups/`, `data/`, `*.log`);
+manifiesto ordenado `ruta + tamaño + SHA-256` + hash global; fingerprint
+persistido aditivamente en `deployments` (`snapshot_fingerprint`,
+`snapshot_path`); antes del snapshot, si los receipts del proyecto comparten
+un único fingerprint, debe coincidir con `sourceFingerprint(projectDir)`
+(`RECEIPT_FINGERPRINT_MISMATCH` si las fuentes cambiaron tras el gate; los
+receipts por-scope de Fase 6 los re-verifica el orquestador); el hash del
+snapshot se re-verifica inmediatamente antes del `docker build` y también al
+reutilizar un snapshot existente. `.dockerignore` controlado por AppForge con
+las mismas exclusiones. Docker construye exclusivamente desde el snapshot.
+El build es idempotente: snapshot verificado + imagen con labels exactas →
+se reutiliza sin reconstruir.
+
+**Endurecimiento** (live y verify): usuario 1001, `--read-only`, `/tmp` en
+tmpfs con límites, único montaje escribible (volumen propio en `/data`),
+`--cap-drop=ALL`, `--security-opt=no-new-privileges:true`, `--pids-limit=128`,
+`--cpus=1.0`, `--memory=512m` (+swap igualado), sin privileged/dispositivos/
+host PID-IPC-network, sin puertos publicados, solo red interna `appforge-apps`
+(migraciones con `--network=none`), restart `unless-stopped` solo en live,
+healthcheck real. Las pruebas inspeccionan `docker inspect`.
+
+**Variables y secretos**: `.env` del proyecto (0600, gitignored, fuera del
+snapshot/imagen/ZIP); el driver escribe una copia validada 0600 en
+`$DATA_DIR/deploy-env/<deploymentId>/runtime.env` — **fuera del snapshot**
+(el snapshot es inmutable; escribir dentro lo invalidaría y expondría el env
+al contexto de build) — y la pasa con `--env-file`; lista permitida
+de nombres; se rechazan claves inválidas, null bytes, saltos y duplicados
+ambiguos; ninguna variable del proceso del Studio se hereda en bloque.
+
+**Backup SQLite real**: `docker cp` desde el live detenido (operación fija);
+se copian `app.db` + `app.db-wal` (el `-shm` es memoria compartida
+transitoria: SQLite lo recrea y su checksum no es estable); SHA-256 +
+manifiesto + `PRAGMA quick_check` con `node:sqlite` (código confiable); `backupId` con formato `bk_[A-Za-z0-9_-]{1,64}` y
+`backupValidated='true'` solo tras validar todos los pasos; primer despliegue
+→ backup validado con `hadDatabase=false` (restaurar = volumen vacío);
+retención 10 sin borrar backups requeridos; restauración verificada
+(checksum tras copiar).
+
+**Runner**: spawn sin shell (ejecutable + argv validado contra lista cerrada);
+abort/timeout matan TODO el grupo de procesos (`detached: true` + SIGKILL al
+grupo: cero huérfanos aunque el hijo haga fork); captura limitada (1 MiB) y
+sanitizada; entorno mínimo explícito (nunca `process.env` en bloque).
+
+**Volumen live**: se crea con labels antes del primer uso (`ensureLiveVolume`
+en `runLiveMigrations`/`startCandidateAsLive`/`restoreBackup`); sin esto,
+`docker run -v` lo autocrearía sin labels y quedaría fuera del inventario.
+
+**Revisión Codex (NO-GO) — 9 bloqueos corregidos** (rama
+`fase7-docker-oracle-driver`, sin merge/tag/7B):
+
+1. **Puerta de receipts real**: `verifyReceiptGate()` delega en
+   `persistedDynamicGateStatus` (Fase 6): exige la DB (el constructor lanza
+   `RECEIPT_DB_REQUIRED` sin ella) y los SEIS receipts canónicos de
+   `verification_receipts` en orden canónico, vigentes sobre las fuentes
+   actuales y con scopes del proyecto. Ausencia, stale u orden incorrecto o
+   error de lectura → fail closed, nunca puerta desactivada.
+2. **Fingerprints separados**: `deployments` guarda por separado
+   `verified_source_fingerprint` (fuentes verificadas) y
+   `snapshot_fingerprint` (columnas aditivas). Al reutilizar un snapshot se
+   comprueba contra SQLite la ruta registrada, el re-hash del contenido
+   (`verifySnapshot`) y el fingerprint de fuentes; el manifiesto (editable)
+   no basta. Mutación de fuentes durante la copia → snapshot descartado
+   (`SOURCE_MUTATED_DURING_SNAPSHOT`).
+3. **Dockerfile confiable**: el snapshot/Dockerfile se compara byte a byte
+   (`timingSafeEqual`) con `<templatesDir>/dynamic-react-node/Dockerfile`;
+   el `.dockerignore` controlado (`APPFORGE_DOCKERIGNORE`) forma parte de la
+   integridad. Sin `templatesDir` o con diferencias → fail closed antes del
+   build. Verificado también al reutilizar snapshot.
+4. **Volumen live con identidad estable**: `projectLiveVolumeName()`
+   (`appforge-project-<uuid>-data`) y labels estables (`managed`,
+   `project-id`, `role=live`; SIN `deployment-id` ni fingerprint).
+   `assertLiveVolumeLabels()` falla cerrado ante divergencia. Dos
+   despliegues consecutivos comparten volumen y datos (regresión B4).
+5. **Preflight con propiedad exacta**: si la red o el volumen ya existen, se
+   inspeccionan labels: la red debe ser interna y etiquetada
+   (`component=network`); el volumen debe llevar `component=studio-data`.
+   Colisión o labels ajenas/incompletas → falla SIN modificar el recurso.
+6. **`restoreBackup()` endurecido**: valida TODO antes de detener/eliminar
+   nada (manifiesto, `projectId`/`backupId`, nombres permitidos, unicidad,
+   tamaños, SHA-256 en disco, `PRAGMA quick_check`). Restaura primero en un
+   volumen staging validado y solo después sustituye el live; verifica las
+   labels estables del volumen actual antes de `volume rm` (un volumen ajeno
+   sobrevive). Staging siempre limpiado.
+7. **`pruneManagedImages(projectId, keepImages)` con scope**: lee
+   `live_image`/`previous_image` de `project_runtime` como protegidos ANTES
+   de la retención; solo actúa sobre imágenes del proyecto con labels
+   completas; re-inspecciona labels exactas inmediatamente antes de cada
+   `rmi`. Imágenes de otros proyectos intocables.
+8. **Validación posterior completa** (`validateRunningContainer`): además de
+   lo previo, arquitectura (`amd64`/`arm64`) y SO (`linux`) de la imagen,
+   usuario exactamente `1001`, `MemorySwap` topado a 512m, tmpfs en `/tmp`,
+   `Privileged=false`, `Devices` vacío, `PidMode`/`IpcMode` no host,
+   `NetworkMode` igual a la red configurada, mounts exactos (solo `/data` y
+   `/tmp`), ausencia del socket de Docker y del volumen de datos del Studio.
+9. **Rollback físico real** (test, no supuesto): v1 live con datos → v2
+   verificada → backup → fallo real durante la migración live →
+   `restoreBackup` → `startPreviousVersion` → health → datos anteriores
+   intactos; se demuestra con datos (un todo posterior al backup
+   desaparece, el anterior permanece) que las operaciones físicas se
+   ejecutaron.
+
+**Regresiones** (`dockerDriverRegressions.test.ts`, 35 tests con stub del
+runner, sin daemon): seis receipts vigentes abren / stale-orden-error
+cierran; driver sin DB → `RECEIPT_DB_REQUIRED`; snapshot/manifiesto/
+Dockerfile/`.dockerignore` manipulados → rechazados; red no interna y
+volumen sin labels → rechazados sin mutar; volumen live ajeno sobrevive a
+`restoreBackup`; backup corrupto → rechazado antes de tocar live;
+`discardCandidate` no elimina imagen ajena con el nombre esperado (verifica
+labels exactas antes del `rmi`); poda con scope no toca otros proyectos;
+`live_image`/`previous_image` sobreviven; validación `inspect` completa.
+
+**Regresiones NO-GO 2** (`dockerDriverRegressions.test.ts`, stub sin daemon;
+`hardening.test.ts` para el vector del temporal): retención con >10
+backups y protegidos reales; volumen huérfano con/sin datos y con labels
+ajenas; `docker cp`/`quick_check` fallando tras detener el live (se
+re-levanta con health o se informa `BACKUP_RECOVERY_FAILED`); staging
+ajeno; `hadDatabase` no booleano o inconsistente con `files`; fallo
+inyectado en `volume create`, copia a live y verificación final (la
+compensación devuelve los bytes originales y `startPreviousVersion`
+arranca sana); imagen anterior ajena/incompleta; arquitectura distinta a
+la del daemon; red adicional; `PidMode`/`IpcMode` no permitidos;
+`Devices` ausente/no vacío; `verified_source_fingerprint` ausente, NULL,
+vacío, malformado o distinto.
+
+**Revisión Codex (NO-GO 2) — 6 bloqueos corregidos** (rama
+`fase7-docker-oracle-driver`, sin merge/tag/7B):
+
+1. **Retención real de backups**: `createLiveBackup` pasa `protectedIds` a
+   `enforceRetention`, leídos de SQLite (`protectedBackupIds`): backups de
+   deployments activos (no terminales, incluido rollback pendiente) y del
+   último despliegue `live`. El test antes titulado "backups protegidos"
+   probaba imágenes: renombrado a "imágenes protegidas…"; la retención de
+   backups se prueba con >10 directorios reales.
+2. **Primer despliegue seguro**: "contenedor live ausente" NO equivale a
+   primer despliegue. `hadDatabase=false` solo si no hay
+   `previousLiveVersion`, ni contenedor live, ni volumen live con datos. Un
+   volumen live huérfano se verifica con `assertLiveVolumeLabels` y se
+   respalda con un contenedor temporal endurecido
+   (`hardenedTempVolumeArgs`: usuario 1001, read-only, tmpfs, cap-drop ALL,
+   no-new-privileges, límites, `--network=none`, sin labels de managed).
+   Si el backup falla o se aborta DESPUÉS de detener el live,
+   `recoverStoppedLive` re-levanta el contenedor y verifica health antes de
+   devolver el error original; si la recuperación falla →
+   `BACKUP_RECOVERY_FAILED` (se informa, no se oculta).
+3. **Restore failure-safe**: un staging preexistente se inspecciona con
+   labels exactas antes de eliminarlo (ajeno → `FOREIGN_RESOURCE`, el
+   staging sobrevive). `validateBackupForRestore` exige `hadDatabase`
+   booleano, `false ⇒ files=[]` y `true ⇒ app.db` presente. Antes de tocar
+   el live se rescatan sus datos a un temporal del host
+   (`rescueLiveVolume`); si algo falla tras eliminar el live,
+   `compensateRestoreFailure` recrea el volumen con labels estables,
+   devuelve los datos rescatados y verifica checksums + `quick_check`. El
+   contenedor no se arranca en la compensación: lo hace
+   `startPreviousVersion`.
+4. **Identidad de `previousLiveVersion`**: `startPreviousVersion`
+   inspecciona la imagen ANTES de ejecutarla y exige `managed=true`,
+   `project-id` exacto del proyecto, `deployment-id` UUID válido, `role`
+   `live` y `source-fingerprint` válido (una imagen de otro proyecto se
+   rechaza aunque el nombre tenga formato válido). El nuevo contenedor live
+   usa las labels REALES de la imagen anterior, no las del deployment
+   fallido.
+5. **Hardening exacto** (`validateRunningContainer`): la arquitectura de la
+   imagen debe coincidir EXACTAMENTE con la del daemon/host detectada en
+   preflight (`detectDaemonArchitecture`, `normalizeArch`); exactamente UNA
+   red (la configurada); `PidMode`/`IpcMode` solo con los valores exactos
+   permitidos (`''`/`'private'`); `Devices` explícitamente vacío (ausente
+   → rechazado).
+6. **Snapshot fail closed**: `reuseSnapshot` rechaza
+   `verified_source_fingerprint` ausente, NULL, vacío, malformado o
+   distinto (`SNAPSHOT_SOURCE_FP_INVALID` / `SNAPSHOT_SOURCE_MISMATCH`); no
+   basta con comprobarlo solo cuando sea truthy.
+
+**Revisión final Codex — cierres adicionales antes del merge**:
+
+- La retención falla cerrada con `BACKUP_RETENTION_STATE_ERROR` si SQLite
+  no permite determinar los backups protegidos; no se poda a ciegas.
+- Una `previousLiveVersion` persistida sin contenedor ni volumen devuelve
+  `LIVE_DATA_MISSING`; nunca se certifica un backup vacío como válido.
+- La recuperación del live tras un backup abortado y la compensación de un
+  restore disponen de una señal y presupuesto independientes del timeout
+  original. Así el mismo abort que dispara el rollback no impide repararlo.
+- La compensación elimina cualquier copia parcial y recrea el volumen
+  incluso cuando el estado original estaba vacío, por lo que restaura el
+  estado exacto y no conserva datos introducidos a medias.
+- `startPreviousVersion` exige que la referencia de imagen coincida con el
+  nombre derivado de sus propias labels de deployment/fingerprint, y crea o
+  valida el volumen live antes de arrancar; nombre y metadatos no pueden
+  describir identidades distintas.
+- Las rutas absolutas de `--env-file` aceptan sintaxis POSIX y Windows, con
+  límite de longitud y rechazo de NUL/CR/LF; se conserva la validación
+  POSIX estricta para rutas internas del contenedor.
+- La ausencia normal de `app.db-wal` se reconoce tanto con `no such file`
+  como con `Could not find the file`, variantes reales de `docker cp`; un
+  WAL opcional ausente no invalida el rescate previo al rollback.
+
+**Archivos de 7A** (inventario):
+`apps/worker/src/docker/commandRunner.ts` (+ `.test.ts`),
+`apps/worker/src/docker/snapshot.ts` (+ `.test.ts`),
+`apps/worker/src/docker/resources.ts` (+ `.test.ts`),
+`apps/worker/src/docker/hardening.ts` (+ `.test.ts`),
+`apps/worker/src/docker/env.ts` (+ `.test.ts`),
+`apps/worker/src/docker/sqliteBackup.ts` (+ `.test.ts`),
+`apps/worker/src/docker/dockerDriver.ts` (+ `.test.ts`),
+`apps/worker/src/docker/dockerDriverRegressions.test.ts` (35 regresiones de
+los 9 bloqueos, stub sin daemon),
+`apps/worker/src/docker/integration.test.ts` (puerta `APPFORGE_DOCKER_INTEGRATION`),
+`apps/worker/src/docker/static.test.ts`,
+`apps/worker/src/docker/index.ts`.
+
+### 9.23 Integración del driver Docker (Fase 7B — alcance cerrado)
+
+**Objetivo:** conectar el driver certificado en 7A al Studio sin habilitarlo
+por defecto y sin tocar todavía Oracle, el compose productivo, DNS, TLS, nginx
+ni la UI de despliegue. 7B no cambia la secuencia ni las garantías del
+orquestador de Fase 6.
+
+**Incluido en 7B:**
+
+1. Una única factoría de arranque resuelve los kill switches de §9.22, ejecuta
+   el preflight antes de crear el driver y devuelve un estado tipado
+   `disabled|ready|unavailable`. `disabled` y `unavailable` conservan el
+   `501 DEPLOYMENT_DRIVER_NOT_CONFIGURED`; no hay fallback al fake. Los
+   diagnósticos se sanitizan y nunca exponen variables de entorno.
+2. El mismo `DockerDeploymentDriver` listo se inyecta en HTTP, worker/agente y
+   reconciliación de arranque. No se crean instancias independientes ni
+   semáforos separados.
+3. `APPFORGE_MAX_CONCURRENT_DEPLOYS` limita pipelines completos (HTTP y tool),
+   no operaciones individuales. El slot se adquiere antes de crear trabajo y
+   se libera en `finally`, incluso ante excepción/cancelación.
+4. `buildCandidate` devuelve la referencia inmutable real de imagen. El
+   orquestador persiste esa referencia —no `cand-…`— como `live_image` y mueve
+   el anterior `live_image` a `previous_image`, de forma atómica con el estado
+   `live`. Una respuesta Docker sin referencia válida falla cerrada antes de
+   tocar el live.
+5. Al arrancar, `reconcileDeployments` usa el driver real antes de cerrar
+   ejecuciones interrumpidas. Después reconcilia cada `project_runtime` contra
+   el contenedor administrado real y persiste solo `running|stopped|missing`;
+   una colisión de identidad o error del daemon no se convierte en `running`.
+6. Tras una promoción correcta se ejecuta la poda segura de imágenes de 7A;
+   sus fallos se registran como diagnóstico/evento y no convierten un live sano
+   en fallido. Live y previous permanecen siempre protegidas.
+7. `/api/projects/:id/runtime` y `/api/projects/:id/preview` reflejan el runtime
+   persistido para proyectos dinámicos desplegados. El acceso live reutiliza
+   `/a/:projectId/*`: primero el preview efímero listo de 5B; si no existe,
+   únicamente el `container_name` validado de `project_runtime`. Nunca acepta
+   host/URL del cliente, elimina `Authorization` y hop-by-hop, limita cuerpo y
+   respuesta a 10 MiB, preserva múltiples `Set-Cookie` y devuelve 503 estable
+   si el runtime no está disponible. El proxy se prueba con un destino interno
+   inyectado; 7B no conecta aún el servidor productivo a la red Docker.
+
+**Criterios de aceptación:**
+
+- Kill switches ausentes/incompletos, plataforma no Linux, socket inválido,
+  daemon/red/volumen no válidos: Studio operativo y deploy 501, sin recursos
+  simulados ni mutaciones de deployment.
+- Con factoría `ready`, HTTP y `deploy_project` recorren el driver real
+  compartido; el límite global devuelve `409 DEPLOYMENT_CAPACITY` antes de
+  crear un deployment adicional.
+- Dos despliegues consecutivos demuestran referencias de imagen completas y
+  rollback a la anterior; reinicio demuestra reconciliación real de
+  `running`, `stopped` y `missing`.
+- Pruebas unitarias y HTTP cubren configuración, capacidad, identidad,
+  reconciliación y proxy (incluidos SSRF, cabeceras, cookies y límites). El job
+  Docker estricto amplía el recorrido real 7A con wiring y pasa en el primer
+  intento junto al resto de CI.
+- PR independiente desde `fase7a-stable`, sin merge ni tag hasta revisión
+  final. Sin secretos, Docker socket productivo, Oracle, Vercel manual ni
+  cambios de producción.
+
+**Alcance que 7B reservó a 7C:** compose/socket/red productivos, despliegue en
+Oracle, proxy expuesto por nginx, dominio/DNS/TLS, observabilidad/alertas de
+producción, UI de despliegue y recorrido final en infraestructura real.
+También quedaron fuera de 7B los endpoints operativos de §9.20 (`POST
+migrations`, rollback manual y backup manual). 7C.2 los implementa con
+autorización operativa, idempotencia, auditoría persistente y retención real.
+Los endpoints de deploy/listado/cancel/runtime y preview ya estaban conectados
+y cubiertos en 7B.
+
+### 9.24 Producción Oracle y operación autónoma (Fase 7C — contrato cerrado)
+
+**Objetivo:** convertir el pipeline certificado de 7B en una entrega operable
+en una VM Oracle dedicada: un administrador solicita el despliegue desde el
+Studio y recibe una aplicación dinámica accesible, con autenticación y SQLite
+persistente, sin entrar en el servidor ni ejecutar comandos manuales. 7C no
+relaja ninguna garantía de 5A–7B y no introduce un segundo orquestador.
+
+7C se entrega en tres cortes secuenciales. Ningún corte se considera cerrado
+por documentación o mocks: exige pruebas automatizadas y la evidencia indicada.
+
+#### 7C.1 — Plano de ejecución productivo
+
+1. `infra/docker-compose.yml` deja de publicar el backend directamente. Solo el
+   proxy de borde expone 80/443; `studio` queda en una red de control y en la
+   red interna `appforge-apps`. Los contenedores generados no publican puertos,
+   solo pertenecen a `appforge-apps`, y nunca reciben el socket, el volumen del
+   Studio ni secretos del Studio.
+2. La imagen del Studio incluye un cliente Docker versionado y ejecuta el
+   backend como usuario no root. El único componente con acceso de escritura al
+   socket es el backend/orquestador. Se documenta expresamente que ese acceso
+   equivale a privilegio de host; por tanto 7C requiere una VM dedicada, API de
+   administración autenticada y ningún código generado ejecutándose dentro del
+   proceso del Studio.
+3. `DATA_DIR`, base SQLite del Studio, snapshots, manifiestos, backups y env de
+   runtime viven en almacenamiento persistente. Los secretos llegan mediante
+   un fichero 0600 no versionado; no aparecen en imagen, Git, ZIP, logs, eventos
+   ni respuestas HTTP. El arranque productivo falla cerrado si faltan el token
+   administrador, las rutas persistentes o sus permisos. Un socket/daemon/red/
+   volumen no disponible conserva el Studio operativo, pero el driver queda
+   `unavailable` y todo despliegue devuelve 501 sin mutaciones.
+4. Healthchecks de Studio, proxy y runtime; política de reinicio; rotación y
+   límites de logs; límites CPU/RAM/PIDs; `no-new-privileges`; filesystem de
+   Studio de solo lectura salvo temporales y datos declarados. El apagado espera
+   operaciones en curso dentro de un presupuesto y la reconciliación posterior
+   conserva la semántica de Fase 6.
+5. Caddy publica `/api/*` y `/a/*` hacia el Studio. El dominio configurable y
+   TLS automático se admiten cuando DNS ya apunta a la VM; para certificar el
+   núcleo basta una URL HTTP/IP de Oracle. Nunca se genera un certificado falso
+   ni se afirma que un dominio está activo sin comprobarlo externamente.
+
+#### 7C.2 — Operación administrada y UI
+
+1. Se completan los endpoints de §9.20 para migración pendiente, backup manual
+   y rollback manual reutilizando el driver real y el mismo bloqueo global por
+   proyecto. No aceptan comandos, rutas, imágenes, hosts ni nombres Docker del
+   cliente.
+2. Toda mutación exige autenticación administrativa y `Idempotency-Key` con
+   formato y longitud limitados. La clave, el actor, la operación, el proyecto,
+   el resultado y las fechas quedan en un registro de auditoría persistente.
+   Repetir la misma clave y payload devuelve el resultado original; reutilizarla
+   con otro payload devuelve `409 IDEMPOTENCY_CONFLICT`.
+3. Backup manual devuelve un identificador opaco y metadatos, nunca una ruta del
+   host. Solo cuenta como correcto tras manifiesto, checksums y `quick_check`.
+   La retención reutiliza la protección de 7A y falla cerrada si no puede
+   calcular los backups protegidos.
+4. Rollback manual crea un deployment nuevo y auditable, requiere imagen y
+   backup anterior coherentes, serializa contra deploy/migración/backup, restaura
+   físicamente, arranca, verifica health y flujo autenticado, y solo entonces
+   actualiza `project_runtime`. Ante fallo conserva o recupera el último live
+   sano; nunca publica un rollback parcial.
+5. La UI muestra capacidad del driver, estado/fase, historial, diagnóstico
+   sanitizado, URL live y acciones permitidas. Deshabilita operaciones
+   incompatibles y explica el motivo; la UI no es autoridad y el servidor
+   repite todas las comprobaciones. No se muestra un éxito hasta confirmar el
+   estado terminal persistido.
+
+#### 7C.3 — Certificación en Oracle
+
+1. Instalación reproducible desde un commit y tag exactos, con preflight que no
+   imprime secretos. La ejecución genera un paquete de evidencia sanitizado y
+   versionable: versiones, commit, configuración no sensible, checks y marcas
+   temporales; nunca `.env`, cookies, tokens ni datos personales.
+2. Recorrido E2E obligatorio desde navegador y API: crear proyecto dinámico,
+   generar, obtener los seis receipts, desplegar, abrir `/a/:projectId/`,
+   registrar usuario, iniciar/cerrar sesión y completar CRUD persistente.
+3. Segundo despliegue con migración compatible conserva usuario y datos.
+   Se provoca después un fallo controlado tras el backup para demostrar rollback
+   físico: vuelve la versión previa sana y se mantienen los datos anteriores.
+4. Reinicio real de `studio`, proxy y VM: reconciliación correcta, aplicación
+   accesible y datos persistentes. Se prueba además cancelación, concurrencia,
+   límite de respuesta, aislamiento entre dos proyectos y rechazo de recursos
+   Docker ajenos.
+5. La aceptación exige tres recorridos consecutivos completos sobre Oracle,
+   todos desde estado conocido, sin reparación manual entre pasadas. Cada pasada
+   conserva su evidencia, IDs y resultados. Un rerun o intervención se declara;
+   nunca se sustituye silenciosamente una pasada fallida.
+
+#### Puertas de aceptación y exclusiones
+
+- CI de PR y CI post-merge: `verify`, plantilla Ubuntu/Windows e integración
+  Docker estricta verdes en intento 1. Se añade validación estática del compose
+  productivo y un smoke test Linux sin secretos reales.
+- Pruebas negativas obligatorias: socket ausente/solo lectura, daemon caído,
+  red o volumen ajenos, token ausente, secretos con permisos inseguros, segundo
+  deployment concurrente, clave idempotente conflictiva, backup corrupto,
+  rollback sin anterior y reinicio durante una operación.
+- La activación continúa detrás de los kill switches de §9.22. `disabled` o
+  preflight fallido mantienen el Studio disponible y devuelven 501 sin crear ni
+  modificar deployments o recursos Docker.
+- 7C no compra dominios, no acepta términos externos, no contrata servicios y
+  no incorpora pagos, correo corporativo, multi-host, Kubernetes, PostgreSQL,
+  alta disponibilidad ni restauración fuera de la VM. Son trabajos posteriores
+  y no bloquean la certificación por IP/URL de Oracle.
+- No se fusiona ni etiqueta 7C hasta revisión final del PR, CI verde y evidencia
+  Oracle completa. Si no hay acceso autorizado a Oracle, el código puede quedar
+  listo para revisión, pero 7C permanece **no certificada**.

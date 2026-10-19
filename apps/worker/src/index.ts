@@ -22,8 +22,8 @@ export {
 export type { DynamicCheckKey, ProcResult } from './dynamicTools.js';
 export { runAgentOnce } from './agent.js';
 export type { AgentSettings, RunAgentOptions } from './agent.js';
-export { startWorker } from './jobs.js';
-export type { WorkerOptions } from './jobs.js';
+export { startWorker, waitForTaskSet } from './jobs.js';
+export type { WorkerController, WorkerOptions } from './jobs.js';
 export { requestCancel, clearCancel, isCancelRequested } from './cancel.js';
 export { checkBrowser, checkBrowserAtUrl } from './browser.js';
 export type { BrowserSession, BrowserStep } from './browser.js';
@@ -47,12 +47,15 @@ export {
   listDeploymentEvents,
   transitionDeployment,
   finalizeLiveDeployment,
+  setDeploymentBackup,
+  setDeploymentPreviousLive,
   recordEvent,
   requestDeploymentCancel,
   isDeploymentCancelRequested,
   getProjectRuntime,
   upsertProjectRuntime,
   reconcileDeployments,
+  reconcileProjectRuntimes,
   isDeploymentStatus,
   isTerminalStatus,
   NON_TERMINAL_STATUSES,
@@ -64,7 +67,14 @@ export {
   isValidBackupId,
 } from './deploy/stateMachine.js';
 export type { DeploymentRecord, DeploymentEvent, DeploymentEventInput, ProjectRuntimeRecord } from './deploy/stateMachine.js';
-export { FakeDeploymentDriver, assertDriverArgs, FAKE_OP_NAMES } from './deploy/driver.js';
+export {
+  FakeDeploymentDriver,
+  assertDriverArgs,
+  FAKE_OP_NAMES,
+  acquireDeploymentCapacity,
+  activeDeploymentCapacity,
+  APPFORGE_IMAGE_REF_RE,
+} from './deploy/driver.js';
 export type {
   DeploymentDriver,
   DriverOpArgs,
@@ -83,3 +93,4 @@ export {
   listVerificationReceipts,
 } from './deploy/receipts.js';
 export type { VerificationReceipt } from './deploy/receipts.js';
+export * from './docker/index.js';

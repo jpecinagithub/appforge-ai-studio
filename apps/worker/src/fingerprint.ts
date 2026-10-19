@@ -7,6 +7,12 @@ export function sourceFingerprint(root: string): string {
   const walk = (dir: string) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       if (['node_modules', 'dist', '.git'].includes(entry.name)) continue;
+      // Agent-maintained run notes are operational metadata, not application
+      // source. The agent refreshes this file after verification succeeds; if
+      // it participates in the fingerprint, every otherwise successful run
+      // immediately makes its own persisted receipts stale and deployment can
+      // never pass the authoritative gate.
+      if (dir === root && entry.name === 'PROJECT_CONTEXT.md') continue;
       const file = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(file);
       else if (entry.isFile()) hash.update(path.relative(root, file)).update('\0').update(fs.readFileSync(file)).update('\0');

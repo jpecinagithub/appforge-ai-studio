@@ -89,6 +89,56 @@ export interface DeploymentInfo {
   url: string | null;
   createdAt: string;
   logs: string | null;
+  candidateId?: string | null;
+  previousLiveVersion?: string | null;
+  backupId?: string | null;
+  cancelRequested?: boolean;
+  startedAt?: string | null;
+  updatedAt?: string | null;
+  finishedAt?: string | null;
+  error?: string | null;
+}
+
+export interface ProjectRuntimeInfo {
+  projectId: string;
+  containerName: string;
+  liveImage: string;
+  previousImage: string | null;
+  status: 'running' | 'stopped' | 'missing';
+  updatedAt: string;
+}
+
+export interface AdministrativeOperationInfo {
+  id: string;
+  actor: string;
+  operation: 'database_backup' | 'migrations' | 'rollback' | 'deploy' | 'deployment_cancel';
+  status: 'running' | 'succeeded' | 'failed';
+  responseStatus: number | null;
+  result: unknown | null;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+
+export interface MigrationInfo {
+  id: string;
+  projectId: string;
+  version: number;
+  name: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  logs: string;
+  error: string | null;
+}
+
+export interface DeploymentDriverStatus {
+  configured: boolean;
+  name: string | null;
+  active: number;
+  limit: number | null;
+  available: number | null;
 }
 
 export interface FileNode {

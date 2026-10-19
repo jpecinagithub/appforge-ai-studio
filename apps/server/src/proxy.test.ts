@@ -28,7 +28,7 @@ let dataDir: string;
 let baseUrl: string;
 let upstream: http.Server;
 let upstreamPort: number;
-let upstreamSaw: Array<{ method: string; url: string; authorization?: string; cookie?: string; body: string }> = [];
+let upstreamSaw: Array<{ method: string; url: string; authorization?: string; cookie?: string; contentType?: string; body: string }> = [];
 
 // Fake preview backend: echoes method/url/headers/body as JSON.
 function startUpstream(): Promise<void> {
@@ -43,6 +43,7 @@ function startUpstream(): Promise<void> {
           url: req.url ?? '',
           authorization: req.headers.authorization,
           cookie: req.headers.cookie,
+          contentType: req.headers['content-type'],
           body,
         });
         const isAsset = (req.url ?? '').endsWith('.js');
@@ -79,7 +80,12 @@ async function createDynamicProject(name: string): Promise<string> {
 beforeAll(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-proxy-test-'));
   db = openDb(dataDir);
-  app = buildServer({ db, dataDir, templatesDir: TEMPLATES_DIR });
+  app = buildServer({
+    db,
+    dataDir,
+    templatesDir: TEMPLATES_DIR,
+    liveRuntimeOrigin: () => `http://127.0.0.1:${upstreamPort}`,
+  });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const addr = app.server.address();
   if (!addr || typeof addr === 'string') throw new Error('could not listen');
@@ -105,6 +111,50 @@ describe('dynamic preview proxy /a/:projectId', () => {
     expect(last.url).toBe('/api/todos?page=2');
   });
 
+  it('falls back to a validated live runtime and reports it as ready', async () => {
+    const id = await createDynamicProject('Live 7B');
+    db.prepare(
+      `INSERT INTO project_runtime(project_id, container_name, live_image, previous_image, status, updated_at)
+       VALUES (?,?,?,?,?,?)`,
+    ).run(
+      id,
+      `appforge-app-${id.slice(0, 8)}`,
+      'appforge/app-1234abcd:dep-5678abcd-0123456789ab',
+      null,
+      'running',
+      new Date().toISOString(),
+    );
+    const status = await fetch(`${baseUrl}/api/projects/${id}/preview`);
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({ url: `/a/${id}/`, status: 'ready' });
+    const res = await fetch(`${baseUrl}/a/${id}/api/live?q=1`, {
+      headers: { authorization: 'Bearer MUST-NOT-LEAK' },
+    });
+    expect(res.status).toBe(200);
+    const last = upstreamSaw[upstreamSaw.length - 1]!;
+    expect(last.url).toBe('/api/live?q=1');
+    expect(last.authorization).toBeUndefined();
+  });
+
+  it('rejects a runtime whose persisted container identity is not derived', async () => {
+    const id = await createDynamicProject('Foreign live 7B');
+    db.prepare(
+      `INSERT INTO project_runtime(project_id, container_name, live_image, previous_image, status, updated_at)
+       VALUES (?,?,?,?,?,?)`,
+    ).run(
+      id,
+      'attacker-controlled-host',
+      'appforge/app-1234abcd:dep-5678abcd-0123456789ab',
+      null,
+      'running',
+      new Date().toISOString(),
+    );
+    const before = upstreamSaw.length;
+    const res = await fetch(`${baseUrl}/a/${id}/`);
+    expect(res.status).toBe(503);
+    expect(upstreamSaw).toHaveLength(before);
+  });
+
   it('forwards POST/PATCH/DELETE with the body preserved', async () => {
     const id = await createDynamicProject('Proxy B');
     registerPreview(id);
@@ -120,6 +170,18 @@ describe('dynamic preview proxy /a/:projectId', () => {
       expect(last.url).toBe('/api/todos/1');
       expect(JSON.parse(last.body)).toEqual({ title: 'hello' });
     }
+  });
+
+  it('does not leak the internal passthrough content type on a bodyless POST', async () => {
+    const id = await createDynamicProject('Proxy bodyless POST');
+    registerPreview(id);
+    const res = await fetch(`${baseUrl}/a/${id}/api/auth/logout`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    const last = upstreamSaw[upstreamSaw.length - 1]!;
+    expect(last.method).toBe('POST');
+    expect(last.url).toBe('/api/auth/logout');
+    expect(last.contentType).toBeUndefined();
+    expect(last.body).toBe('');
   });
 
   it('passes cookies through and returns Set-Cookie', async () => {

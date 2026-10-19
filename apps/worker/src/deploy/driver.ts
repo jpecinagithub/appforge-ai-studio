@@ -12,8 +12,8 @@
  *   orquestador decide transiciones (vía la máquina de estados).
  * - El LLM nunca recibe acceso directo al driver.
  *
- * En Fase 6 solo existe `FakeDeploymentDriver` (determinista, para
- * pruebas). `DockerDeploymentDriver` se añadirá en Fase 7.
+ * `FakeDeploymentDriver` es exclusivo de pruebas. Desde 7B el Studio puede
+ * inyectar el `DockerDeploymentDriver` real tras kill switches + preflight.
  *
  * Este módulo no ejecuta shell, no abre red y no importa Docker.
  */
@@ -74,6 +74,13 @@ export interface DriverResult {
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$/;
 
 /**
+ * Referencia completa de imagen AppForge (`appforge/app-<p8>:dep-<d8>-<sha12>`).
+ * Es el único formato aceptado para `previousLiveVersion`: la fija el Studio
+ * desde `project_runtime` (7B), nunca el modelo.
+ */
+export const APPFORGE_IMAGE_REF_RE = /^appforge\/app-[0-9a-f]{8}:dep-[0-9a-f]{8}-[0-9a-f]{12}$/;
+
+/**
  * Valida que los argumentos sean identificadores seguros derivados
  * internamente. Rechaza comandos, rutas, espacios y cadenas vacías: el
  * driver nunca debe recibir entrada libre del modelo. Los campos opcionales
@@ -102,12 +109,21 @@ export function assertDriverArgs(args: DriverOpArgs): void {
       throw new Error(`invalid driver argument 'signal': must be an AbortSignal`);
     }
   }
-  for (const k of ['previousLiveVersion', 'backupId'] as const) {
+  for (const k of ['backupId'] as const) {
     if (k in extra) {
       const v = extra[k];
       if (v !== null && (typeof v !== 'string' || !SAFE_ID.test(v))) {
         throw new Error(`invalid driver argument '${k}': must be an internally-derived identifier or null`);
       }
+    }
+  }
+  // previousLiveVersion: null o referencia completa de imagen AppForge.
+  if ('previousLiveVersion' in extra) {
+    const v = extra['previousLiveVersion'];
+    if (v !== null && (typeof v !== 'string' || !APPFORGE_IMAGE_REF_RE.test(v))) {
+      throw new Error(
+        `invalid driver argument 'previousLiveVersion': must be null or a full appforge image reference`,
+      );
     }
   }
   const allowed = new Set([
@@ -120,6 +136,14 @@ export function assertDriverArgs(args: DriverOpArgs): void {
 
 export interface DeploymentDriver {
   readonly name: string;
+  /**
+   * Límite de pipelines completos que puede atender esta instancia. Ausente
+   * significa que el driver no impone límite (fakes y adaptadores de tests).
+   * 7B comparte una sola instancia entre HTTP y worker.
+   */
+  readonly maxConcurrentDeploys?: number;
+  /** Drivers reales pueden exigir una versión inmutable devuelta por build. */
+  readonly requiresCandidateVersion?: boolean;
   buildCandidate(args: DriverOpArgs): Promise<DriverResult>;
   prepareVerificationDatabase(args: DriverOpArgs): Promise<DriverResult>;
   runVerificationMigrations(args: DriverOpArgs): Promise<DriverResult>;
@@ -127,8 +151,16 @@ export interface DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult>;
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult>;
+  /** Ejecuta el mismo flujo autenticado contra el slot live canónico. */
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult>;
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult>;
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult>;
+  /** Reanuda el live detenido por un backup manual y confirma su health. */
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
+  /** Ejecuta las migraciones incluidas en la imagen live inspeccionada. */
+  runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult>;
+  /** Restaura un backup manual y recupera la misma imagen live sana. */
+  recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult>;
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult>;
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult>;
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult>;
@@ -147,6 +179,36 @@ export interface DeploymentDriver {
    */
   discardCandidate(args: DriverOpArgs): Promise<DriverResult>;
   reconcileRuntime(args: ReconcileArgs): Promise<DriverResult>;
+  /** Limpieza post-live opcional; jamás puede invalidar una promoción sana. */
+  pruneManagedImages?(projectId: string, keepImages?: string[]): Promise<{ removed: string[]; failures: string[] }>;
+}
+
+const activeByDriver = new WeakMap<DeploymentDriver, number>();
+
+/**
+ * Reserva capacidad para un pipeline completo. Devuelve una liberación
+ * idempotente, o null antes de que se cree/persista ningún deployment.
+ */
+export function acquireDeploymentCapacity(driver: DeploymentDriver): (() => void) | null {
+  const configured = driver.maxConcurrentDeploys;
+  if (configured === undefined) return () => undefined;
+  const max = Math.max(1, Math.floor(configured));
+  const active = activeByDriver.get(driver) ?? 0;
+  if (active >= max) return null;
+  activeByDriver.set(driver, active + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const current = activeByDriver.get(driver) ?? 0;
+    if (current <= 1) activeByDriver.delete(driver);
+    else activeByDriver.set(driver, current - 1);
+  };
+}
+
+/** Solo para diagnóstico/pruebas; no muta el contador. */
+export function activeDeploymentCapacity(driver: DeploymentDriver): number {
+  return activeByDriver.get(driver) ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +223,12 @@ export type FakeOpName =
   | 'startVerificationRuntime'
   | 'runHealthCheck'
   | 'runAuthenticatedVerification'
+  | 'runAuthenticatedLiveVerification'
   | 'stopVerificationRuntime'
   | 'createLiveBackup'
+  | 'resumeCurrentLiveRuntime'
+  | 'runCurrentLiveMigrations'
+  | 'recoverCurrentLiveBackup'
   | 'runLiveMigrations'
   | 'stopCurrentLiveRuntime'
   | 'startCandidateAsLive'
@@ -179,8 +245,12 @@ export const FAKE_OP_NAMES: readonly FakeOpName[] = [
   'startVerificationRuntime',
   'runHealthCheck',
   'runAuthenticatedVerification',
+  'runAuthenticatedLiveVerification',
   'stopVerificationRuntime',
   'createLiveBackup',
+  'resumeCurrentLiveRuntime',
+  'runCurrentLiveMigrations',
+  'recoverCurrentLiveBackup',
   'runLiveMigrations',
   'stopCurrentLiveRuntime',
   'startCandidateAsLive',
@@ -237,6 +307,9 @@ export interface FakeDriverOptions {
    * createLiveBackup (defecto 'true'; 'false' simula backup no validado).
    */
   backupValidated?: string;
+  /** Metadatos del backup fake para diferenciar live con/sin base de datos. */
+  backupSizeBytes?: number;
+  backupHadDatabase?: boolean;
   /**
    * Decisor dinámico por operación (p. ej. fallar runHealthCheck solo para
    * runtime='live'). Tiene prioridad sobre `behavior`.
@@ -333,6 +406,9 @@ export class FakeDeploymentDriver implements DeploymentDriver {
             ? {
                 ...(this.opts.omitBackupId ? {} : { backupId: this.opts.backupId ?? `bk_${args.deploymentId.slice(0, 8)}` }),
                 backupValidated: this.opts.backupValidated ?? 'true',
+                createdAt: new Date().toISOString(),
+                sizeBytes: String(this.opts.backupSizeBytes ?? 0),
+                hadDatabase: String(this.opts.backupHadDatabase ?? false),
               }
             : undefined;
         return { ok: true, code: `${op.toUpperCase()}_OK`, output: this.opts.outputOverride?.[op] ?? `fake ${op} ok`, data };
@@ -355,8 +431,12 @@ export class FakeDeploymentDriver implements DeploymentDriver {
   startVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('startVerificationRuntime', args); }
   runHealthCheck(args: HealthCheckArgs): Promise<DriverResult> { return this.run('runHealthCheck', args); }
   runAuthenticatedVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedVerification', args); }
+  runAuthenticatedLiveVerification(args: DriverOpArgs): Promise<DriverResult> { return this.run('runAuthenticatedLiveVerification', args); }
   stopVerificationRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopVerificationRuntime', args); }
   createLiveBackup(args: LiveBackupArgs): Promise<DriverResult> { return this.run('createLiveBackup', args); }
+  resumeCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('resumeCurrentLiveRuntime', args); }
+  runCurrentLiveMigrations(args: DriverOpArgs): Promise<DriverResult> { return this.run('runCurrentLiveMigrations', args); }
+  recoverCurrentLiveBackup(args: RestoreBackupArgs): Promise<DriverResult> { return this.run('recoverCurrentLiveBackup', args); }
   runLiveMigrations(args: DriverOpArgs): Promise<DriverResult> { return this.run('runLiveMigrations', args); }
   stopCurrentLiveRuntime(args: DriverOpArgs): Promise<DriverResult> { return this.run('stopCurrentLiveRuntime', args); }
   startCandidateAsLive(args: DriverOpArgs): Promise<DriverResult> { return this.run('startCandidateAsLive', args); }

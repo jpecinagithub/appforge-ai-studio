@@ -41,9 +41,11 @@ import {
 } from 'appforge-worker';
 import { nowIso } from 'appforge-worker';
 import { projectDir } from './projects.js';
+import { acquireProjectOperationLock, releaseProjectOperationLock } from './operations.js';
 
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = path.resolve(SRC_DIR, '..', '..', '..', 'templates');
+const ADMIN_TOKEN = 'deploy-http-administrative-token';
 
 let db: Database.Database;
 let app: FastifyInstance;
@@ -85,14 +87,34 @@ async function buildApp(driver?: FakeDeploymentDriver): Promise<FastifyInstance>
   return a;
 }
 
+async function buildSecuredApp(driver?: FakeDeploymentDriver): Promise<FastifyInstance> {
+  const a = buildServer({
+    db,
+    dataDir,
+    templatesDir: TEMPLATES_DIR,
+    deploymentDriver: driver,
+    adminToken: ADMIN_TOKEN,
+  });
+  await a.ready();
+  return a;
+}
+
+function adminHeaders(idempotencyKey?: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${ADMIN_TOKEN}`,
+    ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
+  };
+}
+
 async function waitForTerminal(
   client: FastifyInstance,
   deploymentId: string,
   timeoutMs = 20000,
+  headers?: Record<string, string>,
 ): Promise<DeploymentRecord & Record<string, unknown>> {
   const t0 = Date.now();
   for (;;) {
-    const res = await client.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
+    const res = await client.inject({ method: 'GET', url: `/api/deployments/${deploymentId}`, headers });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { status: string };
     if (['live', 'failed', 'rolled_back', 'cancelled'].includes(body.status)) {
@@ -108,10 +130,11 @@ async function waitForStatus(
   deploymentId: string,
   status: string,
   timeoutMs = 20000,
+  headers?: Record<string, string>,
 ): Promise<void> {
   const t0 = Date.now();
   for (;;) {
-    const res = await client.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
+    const res = await client.inject({ method: 'GET', url: `/api/deployments/${deploymentId}`, headers });
     const body = res.json() as { status: string };
     if (body.status === status) return;
     if (Date.now() - t0 > timeoutMs) throw new Error(`timeout waiting for status=${status} (last=${body.status})`);
@@ -245,7 +268,47 @@ describe('POST /api/projects/:id/deploy (criterios 1, 18, 19, 20)', () => {
   });
 });
 
+describe('GET /api/deployment-driver — operations UI', () => {
+  it('reports the configured driver and capacity without exposing configuration', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/deployment-driver' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ configured: true, name: 'fake', active: 0, limit: null, available: null });
+
+    const withoutDriver = await buildApp();
+    try {
+      const missing = await withoutDriver.inject({ method: 'GET', url: '/api/deployment-driver' });
+      expect(missing.statusCode).toBe(200);
+      expect(missing.json()).toEqual({ configured: false, name: null, active: 0, limit: null, available: null });
+    } finally {
+      await withoutDriver.close();
+    }
+  });
+});
+
 describe('concurrent deploys (criterio 4)', () => {
+  it('serializes deploy against another managed operation on the same project', async () => {
+    addProject('locked-project');
+    seedVerificationReceipts('locked-project');
+    expect(acquireProjectOperationLock(db, {
+      projectId: 'locked-project',
+      operationId: 'manual-backup-owner',
+      operation: 'database_backup',
+    })).toBe(true);
+    try {
+      const blocked = await app.inject({
+        method: 'POST',
+        url: '/api/projects/locked-project/deploy',
+        payload: { target: 'oracle' },
+      });
+      expect(blocked.statusCode).toBe(409);
+      expect((blocked.json() as { error: { code: string } }).error.code).toBe('PROJECT_OPERATION_ACTIVE');
+      const count = db.prepare('SELECT COUNT(*) AS n FROM deployments WHERE project_id=?').get('locked-project') as { n: number };
+      expect(count.n).toBe(0);
+    } finally {
+      releaseProjectOperationLock(db, 'manual-backup-owner');
+    }
+  });
+
   it('only one of two simultaneous requests creates a deployment', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => { release = r; });
@@ -267,6 +330,34 @@ describe('concurrent deploys (criterio 4)', () => {
     } finally {
       release();
       await gatedApp.close();
+    }
+  });
+
+  it('applies the 7B driver capacity across different projects before creating work', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const limited = new FakeDeploymentDriver({ db, gates: { buildCandidate: () => gate } }) as
+      FakeDeploymentDriver & { maxConcurrentDeploys: number };
+    limited.maxConcurrentDeploys = 1;
+    const limitedApp = await buildApp(limited);
+    try {
+      addProject('capacity-a');
+      addProject('capacity-b');
+      seedVerificationReceipts('capacity-a');
+      seedVerificationReceipts('capacity-b');
+      const first = await limitedApp.inject({ method: 'POST', url: '/api/projects/capacity-a/deploy', payload: { target: 'oracle' } });
+      expect(first.statusCode).toBe(202);
+      await waitForStatus(limitedApp, (first.json() as { id: string }).id, 'building');
+      const second = await limitedApp.inject({ method: 'POST', url: '/api/projects/capacity-b/deploy', payload: { target: 'oracle' } });
+      expect(second.statusCode).toBe(409);
+      expect((second.json() as { error: { code: string } }).error.code).toBe('DEPLOYMENT_CAPACITY');
+      const rows = db.prepare('SELECT COUNT(*) AS n FROM deployments WHERE project_id=?').get('capacity-b') as { n: number };
+      expect(rows.n).toBe(0);
+      release();
+      await waitForTerminal(limitedApp, (first.json() as { id: string }).id);
+    } finally {
+      release();
+      await limitedApp.close();
     }
   });
 });
@@ -320,6 +411,64 @@ describe('deployment queries and cancel (criterio 13)', () => {
     const res = await app.inject({ method: 'GET', url: '/api/projects/hr/runtime' });
     expect(res.statusCode).toBe(404);
     expect((res.json() as { error: { code: string } }).error.code).toBe('RUNTIME_NOT_FOUND');
+  });
+});
+
+describe('production deploy/cancel authorization and idempotency — 7C.2', () => {
+  it('authenticates, audits and replays deploy and cancellation without a second mutation', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const driver = new FakeDeploymentDriver({ db, gates: { buildCandidate: () => gate } });
+    const secured = await buildSecuredApp(driver);
+    try {
+      addProject('secured-deploy');
+      seedVerificationReceipts('secured-deploy');
+      const url = '/api/projects/secured-deploy/deploy';
+      const unauthorized = await secured.inject({ method: 'POST', url, payload: { target: 'oracle' } });
+      expect(unauthorized.statusCode).toBe(401);
+      const missingKey = await secured.inject({
+        method: 'POST', url, headers: adminHeaders(), payload: { target: 'oracle' },
+      });
+      expect(missingKey.statusCode).toBe(400);
+      expect((missingKey.json() as { error: { code: string } }).error.code).toBe('INVALID_IDEMPOTENCY_KEY');
+
+      const headers = adminHeaders('deploy-idempotency-0001');
+      const first = await secured.inject({ method: 'POST', url, headers, payload: { target: 'oracle' } });
+      expect(first.statusCode).toBe(202);
+      const deployment = first.json() as { id: string };
+      await waitForStatus(secured, deployment.id, 'building', 20000, adminHeaders());
+      const replay = await secured.inject({ method: 'POST', url, headers, payload: { target: 'oracle' } });
+      expect(replay.statusCode).toBe(202);
+      expect(replay.headers['idempotency-replayed']).toBe('true');
+      expect(replay.json()).toEqual(first.json());
+      const count = db.prepare('SELECT COUNT(*) AS n FROM deployments WHERE project_id=?').get('secured-deploy') as { n: number };
+      expect(count.n).toBe(1);
+
+      const cancelUrl = `/api/deployments/${deployment.id}/cancel`;
+      const cancelMissingKey = await secured.inject({ method: 'POST', url: cancelUrl, headers: adminHeaders() });
+      expect(cancelMissingKey.statusCode).toBe(400);
+      const cancelHeaders = adminHeaders('cancel-idempotency-0001');
+      const cancelled = await secured.inject({ method: 'POST', url: cancelUrl, headers: cancelHeaders });
+      expect(cancelled.statusCode).toBe(200);
+      expect((cancelled.json() as { cancelRequested: boolean }).cancelRequested).toBe(true);
+      const cancelReplay = await secured.inject({ method: 'POST', url: cancelUrl, headers: cancelHeaders });
+      expect(cancelReplay.statusCode).toBe(200);
+      expect(cancelReplay.headers['idempotency-replayed']).toBe('true');
+      expect(cancelReplay.json()).toEqual(cancelled.json());
+
+      const audit = db.prepare(
+        "SELECT operation,status,response_status FROM operation_audit WHERE project_id=? ORDER BY created_at",
+      ).all('secured-deploy') as Array<{ operation: string; status: string; response_status: number }>;
+      expect(audit).toEqual([
+        { operation: 'deploy', status: 'succeeded', response_status: 202 },
+        { operation: 'deployment_cancel', status: 'succeeded', response_status: 200 },
+      ]);
+      release();
+      expect((await waitForTerminal(secured, deployment.id, 20000, adminHeaders())).status).toBe('cancelled');
+    } finally {
+      release();
+      await secured.close();
+    }
   });
 });
 

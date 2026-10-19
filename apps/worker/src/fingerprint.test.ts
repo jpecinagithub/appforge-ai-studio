@@ -24,3 +24,10 @@ it('invalidates verification for source changes but not generated artifacts', ()
   fs.writeFileSync(path.join(root, 'App.tsx'), 'after');
   expect(sourceFingerprint(root)).not.toBe(before);
 });
+it('ignores agent-maintained project context metadata', () => {
+  fs.writeFileSync(path.join(root, 'App.tsx'), 'source');
+  fs.writeFileSync(path.join(root, 'PROJECT_CONTEXT.md'), 'before run');
+  const before = sourceFingerprint(root);
+  fs.writeFileSync(path.join(root, 'PROJECT_CONTEXT.md'), 'after successful verification');
+  expect(sourceFingerprint(root)).toBe(before);
+});

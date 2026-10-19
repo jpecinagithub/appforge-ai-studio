@@ -27,6 +27,7 @@ import { randomUUID } from 'node:crypto';
 import type { DeploymentStatus } from 'appforge-shared';
 import { sanitizeSecrets } from '../secrets.js';
 import { nowIso } from '../tools.js';
+import type { DriverResult } from './driver.js';
 
 export type { DeploymentStatus };
 
@@ -622,8 +623,8 @@ export function finalizeLiveDeployment(
  * `error='interrupted by server restart'`.
  *
  * Antes de marcar cada deployment se invoca la reconciliación abstracta
- * del driver (`reconcileRuntime`); en Fase 6 el fake driver la demuestra y
- * la reconciliación Docker real queda reservada a la Fase 7.
+ * del driver (`reconcileRuntime`); desde 7B el arranque inyecta la
+ * reconciliación Docker real cuando supera el preflight.
  * No se confía en PIDs persistidos (el pipeline Fase 6 no almacena ninguno).
  */
 export async function reconcileDeployments(
@@ -673,4 +674,57 @@ export async function reconcileDeployments(
     count += 1;
   }
   return count;
+}
+
+/**
+ * Fase 7B: contrasta runtimes publicados con recursos reales del driver.
+ * Nunca conserva `running` por confiar únicamente en SQLite.
+ */
+export async function reconcileProjectRuntimes(
+  db: Database.Database,
+  driver: { reconcileRuntime: (args: { deploymentId: string; projectId: string; candidateId: string }) => Promise<DriverResult> },
+): Promise<{ checked: number; unavailable: number }> {
+  const runtimes = db.prepare('SELECT * FROM project_runtime ORDER BY project_id').all() as Record<string, any>[];
+  let unavailable = 0;
+  for (const row of runtimes) {
+    const runtime = getProjectRuntime(db, String(row.project_id));
+    if (!runtime) continue;
+    const dep = db.prepare(
+      "SELECT * FROM deployments WHERE project_id=? AND status='live' ORDER BY finished_at DESC, created_at DESC LIMIT 1",
+    ).get(runtime.projectId) as Record<string, any> | undefined;
+    let next: ProjectRuntimeRecord['status'] = 'missing';
+    if (dep) {
+      const deployment = rowToDeploymentRecord(dep);
+      try {
+        const result = await driver.reconcileRuntime({
+          deploymentId: deployment.id,
+          projectId: runtime.projectId,
+          candidateId: deployment.candidateId ?? `cand-${deployment.id.slice(0, 8)}`,
+        });
+        const found = result.ok && result.data?.liveFound === 'true';
+        const imageMatches = found && result.data?.liveImage === runtime.liveImage;
+        if (imageMatches) next = result.data?.liveRunning === 'true' ? 'running' : 'stopped';
+        else unavailable += 1;
+        recordEvent(db, deployment.id, {
+          phase: 'live',
+          event: 'startup_runtime_reconcile',
+          status: imageMatches ? next : 'failed',
+          output: imageMatches ? `runtime=${next}` : null,
+          error: imageMatches ? null : sanitizeDeploymentError(result.error ?? 'managed live runtime missing or identity mismatch'),
+        });
+      } catch (e) {
+        unavailable += 1;
+        recordEvent(db, deployment.id, {
+          phase: 'live',
+          event: 'startup_runtime_reconcile',
+          status: 'failed',
+          error: sanitizeDeploymentError(`runtime reconcile failed: ${(e as Error).message}`),
+        });
+      }
+    } else {
+      unavailable += 1;
+    }
+    if (runtime.status !== next) upsertProjectRuntime(db, { ...runtime, status: next });
+  }
+  return { checked: runtimes.length, unavailable };
 }
