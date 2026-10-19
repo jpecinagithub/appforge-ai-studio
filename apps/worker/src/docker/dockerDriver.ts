@@ -1708,7 +1708,7 @@ export class DockerDeploymentDriver implements DeploymentDriver {
 
   /**
    * Copia `app.db` (+ `app.db-wal` si existe) desde un contenedor al
-   * directorio del backup, con chown 1001 y SHA-256 por fichero. Lanza
+   * directorio del backup, privado al usuario del Studio y SHA-256 por fichero. Lanza
    * `DockerDriverError` ante cualquier problema (el llamador decide si
    * `app.db` ausente es error o `hadDatabase=false`).
    */
@@ -1734,9 +1734,12 @@ export class DockerDeploymentDriver implements DeploymentDriver {
         throw new DockerDriverError('BACKUP_CP_FAILED', `docker cp ${f}: ${cp.stderr.slice(0, 200)}`);
       }
       try {
-        fs.chownSync(dest, 1001, 1001);
+        // docker cp writes host files as the invoking Studio user. Keep that
+        // ownership: the unprivileged Studio cannot chown to the app's 1001.
+        // On restore, docker cp assigns the destination container's user.
+        fs.chmodSync(dest, 0o600);
       } catch (e) {
-        throw new DockerDriverError('BACKUP_CHOWN_FAILED', `cannot chown ${f}: ${(e as Error).message.slice(0, 150)}`);
+        throw new DockerDriverError('BACKUP_MODE_FAILED', `cannot secure ${f}: ${(e as Error).message.slice(0, 150)}`);
       }
       copied.push({ name: f, ...sha256File(dest) });
     }

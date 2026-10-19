@@ -9,6 +9,7 @@
 - Generic authenticated verification required the example todo UI, preventing other domains from passing legitimately.
 - The shared-host nginx proxy stripped `/appforge/` but did not rewrite the session cookie Path. Registration appeared successful publicly while subsequent authenticated requests failed.
 - A successful deployment left its preview registered as ready. Since `/a/:id/` prefers that preview, public traffic still reached a temporary database. The pipeline now retires the preview after live health succeeds; failed builds preserve it.
+- Subsequent deployment backups tried to chown the Studio's backup to application UID 1001, which fails when the Studio runs as UID 1000. Backups now retain Studio ownership with mode 0600; a Docker probe confirmed restore copies take the destination application's UID and remain writable.
 
 ## Platform changes
 
