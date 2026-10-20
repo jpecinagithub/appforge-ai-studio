@@ -311,9 +311,10 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     const r = resolveAreaPath(ctx, args.area, p);
     const abs = r.abs;
     // Fase 1 guards (see writeGuard.ts): no loose scripts at the frontend
-    // root, and never gut a file its importers depend on. A rejected write
-    // is NOT applied.
-    if (r.area === null || r.area === 'frontend') {
+    // root of dynamic projects (the route the observed junk took; static
+    // projects keep exactly their previous behaviour), and never gut a
+    // file its importers depend on. A rejected write is NOT applied.
+    if (r.area === 'frontend') {
       const rootScript = frontendRootScriptError(r.rel, p);
       if (rootScript) return fail('ROOT_SCRIPT_REJECTED', rootScript, Date.now() - t0);
     }
@@ -346,7 +347,7 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
     // one call. Any rejection aborts the whole batch before any write.
     const batchContents = new Map(files.map((f) => [path.resolve(f.abs), f.content]));
     for (const file of files) {
-      if (file.area === null || file.area === 'frontend') {
+      if (file.area === 'frontend') {
         const rootScript = frontendRootScriptError(file.rel, file.path);
         if (rootScript) return fail('ROOT_SCRIPT_REJECTED', rootScript, Date.now() - t0);
       }

@@ -93,10 +93,11 @@ describe('dynamic editing areas', () => {
     expect(r.ok).toBe(true);
     expect(readFileSync(path.join(dir, 'backend', 'src', 'server.ts'), 'utf8')).toContain('export const x = 2;');
 
-    // frontend still the default
-    r = await tools.write_file(ctx, { path: 'app.js', content: 'console.log(1);' });
+    // frontend still the default (probe lives under src/: Fase 1 rejects
+    // loose script files at the frontend root of dynamic projects)
+    r = await tools.write_file(ctx, { path: 'src/app.js', content: 'console.log(1);' });
     expect(r.ok).toBe(true);
-    expect(existsSync(path.join(dir, 'frontend', 'app.js'))).toBe(true);
+    expect(existsSync(path.join(dir, 'frontend', 'src', 'app.js'))).toBe(true);
 
     // search scoped to the area
     r = await tools.search_code(ctx, { area: 'backend', pattern: 'export const x' });

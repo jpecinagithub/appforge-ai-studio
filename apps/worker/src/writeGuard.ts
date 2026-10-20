@@ -17,9 +17,13 @@
  *
  *  2. Loose scratch scripts at the frontend root — test_backend.js,
  *     debug_server.js and friends were written next to index.html and
- *     polluted the app. Root-level script files in the frontend area are
- *     rejected with a hint towards a work subfolder; known build config
- *     files (vite.config.*, vitest.config.*) stay allowed.
+ *     polluted the app. Root-level script files in the frontend area of
+ *     DYNAMIC projects are rejected with a hint towards a work subfolder;
+ *     known build config files (vite.config.*, vitest.config.*) stay
+ *     allowed. The rule is scoped to dynamic projects on purpose: the
+ *     junk entered through the dynamic area system, and the codebase
+ *     pins "static projects keep exactly their previous behaviour"
+ *     (dynamicAreas.test.ts) as a contract.
  *
  * The checks are deliberately mechanical (regex-level symbol extraction,
  * direct relative imports only) — they are a safety net against gutting a

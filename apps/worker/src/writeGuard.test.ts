@@ -241,7 +241,7 @@ describe('write guards through the tools', () => {
     db.close();
   });
 
-  test('loose root scripts are rejected in dynamic and static frontends; scratch/ and vite.config pass', async () => {
+  test('loose root scripts are rejected in the dynamic frontend area; scratch/ and vite.config pass; static projects are unchanged', async () => {
     const db = makeDb();
     const tools = createTools();
 
@@ -256,11 +256,12 @@ describe('write guards through the tools', () => {
     r = await tools.write_file(dyn, { path: 'vite.config.ts', content: 'export default {};' });
     expect(r.ok).toBe(true);
 
+    // Static projects keep exactly their previous behaviour (the hygiene
+    // rule targets the dynamic area system, where the junk entered).
     const stDir = makeProject('static');
     const st = makeCtx(db, stDir, 'static', 'guard-root-static');
     r = await tools.write_file(st, { path: 'debug_server.js', content: 'console.log(1)' });
-    expect(r.ok).toBe(false);
-    expect(r.code).toBe('ROOT_SCRIPT_REJECTED');
+    expect(r.ok).toBe(true);
     r = await tools.write_file(st, { path: 'src/main.ts', content: 'export {};' });
     expect(r.ok).toBe(true);
     db.close();
