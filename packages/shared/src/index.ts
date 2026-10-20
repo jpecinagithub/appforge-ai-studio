@@ -203,6 +203,9 @@ export interface Settings {
   temperature: number;
   maxTokens: number;
   maxIterations: number;
+  /** Fase 1: optional — settings stored before the agent hardening may lack them. */
+  maxHardIterations?: number;
+  maxRepairAttempts?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -253,6 +256,9 @@ export interface LlmResponse {
 
 export interface AgentLimits {
   maxIterations: number;
+  /** Fase 1: hard stop for the agent loop (maxIterations only forces verify()). */
+  maxHardIterations: number;
+  /** Fase 1: max failed repair verifications per run (was dead config before). */
   maxRepairAttempts: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;

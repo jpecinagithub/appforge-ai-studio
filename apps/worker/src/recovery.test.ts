@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairStateKey } from './recovery.js';
+import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairErrorSignature, repairStateKey } from './recovery.js';
 
 describe('agent recovery helpers', () => {
   it('extracts and deduplicates missing local images with their alt text', () => {
@@ -64,5 +64,47 @@ describe('agent recovery helpers', () => {
     expect(isUsableRasterAsset(fake)).toBe(false);
     expect(isUsableRasterAsset(real)).toBe(true);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('repairErrorSignature (Fase 1 circuit breaker)', () => {
+  it('is stable when the same compiler error only moves lines or the port changes', () => {
+    const a = repairErrorSignature('src/server.ts(82,22): error TS2554: Expected 0 arguments, but got 3.\npreview at http://127.0.0.1:4101/');
+    const b = repairErrorSignature('src/server.ts(97,5): error TS2554: Expected 0 arguments, but got 3.\npreview at http://127.0.0.1:5234/');
+    expect(a).toBe(b);
+    expect(a).toContain('error TS2554');
+  });
+
+  it('differs when the compiler error changes', () => {
+    const a = repairErrorSignature('src/server.ts(82,22): error TS2554: Expected 0 arguments, but got 3.');
+    const b = repairErrorSignature('src/server.ts(82,22): error TS2339: Property x does not exist on type y.');
+    expect(a).not.toBe(b);
+  });
+
+  it('captures several simultaneous compiler errors regardless of order', () => {
+    const a = repairErrorSignature('src/a.ts(1,1): error TS2305: Module has no exported member q.\nsrc/b.ts(2,3): error TS2322: Type string is not assignable.');
+    const b = repairErrorSignature('src/b.ts(9,9): error TS2322: Type string is not assignable.\nsrc/a.ts(4,4): error TS2305: Module has no exported member q.');
+    expect(a).toBe(b);
+  });
+
+  it('keeps test counts: identical pass counts repeat, improved counts differ', () => {
+    const a = repairErrorSignature('api tests exited with code 1 (10/17 passed)');
+    const b = repairErrorSignature('api tests exited with code 1 (10/17 passed)');
+    const c = repairErrorSignature('api tests exited with code 1 (11/17 passed)');
+    expect(a).toBe(b);
+    expect(a).not.toBe(c);
+  });
+
+  it('includes the dynamic gate header (which checks are missing)', () => {
+    const sig = repairErrorSignature('DYNAMIC CHECKS INCOMPLETE (missing or stale checks: backendBuild, migrations). Run the missing tools now');
+    expect(sig).toContain('DYNAMIC CHECKS INCOMPLETE');
+    expect(sig).toContain('backendBuild');
+  });
+
+  it('falls back to the normalized diagnostic for free-form failures', () => {
+    const a = repairErrorSignature('Preview smoke failed at http://127.0.0.1:3000/x');
+    const b = repairErrorSignature('Preview smoke failed at http://127.0.0.1:9999/x');
+    expect(a).toBe(b);
+    expect(a).not.toBe('');
   });
 });

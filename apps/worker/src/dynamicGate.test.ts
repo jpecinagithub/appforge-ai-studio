@@ -333,6 +333,54 @@ describe('dynamic completion gate', () => {
     db.close();
   }, 240000);
 
+  it('Fase 1: stops the repair loop when the same error signature repeats 3 times despite source edits', async () => {
+    const runId = setupRun(makeGateProject());
+    let n = 0;
+    // Alternate edits (each changes the source fingerprint, which used to
+    // reset the stagnation counter) with finish attempts. The gate
+    // diagnostic never changes, so the signature circuit breaker must trip.
+    model.mockImplementation(async () => {
+      n++;
+      if (n % 2 === 1) {
+        return toolCall('write_files', { files: [{ path: 'src/App.tsx', content: `export default function App(){return <h1>v${n}</h1>}` }] });
+      }
+      return final('Done?');
+    });
+    await runAgentOnce(db, runId, { dataDir, settings });
+    const { status, error } = runStatus(runId);
+    expect(status).toBe('error');
+    expect(error ?? '').toMatch(/repeated 3 times in a row/);
+    expect(n).toBeLessThanOrEqual(6);
+    db.close();
+  }, 180000);
+
+  it('Fase 1: the hard iteration cap stops an endless tool loop', async () => {
+    const runId = setupRun(makeGateProject());
+    model.mockImplementation(async () => toolCall('read_file', { path: 'package.json' }));
+    await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxIterations: 100, maxHardIterations: 5 } });
+    const { status, error } = runStatus(runId);
+    expect(status).toBe('error');
+    expect(error ?? '').toMatch(/Hard iteration cap reached \(5 iterations\)/);
+    expect(toolCallCount(runId, 'read_file')).toBe(5);
+    db.close();
+  }, 180000);
+
+  it('Fase 1: maxRepairAttempts stops repair when failed verifications keep changing', async () => {
+    const runId = setupRun(makeGateProject());
+    script([
+      toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v1</h1>}' }] }),
+      final('Done.'), // verify #1 fails: all six checks missing (signature A)
+      toolCall('run_frontend_build'), // succeeds; verify #2 fails: five missing (signature B)
+      toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }), // invalidates frontendBuild; verify #3 fails (signature A) — 3 > maxRepairAttempts=2
+    ]);
+    await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxRepairAttempts: 2 } });
+    const { status, error } = runStatus(runId);
+    expect(status).toBe('error');
+    expect(error ?? '').toMatch(/failed verification attempts \(maxRepairAttempts=2\)/);
+    expect(error ?? '').not.toMatch(/repeated 3 times/);
+    db.close();
+  }, 180000);
+
   it('blocks finishing with only the four 5A checks (5B not done)', async () => {
     const runId = setupRun(makeGateProject());
     script([
