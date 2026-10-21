@@ -92,3 +92,6 @@ que ya estaba en verde.
 
 - (a) Presup
 ...[truncated 1477 chars]
+## Despliegue del paquete completo (21-oct-2026)
+
+Fusionada en `master` junto al frente B (`fix/plataforma-biblioteca-detector`, que ya contenía esta rama como ancestro) con fast-forward a `74477f5` y redesplegada en la instancia edu con el procedimiento seguro (sin runs ni despliegues activos). Verificado dentro del contenedor healthy junto a los marcadores del frente B; health local y público 200.

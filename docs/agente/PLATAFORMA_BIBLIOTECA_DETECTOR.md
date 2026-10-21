@@ -108,3 +108,7 @@ y `.net`). El run nació muerto sin consumir una sola llamada al modelo.
 Nota: la cifra «worker 460» del encargo venía del estado de la rama del
 diagnóstico de flujo; en `master` efe947b la suite ya sumaba 465 antes de
 esta rama (465 + 2 = 467).
+
+## Despliegue del paquete completo (21-oct-2026)
+
+Los dos frentes del paquete (esta rama y `fix/plataforma-postlogin-presupuesto`, que ya era ancestro de esta) se fusionaron en `master` con fast-forward a `74477f5` y se redesplegaron juntos en la instancia edu con el procedimiento seguro (sin runs ni despliegues activos). Verificado dentro del contenedor healthy: aserciones post-login (`assertImagesLoadedAfterSteps`), escritura de URL al pasar a live (`production_url=?` en stateMachine), `stripUrls` en el detector, presupuesto consciente del progreso (`noteFailedVerification`) y `productionUrl` en el dist del Studio; health local y público 200.
