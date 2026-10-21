@@ -105,3 +105,7 @@ inventado una para este paquete.
 | Worker (`apps/worker`) | 456 | **456 ✓** (sin tocar; 18 skipped, igual que el baseline) |
 | Studio build (`tsc -b && vite build`) | — | ✓ |
 | Server typecheck (`tsc --noEmit`) | — | ✓ |
+
+## Despliegue (21-oct-2026)
+
+Fusionado en `master` (fast-forward a `170af12`) y redesplegado en la instancia edu con el procedimiento seguro (sin runs activos). Verificado dentro del contenedor healthy: la lista de copia del PATCH incluye `maxHardIterations` y `maxRepairAttempts`; `finalizeOnce` en ProjectView.tsx y `parseSseBlock` en sse.ts presentes en el código servido; health local y público 200.
