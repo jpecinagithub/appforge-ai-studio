@@ -246,9 +246,16 @@ describe('dynamic completion gate', () => {
     db.prepare('UPDATE runs SET prompt=? WHERE id=?').run('Build a store. '+'.'.repeat(4000)+' KEEP_THE_LAST_REQUIREMENT',runId);
     model.mockRejectedValue(new LlmError('LLM_BAD_TOOL_ARGS','Invalid JSON arguments for tool write_files'));
     await runAgentOnce(db,runId,{dataDir,settings});
-    expect(model).toHaveBeenCalledTimes(4);
+    // Flexibilidad agéntica: four consecutive invalid responses no longer
+    // end the run — they raise a stuck signal. Three signal rounds
+    // (4 responses each) climb the ladder to LOOP_EXHAUSTED: 12 calls.
+    expect(model).toHaveBeenCalledTimes(12);
     expect(runStatus(runId).status).toBe('error');
     expect(runStatus(runId).error).toContain('Four consecutive');
+    expect(runStatus(runId).error).toContain('Three stuck interventions fired');
+    const errorEvents = db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='error'").all(runId) as Array<{ payload_json: string }>;
+    expect(errorEvents).toHaveLength(1);
+    expect((JSON.parse(errorEvents[0]!.payload_json) as { code?: string }).code).toBe('LOOP_EXHAUSTED');
     const recovery=model.mock.calls[1];
     expect(JSON.stringify(recovery[1])).toContain('KEEP_THE_LAST_REQUIREMENT');
     expect(recovery[2].some((tool:{name:string})=>tool.name==='write_files')).toBe(false);
@@ -477,12 +484,14 @@ describe('dynamic completion gate', () => {
     db.close();
   }, 240000);
 
-  it('Fase 1: stops the repair loop when the same error signature repeats 3 times despite source edits', async () => {
+  it('flexibilidad: signature ×3 injects a directive and the run continues; edits between attempts keep resetting the ladder', async () => {
     const runId = setupRun(makeGateProject());
     let n = 0;
-    // Alternate edits (each changes the source fingerprint, which used to
-    // reset the stagnation counter) with finish attempts. The gate
-    // diagnostic never changes, so the signature circuit breaker must trip.
+    // Alternate edits (each changes the source fingerprint = progress)
+    // with finish attempts. The gate diagnostic never changes, so the
+    // signature detector trips every 3 verifications — but every signal
+    // finds the progress key moved, so the ladder resets to level 1 each
+    // time and the run only dies at the hard iteration cap (a fact).
     model.mockImplementation(async () => {
       n++;
       if (n % 2 === 1) {
@@ -493,8 +502,15 @@ describe('dynamic completion gate', () => {
     await runAgentOnce(db, runId, { dataDir, settings });
     const { status, error } = runStatus(runId);
     expect(status).toBe('error');
-    expect(error ?? '').toMatch(/repeated 3 times in a row/);
-    expect(n).toBeLessThanOrEqual(6);
+    expect(error ?? '').toMatch(/Hard iteration cap reached \(60 iterations\)/);
+    // The old regime died at n<=6; the ladder let it run far past that.
+    expect(n).toBeGreaterThan(6);
+    const signals = (db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='status'").all(runId) as Array<{ payload_json: string }>)
+      .map((r) => JSON.parse(r.payload_json) as { phase?: string; level?: number; kind?: string })
+      .filter((p) => p.phase === 'stuck_signal');
+    expect(signals.length).toBeGreaterThanOrEqual(3);
+    expect(signals.every((s) => s.level === 1)).toBe(true);
+    expect(signals.every((s) => s.kind === 'repeated-signature')).toBe(true);
     db.close();
   }, 180000);
 
@@ -538,21 +554,30 @@ describe('dynamic completion gate', () => {
     db.close();
   }, 240000);
 
-  it('a repair loop with no progress still aborts on the repeated signature (breakers unchanged)', async () => {
+  it('a repair loop with no progress climbs the ladder and ends as LOOP_EXHAUSTED (detectors unchanged)', async () => {
     const runId = setupRun(makeGateProject());
     let n = 0;
     model.mockImplementation(async () => {
       n++;
       // One real edit so the loop reaches verify(); after that, pure finish
       // attempts — no edits, no checks, the progress key never moves and
-      // the diagnostic never changes.
+      // the diagnostic never changes. Signals fire at verifications 3, 6
+      // and 9; the third one ends the run as LOOP_EXHAUSTED.
       if (n === 1) return toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' });
       return final('Done.');
     });
     await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxRepairAttempts: 2 } });
     const { status, error } = runStatus(runId);
     expect(status).toBe('error');
-    expect(error ?? '').toMatch(/repeated 3 times in a row/);
+    expect(error ?? '').toContain('Three stuck interventions fired without progress between them');
+    expect(error ?? '').toContain('repeated-signature');
+    const errorEvents = db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='error'").all(runId) as Array<{ payload_json: string }>;
+    expect(errorEvents).toHaveLength(1);
+    expect((JSON.parse(errorEvents[0]!.payload_json) as { code?: string }).code).toBe('LOOP_EXHAUSTED');
+    const signals = (db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='status'").all(runId) as Array<{ payload_json: string }>)
+      .map((r) => JSON.parse(r.payload_json) as { phase?: string; level?: number })
+      .filter((p) => p.phase === 'stuck_signal');
+    expect(signals.map((s) => s.level)).toEqual([1, 2, 3]);
     db.close();
   }, 180000);
 
@@ -567,13 +592,13 @@ describe('dynamic completion gate', () => {
         ...SIX_CHECKS.slice(0, 5).map((n) => toolCall(n)),
         final('Done.'), // verify fails, naming only test_authenticated_flow
         final('Done.'),
-        final('Done.'), // the signature repeats a third time; the abort embeds the diagnostic
+        final('Done.'), // the signature repeats a third time; the signal detail embeds the diagnostic
       ]);
       await runAgentOnce(db, runId, { dataDir, settings });
       const { status, error } = runStatus(runId);
       expect(status).toBe('error');
       expect(error ?? '').toContain('missing or stale checks: authenticatedFlow');
-      expect(error ?? '').toContain('Run only the missing tools now, in this exact order: test_authenticated_flow.');
+      expect(error ?? '').toContain('Recommended next step: run only the missing tools, in this order: test_authenticated_flow.');
       expect(error ?? '').not.toContain('run_frontend_build → run_backend_build');
     } finally {
       await proxy.close();

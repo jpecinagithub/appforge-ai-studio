@@ -73,7 +73,11 @@ const DEFAULT_LIMITS: AgentLimits = {
   runTimeoutMs: 900_000,
 };
 
-/** Consecutive failed verifications with the SAME diagnostic signature stop the run. */
+/**
+ * Consecutive failed verifications with the SAME diagnostic signature
+ * raise a stuck signal (flexibilidad agéntica §4.2). Before the ladder
+ * this stopped the run; now it only feeds the intervention ladder.
+ */
 const MAX_REPEATED_ERROR_SIGNATURE = 3;
 
 /**
@@ -83,7 +87,7 @@ const MAX_REPEATED_ERROR_SIGNATURE = 3;
  */
 const MAX_MALFORMED_COMPLETION_RETRIES = 2;
 
-/** Consecutive `missing required argument` results for the SAME tool that abort the run. */
+/** Consecutive `missing required argument` results for the SAME tool that raise a stuck signal. */
 const MAX_ARGUMENT_STREAK = 3;
 
 export interface ArgumentStreak {
@@ -468,15 +472,32 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   let stagnantRepairs = 0;
   let lastRepairState = '';
   let proposedSummary = '';
-  // Fase 1 circuit breakers (independent of the fingerprint-based
-  // stagnation key above, which any source edit resets): count failed
-  // repair verifications, and how many of them in a row produced the SAME
+  // Fase 1 detectors (independent of the fingerprint-based stagnation
+  // key above, which any source edit resets): count failed repair
+  // verifications, and how many of them in a row produced the SAME
   // diagnostic signature (repairErrorSignature ignores source changes).
+  // Flexibilidad agéntica (§4.2): these detectors no longer kill the
+  // run — they record stuck signals that the intervention ladder
+  // (processStuckSignal) turns into strategy directives.
   let lastToolError: string | null = null;
   let failedRepairVerifications = 0;
   let lastErrorSignature = '';
   let repeatedErrorSignature = 0;
-  let repairAbortMessage: string | null = null;
+  // ---------------------------------------------------------------------
+  // Intervention ladder state. Detectors record at most one pending
+  // signal (first one wins until processed); processing compares the
+  // current progress key against the key at the previous signal: if the
+  // work moved, the ladder resets and the signal is a fresh warning.
+  // ---------------------------------------------------------------------
+  type StuckKind = 'repeated-signature' | 'repair-budget' | 'stagnation' | 'argument-stagnation' | 'malformed-calls';
+  interface StuckSignal { kind: StuckKind; detail: string }
+  let pendingSignal: StuckSignal | null = null;
+  let ladderLevel = 0;
+  let ladderLog: Array<{ level: number; kind: StuckKind; detail: string }> = [];
+  let lastSignalProgressKey: string | null = null;
+  const recordStuckSignal = (kind: StuckKind, detail: string): void => {
+    if (!pendingSignal) pendingSignal = { kind, detail };
+  };
   // Progress snapshot taken at each failed verification (valid dynamic
   // prefix length + source fingerprint). The maxRepairAttempts budget only
   // counts a failed verification when this key did NOT move since the
@@ -681,22 +702,24 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   };
 
   /**
-   * Fase 1: account for one FAILED verification. Two independent circuit
-   * breakers live here (the fingerprint-based stagnation counter remains
-   * as a third net, inside verify()):
+   * Fase 1 detectors, flexibilidad agéntica (§4.2): account for one
+   * FAILED verification. Two independent detectors live here (the
+   * fingerprint-based stagnation counter remains as a third, inside
+   * verify()):
    *  - identical diagnostic signature MAX_REPEATED_ERROR_SIGNATURE times
    *    in a row → the repair is going in circles even though files change;
    *  - more than limits.maxRepairAttempts failed repair verifications
-   *    WITHOUT PROGRESS in total → the repair budget is exhausted even if
-   *    errors keep varying. A verification whose progress key moved since
-   *    the previous one (valid prefix grew, or any source fingerprint
-   *    changed) does NOT consume budget: the old unconditional count
-   *    killed a live run one tool call from success after it re-passed
-   *    five checks in green, because every verify() summed (run 6ad56917).
-   *    The signature breaker above is deliberately NOT progress-aware —
-   *    a loop that keeps producing the same diagnostic still dies at 3.
-   * Tripping only RECORDS the abort; the loop performs it (checkRepairAbort)
-   * so verify() keeps its boolean contract for every caller.
+   *    WITHOUT PROGRESS in total → the repair budget signal. A
+   *    verification whose progress key moved since the previous one
+   *    (valid prefix grew, or any source fingerprint changed) does NOT
+   *    consume budget: the old unconditional count killed a live run one
+   *    tool call from success after it re-passed five checks in green,
+   *    because every verify() summed (run 6ad56917).
+   * Tripping only RECORDS a stuck signal (signature wins ties, as
+   * before) and resets both counters, so one stuck episode produces ONE
+   * intervention, not one per verify; the loop processes the signal
+   * through the ladder (processStuckSignal) and verify() keeps its
+   * boolean contract for every caller.
    */
   const noteFailedVerification = (diagnostic: string): void => {
     const progressKey = verificationProgressKey();
@@ -709,12 +732,40 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       lastErrorSignature = signature;
       repeatedErrorSignature = 1;
     }
-    if (repairAbortMessage) return;
-    if (repeatedErrorSignature >= MAX_REPEATED_ERROR_SIGNATURE) {
-      repairAbortMessage = `${t('loopDetected')}\n\nThe same verification errors repeated ${repeatedErrorSignature} times in a row without change, so further repair turns would repeat them. Last diagnostic:\n${diagnostic.slice(0, 6000)}`;
-    } else if (failedRepairVerifications > limits.maxRepairAttempts) {
-      repairAbortMessage = `${t('repairLimit')}\n\nAutomatic repair stopped after ${failedRepairVerifications} failed verification attempts (maxRepairAttempts=${limits.maxRepairAttempts}). Last diagnostic:\n${diagnostic.slice(0, 6000)}`;
+    const signatureTripped = signature !== '' && repeatedErrorSignature >= MAX_REPEATED_ERROR_SIGNATURE;
+    const budgetTripped = failedRepairVerifications > limits.maxRepairAttempts;
+    if (!signatureTripped && !budgetTripped) return;
+    if (signatureTripped) {
+      recordStuckSignal(
+        'repeated-signature',
+        `the same verification errors repeated ${repeatedErrorSignature} times in a row. Last diagnostic: ${diagnostic.slice(0, 1500)}`,
+      );
+    } else {
+      recordStuckSignal(
+        'repair-budget',
+        `${failedRepairVerifications} failed repair verifications without progress (maxRepairAttempts=${limits.maxRepairAttempts}). Last diagnostic: ${diagnostic.slice(0, 1500)}`,
+      );
     }
+    repeatedErrorSignature = 0;
+    lastErrorSignature = '';
+    failedRepairVerifications = 0;
+    lastVerificationProgressKey = progressKey;
+  };
+
+  /**
+   * Third detector (§4.2): verify()'s fingerprint-based stagnation
+   * counter. Reaching maxStagnantRepairs identical repair states records
+   * a stagnation signal and resets the counter, so re-signalling needs
+   * another full run of unchanged attempts.
+   */
+  const noteStagnation = (): void => {
+    if (stagnantRepairs < maxStagnantRepairs) return;
+    recordStuckSignal(
+      'stagnation',
+      `${maxStagnantRepairs} consecutive verification attempts produced the identical repair state (same sources, same diagnostic)`,
+    );
+    stagnantRepairs = 0;
+    lastRepairState = '';
   };
 
   /**
@@ -806,11 +857,53 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     finishError(finalMessage, code);
   };
 
-  /** Performs a recorded circuit-breaker abort, if any. Returns true when the run was finished. */
-  const checkRepairAbort = async (): Promise<boolean> => {
-    if (!repairAbortMessage) return false;
-    await failRun(repairAbortMessage, 'REPAIR_LIMIT', true);
-    return true;
+  /**
+   * Flexibilidad agéntica (§4.2): process the pending stuck signal, if
+   * any, through the intervention ladder. A signal NEVER kills the run
+   * directly:
+   *  - if the progress key moved since the previous signal, the ladder
+   *    resets first — this signal is a fresh warning (level 1);
+   *  - level 1 injects a persistent strategy directive into the history;
+   *  - level 2 injects a reinforced directive AND compacts the context
+   *    (a stuck loop is often contaminated context, not incapacity);
+   *  - level 3 ends the run as LOOP_EXHAUSTED, with restore, and the
+   *    final message enumerates the three interventions.
+   * Returns true when the run was finished.
+   */
+  const processStuckSignal = async (): Promise<boolean> => {
+    const signal = pendingSignal;
+    if (!signal) return false;
+    pendingSignal = null;
+    const progressKey = verificationProgressKey();
+    if (lastSignalProgressKey !== null && progressKey !== lastSignalProgressKey) {
+      ladderLevel = 0;
+      ladderLog = [];
+    }
+    lastSignalProgressKey = progressKey;
+    ladderLevel++;
+    ladderLog.push({ level: ladderLevel, kind: signal.kind, detail: signal.detail });
+    emit(db, runId, 'status', { phase: 'stuck_signal', level: ladderLevel, kind: signal.kind });
+    emit(db, runId, 'log', { text: `stuck signal ${ladderLevel}/3 (${signal.kind}): ${signal.detail.slice(0, 300)}` });
+    if (ladderLevel >= 3) {
+      const steps = ladderLog.map((s) => `${s.level}. [${s.kind}] ${s.detail}`).join('\n');
+      await failRun(
+        `${t('loopExhausted')}\n\nThree stuck interventions fired without progress between them:\n${steps}`,
+        'LOOP_EXHAUSTED',
+        true,
+      );
+      return true;
+    }
+    const directive = [
+      `STUCK SIGNAL — intervention ${ladderLevel} of 3 (${signal.kind}). ${signal.detail}`,
+      'You are repeating an operation that is not working. Do NOT repeat the failed operation without a material change. Change strategy NOW. Working options: rewrite the whole file instead of patching it again; skip this step and come back to it later; degrade a non-essential requirement instead of blocking on it (for images you cannot acquire, call acquire_image with fallback: "placeholder" — the platform declares the degradation in the run summary); consult get_dynamic_status and fix the earliest broken check.',
+      ...(ladderLevel >= 2 ? ['Your context has been compacted to a fresh summary: re-read the current state before acting.'] : []),
+      'Repeated failures no longer stop this run by themselves; the run ends only when the work is verified, the user cancels, or a hard limit is hit. If the next intervention also finds no progress, the run will be ended as an exhausted loop.',
+    ].join('\n');
+    if (ladderLevel >= 2) {
+      history = compactRecoveryHistory(`Stuck intervention ${ladderLevel}: ${signal.kind}. ${signal.detail.slice(0, 500)}`);
+    }
+    history.push({ role: 'user', content: directive });
+    return false;
   };
 
   const verify = async (): Promise<boolean> => {
@@ -860,7 +953,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         const toolsToRun = missingTools.length > 0 ? missingTools : DYNAMIC_CHECK_ORDER.map((key) => CHECK_TO_TOOL[key]);
         const instruction = untouchedTemplate
           ? 'IMPLEMENT FIRST: write the missing backend routes and the frontend NOW. Do NOT re-run the checks until the implementation exists — they pass on the untouched template and prove nothing.'
-          : `Run only the missing tools now, in this exact order: ${toolsToRun.join(' → ')}. Do not declare the app finished until all six succeed on the current sources.`;
+          : `Recommended next step: run only the missing tools, in this order: ${toolsToRun.join(' → ')}. The order is a recommendation, not a cage — you may verify intermediate steps whenever it helps; receipts re-validate themselves. Do not declare the app finished until all six succeed on the current sources.`;
         lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). ${instruction}\n${diagnostics}`;
         criticalFailures.set('dynamicChecks', lastError);
         repairing = true;
@@ -871,8 +964,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
           stagnantRepairs = 0;
           lastProgressAt = Date.now();
         }
-        history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. ${lastError} repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled.` });
+        history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. ${lastError} repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before a stuck intervention fires.` });
         noteFailedVerification(`${lastError}\n${lastToolError ?? ''}`);
+        noteStagnation();
         emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, errorSignatureRepeats: repeatedErrorSignature, failedRepairVerifications, progressAware: true });
         return false;
       }
@@ -910,8 +1004,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       lastProgressAt = Date.now();
     }
     // Include actual diagnostics, not just "exit code 2", and keep JSON intact.
-    history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
+    history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before a stuck intervention fires. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
     noteFailedVerification([...criticalFailures.values()].join('\n') || lastError || 'unknown');
+    noteStagnation();
     emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, errorSignatureRepeats: repeatedErrorSignature, failedRepairVerifications, progressAware: true });
     return false;
   };
@@ -929,10 +1024,11 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
    * LLM calls (usage and time) but not as iterations or tool errors;
    * their usage is accounted here for the discarded responses, while the
    * surviving response is accounted by the caller as usual. If the last
-   * retry is still malformed, throws a fatal LlmError LLM_BAD_TOOL_ARGS
-   * so the run ends with that code instead of burning tool turns on
-   * identical `missing required argument` rejections (production run
-   * 3723178d died exactly that way).
+   * retry is still malformed, throws a fatal LlmError LLM_BAD_TOOL_ARGS;
+   * the loop routes it into the intervention ladder as a malformed-calls
+   * stuck signal (§4.2) instead of burning tool turns on identical
+   * `missing required argument` rejections (production run 3723178d died
+   * exactly that way under the old regime).
    */
   const requestCompletion = async (): Promise<LlmResponse> => {
     const defs = availableToolDefs();
@@ -998,9 +1094,6 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
 
     stats.iterations = iter;
-    if (repairing) {
-      if (stagnantRepairs >= maxStagnantRepairs) break;
-    }
     emit(db, runId, 'status', { phase: repairing ? 'repairing' : 'thinking', iteration: iter });
 
     let resp;
@@ -1010,14 +1103,19 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     } catch (e) {
       if (e instanceof LlmError && e.fatal) {
         // Persistent malformed tool calls: the completion retries inside
-        // requestCompletion are already exhausted, so the run ends here
-        // with the LLM error code (finishError accounts the error itself;
-        // the discarded completions were accounted by requestCompletion).
+        // requestCompletion are already exhausted. Flexibilidad agéntica
+        // (§4.2): even this no longer ends the run — it feeds the
+        // intervention ladder as a malformed-calls signal (the discarded
+        // completions were accounted by requestCompletion). The invariant
+        // stands untouched: no malformed call was executed or entered
+        // the canonical history.
         stats.llmMs += Date.now() - llmT0;
+        stats.errors++;
         lastError = e.message;
         emit(db, runId, 'log', { text: e.message });
-        finishError(e.message, e.code);
-        return;
+        recordStuckSignal('malformed-calls', e.message);
+        if (await processStuckSignal()) return;
+        continue;
       }
       if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
         stats.errors++;
@@ -1027,12 +1125,16 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         lastError = e.message;
         emit(db, runId, 'log', { text: e.message });
         if (malformedResponses >= 4) {
-          finishError(`${e.message}. Four consecutive invalid model responses; no file changes were made by those responses.`, e.code);
-          return;
+          // §4.2: four consecutive invalid responses raise a stuck
+          // signal instead of ending the run; the recovery below still
+          // runs, and the ladder decides what happens next.
+          recordStuckSignal('malformed-calls', `${e.message}. Four consecutive invalid model responses; no file changes were made by those responses.`);
+          malformedResponses = 0;
         }
         singleFileMode = true;
         history = compactRecoveryHistory(`${e.message}. The invalid response made no file changes.`);
         emit(db, runId, 'status', { phase: 'recovering_model', code: e.code, attempt: malformedResponses, strategy: 'single_file' });
+        if (await processStuckSignal()) return;
         if (iter >= limits.maxIterations) repairing = true;
         continue;
       }
@@ -1067,7 +1169,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         history.push({ role: 'user', content: lastError });
         if ((repairing || iter >= limits.maxIterations) && await verify()) return;
       } else if (await verify()) return;
-      if (await checkRepairAbort()) return;
+      if (await processStuckSignal()) return;
     }
 
     for (const tc of resp.toolCalls) {
@@ -1080,29 +1182,34 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         name: tc.name,
         content: JSON.stringify({ ...result, output: result.output?.slice(0, 16000) }),
       });
-      // Corte rápido: MAX_ARGUMENT_STREAK consecutive `missing required
-      // argument` rejections for the same tool mean the model keeps
-      // emitting calls this layer cannot fix (e.g. nested item shapes);
-      // stop instead of spending the run on identical rejections.
+      // Corte rápido (§4.2): MAX_ARGUMENT_STREAK consecutive `missing
+      // required argument` rejections for the same tool mean the model
+      // keeps emitting calls this layer cannot fix (e.g. nested item
+      // shapes). It no longer stops the run: it records an
+      // argument-stagnation signal, processed after this response's tool
+      // results are all in the history (so the directive never splits an
+      // assistant message from its tool results).
       argumentStreak = updateArgumentStreak(argumentStreak, tc.name, result.error);
       if (argumentStreak.count >= MAX_ARGUMENT_STREAK) {
-        await failRun(
-          `Tool ${tc.name} received calls without required arguments ${MAX_ARGUMENT_STREAK} times in a row (last rejection: ${result.error}). The model is emitting malformed calls for this tool; stopping instead of repeating identical rejections.`,
-          'TOOL_ARGUMENT_STAGNATION',
-          true,
+        recordStuckSignal(
+          'argument-stagnation',
+          `Tool ${tc.name} received calls without required arguments ${MAX_ARGUMENT_STREAK} times in a row (last rejection: ${result.error}). The model is emitting malformed calls for this tool.`,
         );
-        return;
+        argumentStreak = { tool: '', count: 0 };
       }
     }
+    if (await processStuckSignal()) return;
     // Repair turns must receive fresh compiler/browser diagnostics after each
     // response, not only after spending the entire repair reserve on patches.
     if ((!repairing && iter >= limits.maxIterations) || (repairing && resp.toolCalls.length > 0)) {
       if (await verify()) return;
-      if (await checkRepairAbort()) return;
-      if (stagnantRepairs >= maxStagnantRepairs) break;
+      if (await processStuckSignal()) return;
     }
   }
 
+  // Defensive exit: the loop above returns on every termination path
+  // (facts and the ladder); this remains so a future `break` can never
+  // leave a run unfinished.
   await failRun(`${t('repairLimit')}\n\n${lastError ?? t('maxIterations')}`, 'REPAIR_LIMIT', true);
 }
 
@@ -1117,7 +1224,7 @@ const ES: Record<string, string> = {
   tokenBudget: 'La ejecución alcanzó el techo de tokens por run y se detuvo. Los archivos generados se conservan; puedes continuar desde este estado.',
   llmFailed: 'Fallo la llamada al modelo',
   emptySummary: 'Trabajo terminado.',
-  loopDetected: 'Detecté que el agente repetía la misma operación sin avanzar y lo detuve. Los archivos generados se conservan; puedes continuar desde este estado.',
+  loopExhausted: 'Detecté que el agente seguía atascado tras tres intervenciones de cambio de estrategia y detuve la ejecución. Los archivos generados se conservan; puedes continuar desde este estado.',
   repairLimit: 'La verificación sigue fallando después de la fase automática de reparación. Los archivos se conservan. Diagnóstico:',
   maxIterations: 'Se alcanzó el máximo de iteraciones sin completar el trabajo. Los archivos generados se conservan; puedes continuar desde este estado.',
   unverifiedCompletion: 'El agente intentó terminar sin un build y una preview verificados.',
@@ -1135,7 +1242,7 @@ const EN: Record<string, string> = {
   tokenBudget: 'The run reached its per-run token ceiling and was stopped. Generated files are preserved; you can continue from this state.',
   llmFailed: 'Model call failed',
   emptySummary: 'Work finished.',
-  loopDetected: 'I detected the agent repeating the same operation without progress and stopped it. Generated files are preserved; you can continue from this state.',
+  loopExhausted: 'I detected the agent was still stuck after three strategy-change interventions and stopped the run. Generated files are preserved; you can continue from this state.',
   repairLimit: 'Verification still fails after the automatic repair phase. Files are preserved. Diagnosis:',
   maxIterations: 'Reached the maximum number of iterations without completing the work. Generated files are preserved; you can continue from this state.',
   unverifiedCompletion: 'The agent tried to finish without a verified build and preview.',

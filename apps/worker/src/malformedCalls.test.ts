@@ -11,13 +11,17 @@
  *  (a) a completion whose read_file arrives with raw empty arguments is
  *      NOT executed; the loop retries the completion with a temporary
  *      notice naming the tool/parameter, and the run then proceeds.
- *  (b) persistently empty arguments end the run with LLM_BAD_TOOL_ARGS
- *      after exactly 1 + 2 completions and zero tool executions.
+ *  (b) flexibilidad agéntica: persistently empty arguments no longer end
+ *      the run at the first fatal — each exhausted completion round feeds
+ *      the intervention ladder as a malformed-calls signal, and only the
+ *      third signal ends the run (LOOP_EXHAUSTED), still with zero tool
+ *      executions.
  *  (c) a wrong-key emission (read_file {file}) takes the same retry path
  *      via the required-parameter detection.
  *  (d) corte rápido: three consecutive `missing required argument` tool
  *      results for the same tool (a shape the retry layer cannot see —
- *      nested write_files items) abort with TOOL_ARGUMENT_STAGNATION.
+ *      nested write_files items) raise an argument-stagnation stuck
+ *      signal; the run continues.
  */
 import { beforeAll, afterAll, beforeEach, expect, it, vi, describe } from 'vitest';
 import fs from 'node:fs';
@@ -308,21 +312,26 @@ describe('malformed tool calls in the agent loop', () => {
     } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
   }, 240000);
 
-  it('(b) persistent empty arguments end the run with LLM_BAD_TOOL_ARGS after 1+2 completions and zero executions', async () => {
+  it('(b) persistent empty arguments climb the ladder: three fatal rounds end the run as LOOP_EXHAUSTED, zero executions', async () => {
     const runId = setupRun(makeGateProject());
     model.mockImplementation(async () => malformedCall('read_file'));
     await runAgentOnce(db, runId, { dataDir, settings });
-    expect(model).toHaveBeenCalledTimes(3);
+    // Each loop iteration burns 1 + 2 completions, throws the fatal, and
+    // the ladder turns it into a signal; the third signal ends the run.
+    expect(model).toHaveBeenCalledTimes(9);
     const row = runRow(runId);
     expect(row.status).toBe('error');
     expect(row.error).toContain('read_file');
     expect(row.error).toContain('path');
     const errorEvents = eventPayloads(runId, 'error');
     expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]!.code).toBe('LLM_BAD_TOOL_ARGS');
+    expect(errorEvents[0]!.code).toBe('LOOP_EXHAUSTED');
     expect(toolCallCount(runId, 'read_file')).toBe(0);
-    // Every completion (initial + 2 retries) counted as an LLM call.
-    expect((JSON.parse(row.stats_json) as { llmCalls: number }).llmCalls).toBe(3);
+    // Every discarded completion (3 per round × 3 rounds) counted as an LLM call.
+    expect((JSON.parse(row.stats_json) as { llmCalls: number }).llmCalls).toBe(9);
+    const signals = eventPayloads(runId, 'status').filter((p) => p.phase === 'stuck_signal');
+    expect(signals.map((s) => s.level)).toEqual([1, 2, 3]);
+    expect(signals.every((s) => s.kind === 'malformed-calls')).toBe(true);
     db.close();
   }, 60000);
 
@@ -347,26 +356,33 @@ describe('malformed tool calls in the agent loop', () => {
     } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
   }, 240000);
 
-  it('(d) aborts with TOOL_ARGUMENT_STAGNATION after 3 consecutive missing-argument rejections for the same tool', async () => {
-    const runId = setupRun(makeGateProject());
-    // write_files whose single item lacks `content`: top-level `files` is
-    // present, so the completion-retry layer cannot see it — the tool
-    // itself rejects with `missing required argument: content`.
-    script([
-      toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
-      toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
-      toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
-      toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
-    ]);
-    await runAgentOnce(db, runId, { dataDir, settings });
-    expect(model).toHaveBeenCalledTimes(3);
-    expect(runRow(runId).status).toBe('error');
-    const errorEvents = eventPayloads(runId, 'error');
-    expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]!.code).toBe('TOOL_ARGUMENT_STAGNATION');
-    expect(toolCallCount(runId, 'write_files')).toBe(3);
-    db.close();
-  }, 60000);
+  it('(d) 3 consecutive missing-argument rejections raise an argument-stagnation signal and the run continues to done', async () => {
+    const fixture = makeTemplatedProject();
+    stubTemplatesFrom(fixture);
+    const runId = setupRun(fixture);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      // write_files whose single item lacks `content`: top-level `files` is
+      // present, so the completion-retry layer cannot see it — the tool
+      // itself rejects with `missing required argument: content`.
+      script([
+        toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
+        toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
+        toolCall('write_files', { files: [{ path: 'src/App.tsx' }] }),
+        ...happyTail,
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runRow(runId).status).toBe('done');
+      const signals = eventPayloads(runId, 'status').filter((p) => p.phase === 'stuck_signal');
+      expect(signals).toHaveLength(1);
+      expect(signals[0]!.kind).toBe('argument-stagnation');
+      expect(signals[0]!.level).toBe(1);
+      expect(eventPayloads(runId, 'error')).toHaveLength(0);
+      // 3 rejected + 2 well-formed in the happy tail.
+      expect(toolCallCount(runId, 'write_files')).toBe(5);
+    } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
+  }, 240000);
 });
 
 describe('updateArgumentStreak', () => {

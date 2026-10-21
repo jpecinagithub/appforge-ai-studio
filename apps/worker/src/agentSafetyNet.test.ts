@@ -217,8 +217,8 @@ const BAD_APP = 'export default function App(){return <h1>BROKEN v2</h1>}';
  * The shared "advance then degrade" script: write a good file, pass
  * frontendBuild + backendBuild (two automatic photos), then degrade the
  * sources (overwrite + a brand-new junk file) and keep trying to finish —
- * the identical gate diagnostic trips the Fase 1 signature breaker
- * (REPAIR_LIMIT) after 3 failed verifications.
+ * the identical gate diagnostic feeds the intervention ladder, which
+ * ends the run as LOOP_EXHAUSTED after three signals without progress.
  */
 async function runAdvanceAndDegrade(): Promise<{ runId: string; projectId: string; projectOnDisk: string }> {
   const ctx = setupRun(makeGateProject());
@@ -297,6 +297,27 @@ describe('Fase 2 safety net', () => {
     expect(eventPhases(runId)).not.toContain('restored_best');
     expect(error ?? '').toMatch(/No earlier state was restored/);
     expect(fs.readFileSync(path.join(projectOnDisk, 'frontend', 'src', 'App.tsx'), 'utf8')).toBe(BAD_APP);
+    db.close();
+  }, 180000);
+
+  it('escalera agotada: tres señales sin progreso cierran con LOOP_EXHAUSTED y restauran la mejor foto', async () => {
+    const { runId, projectOnDisk } = await runAdvanceAndDegrade();
+    const { status, error } = runStatus(runId);
+    expect(status).toBe('error');
+    const errorEvents = (db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='error'").all(runId) as Array<{ payload_json: string }>)
+      .map((r) => JSON.parse(r.payload_json) as { code?: string });
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]!.code).toBe('LOOP_EXHAUSTED');
+    // The final message enumerates the three interventions and the restore.
+    expect(error ?? '').toContain('Three stuck interventions fired without progress between them');
+    expect(error ?? '').toContain('1. [repeated-signature]');
+    expect(error ?? '').toContain('3. [');
+    expect(error ?? '').toMatch(/Restored to the best state reached in this run: after backendBuild \(2\/6 checks valid/);
+    const signals = (db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='status'").all(runId) as Array<{ payload_json: string }>)
+      .map((r) => JSON.parse(r.payload_json) as { phase?: string; level?: number })
+      .filter((p) => p.phase === 'stuck_signal');
+    expect(signals.map((s) => s.level)).toEqual([1, 2, 3]);
+    expect(fs.readFileSync(path.join(projectOnDisk, 'frontend', 'src', 'App.tsx'), 'utf8')).toBe(GOOD_APP);
     db.close();
   }, 180000);
 
