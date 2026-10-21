@@ -470,6 +470,11 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   let lastErrorSignature = '';
   let repeatedErrorSignature = 0;
   let repairAbortMessage: string | null = null;
+  // Progress snapshot taken at each failed verification (valid dynamic
+  // prefix length + source fingerprint). The maxRepairAttempts budget only
+  // counts a failed verification when this key did NOT move since the
+  // previous one — see noteFailedVerification.
+  let lastVerificationProgressKey: string | null = null;
   const initialFingerprint = sourceFingerprint(frontendDir);
   const initialProjectFingerprint = sourceFingerprint(projectDir);
   const isFirstRun = (db.prepare('SELECT COUNT(*) AS n FROM runs WHERE project_id=? AND id<>?').get(project.id, runId) as { n: number }).n === 0;
@@ -656,18 +661,41 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   };
 
   /**
+   * What "progress" means between two failed verifications, composed from
+   * state the gate already maintains: the length of the valid dynamic
+   * check prefix (derived from the receipt fingerprints) plus the source
+   * fingerprint of the root perform() already watches. Either one moving
+   * means the repair is advancing, even if the gate still does not close.
+   */
+  const verificationProgressKey = (): string => {
+    const prefix = isDynamicProject ? validDynamicPrefixLength(ctx) : 0;
+    const fingerprint = sourceFingerprint(isDynamicProject ? projectDir : frontendDir);
+    return `${prefix}|${fingerprint}`;
+  };
+
+  /**
    * Fase 1: account for one FAILED verification. Two independent circuit
    * breakers live here (the fingerprint-based stagnation counter remains
    * as a third net, inside verify()):
    *  - identical diagnostic signature MAX_REPEATED_ERROR_SIGNATURE times
    *    in a row → the repair is going in circles even though files change;
-   *  - more than limits.maxRepairAttempts failed repair verifications in
-   *    total → the repair budget is exhausted even if errors keep varying.
+   *  - more than limits.maxRepairAttempts failed repair verifications
+   *    WITHOUT PROGRESS in total → the repair budget is exhausted even if
+   *    errors keep varying. A verification whose progress key moved since
+   *    the previous one (valid prefix grew, or any source fingerprint
+   *    changed) does NOT consume budget: the old unconditional count
+   *    killed a live run one tool call from success after it re-passed
+   *    five checks in green, because every verify() summed (run 6ad56917).
+   *    The signature breaker above is deliberately NOT progress-aware —
+   *    a loop that keeps producing the same diagnostic still dies at 3.
    * Tripping only RECORDS the abort; the loop performs it (checkRepairAbort)
    * so verify() keeps its boolean contract for every caller.
    */
   const noteFailedVerification = (diagnostic: string): void => {
-    failedRepairVerifications++;
+    const progressKey = verificationProgressKey();
+    const progressed = lastVerificationProgressKey !== null && progressKey !== lastVerificationProgressKey;
+    lastVerificationProgressKey = progressKey;
+    if (!progressed) failedRepairVerifications++;
     const signature = repairErrorSignature(diagnostic);
     if (signature && signature === lastErrorSignature) repeatedErrorSignature++;
     else {
@@ -806,9 +834,26 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         const diagnostics = [...criticalFailures.entries()].filter(([key]) => key !== 'dynamicChecks').map(([, value]) => value).join('\n').slice(0, 12000);
         // When the gap is implementation, ordering the model to re-run the
         // checks teaches it to loop on verification; order it to build.
+        // Otherwise name ONLY the tools for the checks that are actually
+        // missing or stale, in canonical order: ordering the full chain
+        // made the model burn repair turns re-proving green checks. When
+        // nothing is missing but the recorded order is invalid, the whole
+        // chain in canonical order IS the missing work, so list it all.
+        const CHECK_TO_TOOL: Record<DynamicCheckKey, string> = {
+          frontendBuild: 'run_frontend_build',
+          backendBuild: 'run_backend_build',
+          migrations: 'run_migrations',
+          apiTests: 'run_api_tests',
+          fullstackPreview: 'start_fullstack_preview',
+          authenticatedFlow: 'test_authenticated_flow',
+        };
+        const missingTools = DYNAMIC_CHECK_ORDER
+          .filter((key) => gate.missing.includes(key))
+          .map((key) => CHECK_TO_TOOL[key]);
+        const toolsToRun = missingTools.length > 0 ? missingTools : DYNAMIC_CHECK_ORDER.map((key) => CHECK_TO_TOOL[key]);
         const instruction = untouchedTemplate
           ? 'IMPLEMENT FIRST: write the missing backend routes and the frontend NOW. Do NOT re-run the checks until the implementation exists — they pass on the untouched template and prove nothing.'
-          : 'Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.';
+          : `Run only the missing tools now, in this exact order: ${toolsToRun.join(' → ')}. Do not declare the app finished until all six succeed on the current sources.`;
         lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). ${instruction}\n${diagnostics}`;
         criticalFailures.set('dynamicChecks', lastError);
         repairing = true;

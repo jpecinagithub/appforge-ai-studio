@@ -32,6 +32,13 @@ const MIME: Record<string, string> = {
 // part of the auth flow and must not fail it — but when the check does fail,
 // they are reported so the agent can see e.g. an `HTTP 500 POST .../api/...`
 // instead of patching blind.
+//
+// Images are asserted TWICE: on the first screen (before the steps) and again
+// after the steps, on the final screen, after a full scroll + settle so lazy
+// images load. The first screen of the authenticated flow is the login form
+// (no data), so a post-login catalog full of broken images used to verify
+// green; the post-steps assertion is what catches it, and its failure
+// snapshot shows that final screen.
 // ---------------------------------------------------------------------------
 
 /** Resource types whose failures were already fatal before this change. */
@@ -341,6 +348,10 @@ export async function checkBrowser(
         })
         : null;
       await runSteps(page!, steps, (f) => { failedStep = f; });
+      // Post-steps: re-assert images on the FINAL screen (after the mobile
+      // viewport pass below there is a third check); errors collected during
+      // the steps are judged by the hasHardErrors gate further down.
+      await assertImagesLoadedAfterSteps(page!);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       // Capture accessible controls as feedback for the agent's next interaction test.
       const snapshot = (await page!.locator('body').ariaSnapshot()).slice(0, 8000);
@@ -406,6 +417,12 @@ export async function checkBrowserAtUrl(
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       await assertImagesLoaded(page!);
       await runSteps(page!, steps, (f) => { failedStep = f; });
+      // Post-steps: re-assert images on the FINAL screen — in the
+      // authenticated flow that is the post-login content, which the
+      // pre-steps check (login screen) cannot see. Page errors collected
+      // during the steps are judged by the hasHardErrors gate just below,
+      // and the failure snapshot is taken from this same final screen.
+      await assertImagesLoadedAfterSteps(page!);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       const snapshot = (await page!.locator('body').ariaSnapshot()).slice(0, 8000);
       if (hasHardErrors(diag)) throw new CollectedPageErrors();
@@ -436,6 +453,48 @@ async function assertImagesLoaded(page: Page): Promise<void> {
     const detail = broken.slice(0, 8).map((image) => `${image.alt || '(no alt)'}: ${image.src}`).join('\n');
     throw new Error(`Broken images detected:\n${detail}`);
   }
+}
+
+/**
+ * Scroll the whole page top to bottom (and back) so lazy-loaded content —
+ * above all images — is triggered, then wait a short settle. Best effort:
+ * a page mid-navigation may reject the evaluate; the image assertion that
+ * follows still runs and judges whatever state the page is in.
+ */
+async function scrollThroughPage(page: Page): Promise<void> {
+  try {
+    await page.evaluate(async () => {
+      // Runs in the page; the worker tsconfig has no DOM lib, so reach the
+      // globals through globalThis with minimal local typings.
+      const g = globalThis as unknown as {
+        document: { documentElement: { scrollHeight: number } };
+        innerHeight: number;
+        scrollTo: (x: number, y: number) => void;
+      };
+      const height = g.document.documentElement.scrollHeight;
+      const step = Math.max(240, g.innerHeight);
+      for (let y = step; y < height; y += step) {
+        g.scrollTo(0, y);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      g.scrollTo(0, height);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      g.scrollTo(0, 0);
+    });
+  } catch {
+    /* page may be navigating; ignore and let the image check judge */
+  }
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Post-steps image assertion, shared by checkBrowser and checkBrowserAtUrl:
+ * scroll so lazy images load, settle briefly, then apply the exact same
+ * broken-image criterion as the pre-steps check — but on the final screen.
+ */
+async function assertImagesLoadedAfterSteps(page: Page): Promise<void> {
+  await scrollThroughPage(page);
+  await assertImagesLoaded(page);
 }
 
 async function browserStep(page: Page, step: BrowserStep): Promise<void> {

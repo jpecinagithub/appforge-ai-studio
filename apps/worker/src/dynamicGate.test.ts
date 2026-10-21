@@ -509,21 +509,78 @@ describe('dynamic completion gate', () => {
     db.close();
   }, 180000);
 
-  it('Fase 1: maxRepairAttempts stops repair when failed verifications keep changing', async () => {
+  it('repair budget is progress-aware: verifications after edits or prefix growth do not consume maxRepairAttempts', async () => {
     const runId = setupRun(makeGateProject());
-    script([
-      toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v1</h1>}' }] }),
-      final('Done.'), // verify #1 fails: all six checks missing (signature A)
-      toolCall('run_frontend_build'), // succeeds; verify #2 fails: five missing (signature B)
-      toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }), // invalidates frontendBuild; verify #3 fails (signature A) — 3 > maxRepairAttempts=2
-    ]);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
+        toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v1</h1>}' }] }),
+        final('Done.'), // verify #1 fails: all six missing — the only verification that consumes budget
+        toolCall('run_frontend_build'), // verify #2 fails, but the valid prefix grew 0→1: no budget consumed
+        toolCall('write_files', { files: [{ path: 'src/App.tsx', content: 'export default function App(){return <h1>v2</h1>}' }] }), // verify #3 fails, but the sources changed: no budget consumed
+        // Every intermediate verification from here fails too, each with a
+        // longer valid prefix — 8 failed verifications in total against
+        // maxRepairAttempts=2. The old unconditional counter aborted this
+        // exact shape one call from success (live run 6ad56917).
+        ...SIX_CHECKS.map((n) => toolCall(n)),
+        final('All checks green now.'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxRepairAttempts: 2 } });
+      const { status, error } = runStatus(runId);
+      expect(status).toBe('done');
+      expect(error).toBeNull();
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+    }
+    db.close();
+  }, 240000);
+
+  it('a repair loop with no progress still aborts on the repeated signature (breakers unchanged)', async () => {
+    const runId = setupRun(makeGateProject());
+    let n = 0;
+    model.mockImplementation(async () => {
+      n++;
+      // One real edit so the loop reaches verify(); after that, pure finish
+      // attempts — no edits, no checks, the progress key never moves and
+      // the diagnostic never changes.
+      if (n === 1) return toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' });
+      return final('Done.');
+    });
     await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxRepairAttempts: 2 } });
     const { status, error } = runStatus(runId);
     expect(status).toBe('error');
-    expect(error ?? '').toMatch(/failed verification attempts \(maxRepairAttempts=2\)/);
-    expect(error ?? '').not.toMatch(/repeated 3 times/);
+    expect(error ?? '').toMatch(/repeated 3 times in a row/);
     db.close();
   }, 180000);
+
+  it('verify diagnostic names only the missing tool when a single check remains', async () => {
+    const runId = setupRun(makeGateProject());
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
+        // Five of the six checks in canonical order: only authenticatedFlow remains.
+        ...SIX_CHECKS.slice(0, 5).map((n) => toolCall(n)),
+        final('Done.'), // verify fails, naming only test_authenticated_flow
+        final('Done.'),
+        final('Done.'), // the signature repeats a third time; the abort embeds the diagnostic
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      const { status, error } = runStatus(runId);
+      expect(status).toBe('error');
+      expect(error ?? '').toContain('missing or stale checks: authenticatedFlow');
+      expect(error ?? '').toContain('Run only the missing tools now, in this exact order: test_authenticated_flow.');
+      expect(error ?? '').not.toContain('run_frontend_build → run_backend_build');
+    } finally {
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+    }
+    db.close();
+  }, 240000);
 
   it('blocks finishing with only the four 5A checks (5B not done)', async () => {
     const runId = setupRun(makeGateProject());

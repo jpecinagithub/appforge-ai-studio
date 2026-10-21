@@ -105,6 +105,86 @@ it('failure diagnostic lists /api/ network failures, not just static resources',
   } finally { await srv.close(); }
 });
 
+it('fails when a step reveals a broken or empty image (post-steps assertion sees the final screen)', async () => {
+  // The login/first screen has no images at all: the pre-steps assertion
+  // passes. Only after the click does the (post-login) catalog render its
+  // product photos — broken and empty — which is exactly the pcBOX shape
+  // that used to verify green.
+  const srv = await servePage(`<!doctype html><html><head><title>Post Steps Shop</title></head><body>
+    <h1>Sign in</h1>
+    <button data-testid="show-products">Show products</button>
+    <div id="slot"></div>
+    <script>
+      document.querySelector('[data-testid="show-products"]').addEventListener('click', () => {
+        document.getElementById('slot').innerHTML =
+          '<p>Products loaded</p>' +
+          '<img src="/missing-product.jpg" alt="Broken product photo">' +
+          '<img src="" alt="Empty product photo">';
+      });
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="show-products"]' },
+      { action: 'expect_text', value: 'Products loaded' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('Broken images detected');
+    expect(error).toContain('Broken product photo');
+    expect(error).toContain('Empty product photo');
+  } finally { await srv.close(); }
+});
+
+it('passes when the image revealed by a step is healthy', async () => {
+  const srv = await servePage(`<!doctype html><html><head><title>Healthy Shop</title></head><body>
+    <h1>Sign in</h1>
+    <button data-testid="show-products">Show products</button>
+    <div id="slot"></div>
+    <script>
+      document.querySelector('[data-testid="show-products"]').addEventListener('click', () => {
+        document.getElementById('slot').innerHTML =
+          '<p>Products loaded</p>' +
+          '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" alt="Healthy product photo">';
+      });
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="show-products"]' },
+      { action: 'expect_text', value: 'Products loaded' },
+    ], 30000);
+    expect(result.ok).toBe(true);
+    expect(result.output ?? '').not.toContain('Broken images');
+  } finally { await srv.close(); }
+});
+
+it('fails with a page error thrown only after an interaction, snapshotting the final screen', async () => {
+  const srv = await servePage(`<!doctype html><html><head><title>Boom Shop</title></head><body>
+    <h1>Interactive shop</h1>
+    <button data-testid="explode">Load</button>
+    <p id="marker">Before click</p>
+    <script>
+      document.querySelector('[data-testid="explode"]').addEventListener('click', () => {
+        document.getElementById('marker').textContent = 'Final screen after click';
+        throw new Error('boom after click');
+      });
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="explode"]' },
+      { action: 'expect_text', value: 'Final screen after click' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('PAGE ERRORS:');
+    expect(error).toContain('boom after click');
+    // The failure snapshot reflects the FINAL screen, not the initial one.
+    expect(error).toContain('Final screen after click');
+  } finally { await srv.close(); }
+});
+
 it('a passing flow carries no failure diagnostic block', async () => {
   const srv = await servePage(`<!doctype html><html><head><title>Ok Shop</title></head><body>
     <h1>Welcome</h1>
