@@ -14,6 +14,39 @@ export interface SseHandlers {
   onClose: () => void;
 }
 
+/** Líneas `id:`/`event:`/`data:` de un bloque SSE (sin el separador `\n\n`). */
+export interface ParsedSseBlock {
+  id: string;
+  kind: string;
+  dataLines: string[];
+}
+
+/** Parseo puro de un bloque SSE; las líneas `:` (p. ej. `:ping`) se ignoran. */
+export function parseSseBlock(block: string): ParsedSseBlock {
+  const parsed: ParsedSseBlock = { id: '', kind: '', dataLines: [] };
+  for (const line of block.split('\n')) {
+    if (line.startsWith(':')) continue; // :ping
+    else if (line.startsWith('id:')) parsed.id = line.slice(3).trim();
+    else if (line.startsWith('event:')) parsed.kind = line.slice(6).trim();
+    else if (line.startsWith('data:')) parsed.dataLines.push(line.slice(5).replace(/^\s/, ''));
+  }
+  return parsed;
+}
+
+/** Convierte un bloque SSE en StreamEvent; null si el bloque no lleva evento. */
+export function sseBlockToEvent(block: string): StreamEvent | null {
+  const { id, kind, dataLines } = parseSseBlock(block);
+  if (kind === '' && dataLines.length === 0) return null;
+  const raw = dataLines.join('\n');
+  let data: unknown = raw;
+  try {
+    data = raw ? (JSON.parse(raw) as unknown) : null;
+  } catch {
+    /* deja el texto tal cual */
+  }
+  return { seq: Number(id) || 0, kind: (kind || 'message') as RunEventKind, data };
+}
+
 /**
  * Suscripción a GET /api/runs/:runId/events (SSE).
  * Usa fetch+stream para poder enviar el header Authorization (EventSource no lo permite).
@@ -62,26 +95,13 @@ async function runStream(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  let evId = '';
-  let evKind = '';
-  let dataLines: string[] = [];
   let finished = false;
 
-  const dispatch = () => {
-    if (evKind === '' && dataLines.length === 0) return;
-    const kind = (evKind || 'message') as RunEventKind;
-    const raw = dataLines.join('\n');
-    let data: unknown = raw;
-    try {
-      data = raw ? (JSON.parse(raw) as unknown) : null;
-    } catch {
-      /* deja el texto tal cual */
-    }
-    handlers.onEvent({ seq: Number(evId) || 0, kind, data });
-    evId = '';
-    evKind = '';
-    dataLines = [];
-    if (kind === 'done' || kind === 'error') {
+  const dispatchBlock = (block: string) => {
+    const ev = sseBlockToEvent(block);
+    if (!ev) return;
+    handlers.onEvent(ev);
+    if (ev.kind === 'done' || ev.kind === 'error') {
       finished = true;
       void reader.cancel();
     }
@@ -96,18 +116,20 @@ async function runStream(
       while ((idx = buf.indexOf('\n\n')) >= 0) {
         const block = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
-        for (const line of block.split('\n')) {
-          if (line.startsWith(':')) continue; // :ping
-          else if (line.startsWith('id:')) evId = line.slice(3).trim();
-          else if (line.startsWith('event:')) evKind = line.slice(6).trim();
-          else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^\s/, ''));
-        }
-        dispatch();
+        dispatchBlock(block);
         if (finished) break;
       }
     }
   } catch (e) {
     if (!signal.aborted && !finished) handlers.onError(e instanceof Error ? e : new Error(String(e)));
+  }
+  // Flush del bloque final: si el servidor cierra el stream justo tras el
+  // evento terminal y el último bloque quedó en el buffer sin su `\n\n`,
+  // despáchalo antes de onClose o ese evento (done/error) se perdería.
+  if (!finished) {
+    buf += decoder.decode().replace(/\r\n/g, '\n');
+    if (buf.trim() !== '') dispatchBlock(buf);
+    buf = '';
   }
   handlers.onClose();
 }

@@ -1933,7 +1933,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     const body = SettingsPatch.parse(req.body);
     const stored = ensureSettingsRow(db);
     const next: StoredSettings = { ...stored };
-    for (const k of ['provider', 'model', 'temperature', 'maxTokens', 'maxIterations', 'llmTimeoutMs', 'cmdTimeoutMs', 'runTimeoutMs', 'language', 'theme', 'autoRevision', 'autoBuild'] as const) {
+    for (const k of ['provider', 'model', 'temperature', 'maxTokens', 'maxIterations', 'maxHardIterations', 'maxRepairAttempts', 'llmTimeoutMs', 'cmdTimeoutMs', 'runTimeoutMs', 'language', 'theme', 'autoRevision', 'autoBuild'] as const) {
       const v = (body as Record<string, unknown>)[k];
       if (v !== undefined) (next as unknown as Record<string, unknown>)[k] = v;
     }

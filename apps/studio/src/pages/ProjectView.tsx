@@ -43,10 +43,15 @@ export function ProjectView() {
   const [error, setError] = useState<unknown>(null);
   const unsubRef = useRef<(() => void) | null>(null);
   const projectIdRef = useRef<string | null>(null);
+  /** Run ya finalizado: guarda de idempotencia compartida por onEvent/onError/onClose. */
+  const finalizedRunRef = useRef<string | null>(null);
+  /** Run de la suscripción SSE vigente; un onClose tardío de una suscripción abortada no debe actuar. */
+  const subscribedRunRef = useRef<string | null>(null);
 
   const stopSubscription = useCallback(() => {
     unsubRef.current?.();
     unsubRef.current = null;
+    subscribedRunRef.current = null;
   }, []);
 
   const reloadMessages = useCallback(async () => {
@@ -58,11 +63,18 @@ export function ProjectView() {
   const finalizeRun = useCallback(
     async (runId: string) => {
       if (!id) return;
+      // Aplica el estado del run en cuanto se conoce: si el refresco del
+      // proyecto falla o tarda, la UI no debe quedarse en 'running' con el
+      // run ya terminal (spinner «Corrigiendo…» colgado).
       try {
         const final = await api.getRun(runId);
+        if (projectIdRef.current === id) setActiveRun(final);
+      } catch {
+        /* conserva el último estado conocido */
+      }
+      try {
         const updated = await api.getProject(id);
         if (projectIdRef.current === id) {
-          setActiveRun(final);
           setProjectState(updated);
           setProject(updated);
         }
@@ -83,10 +95,22 @@ export function ProjectView() {
     [id, reloadMessages, setRunStatus, setProject],
   );
 
+  /** Finaliza un run como mucho una vez, lo pida onEvent, onError u onClose. */
+  const finalizeOnce = useCallback(
+    (runId: string) => {
+      if (finalizedRunRef.current === runId) return;
+      finalizedRunRef.current = runId;
+      void finalizeRun(runId);
+    },
+    [finalizeRun],
+  );
+
   const subscribe = useCallback(
     (run: Run) => {
       if (!id) return;
       stopSubscription();
+      subscribedRunRef.current = run.id;
+      finalizedRunRef.current = null;
       setEvents([]);
       unsubRef.current = subscribeRunEvents(run.id, {
         onEvent: (ev) => {
@@ -94,19 +118,23 @@ export function ProjectView() {
           setEvents((prev) => [...prev, ev]);
           if (ev.kind === 'done' || ev.kind === 'error') {
             stopSubscription();
-            void finalizeRun(run.id);
+            finalizeOnce(run.id);
           }
         },
         onError: () => {
           /* el stream se cierra; el estado final se recupera con getRun */
-          if (projectIdRef.current === id) void finalizeRun(run.id);
+          if (projectIdRef.current === id) finalizeOnce(run.id);
         },
         onClose: () => {
-          /* noop: done/error ya finalizan */
+          /* Red de seguridad: si el stream muere sin evento terminal,
+             recupera el estado final. finalizeOnce lo hace idempotente y
+             la guarda de suscripción vigente evita que un onClose tardío
+             de una suscripción abortada pise el estado de un run nuevo. */
+          if (subscribedRunRef.current === run.id) finalizeOnce(run.id);
         },
       });
     },
-    [id, stopSubscription, finalizeRun],
+    [id, stopSubscription, finalizeOnce],
   );
 
   const sendPrompt = useCallback(
