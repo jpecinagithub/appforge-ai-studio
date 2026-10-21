@@ -309,7 +309,7 @@ describe('dynamic completion gate', () => {
     fs.mkdirSync(path.join(fixture, 'backend', 'src', 'routes'), { recursive: true });
     fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'App.tsx'), 'export default function App(){return null}');
     fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'api.ts'), 'export const api={};');
-    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'server.ts'), 'export const app={};');
+    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'server.ts'), "import todos from './routes/todos.js';\nimport users from './routes/users.js';\nexport const app = {};");
     fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'todos.ts'), "export default async function todos(app:any){ app.get('/api/todos', async()=>[]); }");
     fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'users.ts'), "export default async function users(app:any){ app.get('/api/users', async()=>[]); }");
     return fixture;
@@ -351,6 +351,7 @@ describe('dynamic completion gate', () => {
       script([
         ...SIX_CHECKS.map(n => toolCall(n)),
         toolCall('write_files', { area: 'backend', files: [{ path: 'src/routes/products.ts', content: "export default async function products(app:any){ app.get('/api/products', async()=>[]); }" }] }),
+        toolCall('write_files', { area: 'backend', files: [{ path: 'src/server.ts', content: "import todos from './routes/todos.js';\nimport users from './routes/users.js';\nimport products from './routes/products.js';\nexport const app = {};" }] }),
         toolCall('write_files', { area: 'frontend', files: [{ path: 'src/App.tsx', content: 'export default function App(){ return <div>STORE</div>; }' }] }),
         ...SIX_CHECKS.map(n => toolCall(n)),
         final('Store built'),
@@ -372,6 +373,7 @@ describe('dynamic completion gate', () => {
     try {
       script([
         toolCall('write_files', { area: 'backend', files: [{ path: 'src/routes/products.ts', content: "import { sendError } from '../lib/errors.js';\nexport default async function products(app:any, db:any){\n  app.post('/api/cart', async (req:any, reply:any) => { const tx = db.transaction(() => 1); tx(); return sendError(reply, 'INSUFFICIENT_STOCK', 'Not enough stock.'); });\n}" }] }),
+        toolCall('write_files', { area: 'backend', files: [{ path: 'src/server.ts', content: "import todos from './routes/todos.js';\nimport users from './routes/users.js';\nimport products from './routes/products.js';\nexport const app = {};" }] }),
         toolCall('write_files', { area: 'frontend', files: [{ path: 'src/App.tsx', content: 'export default function App(){ return <div>STORE</div>; }' }] }),
         ...SIX_CHECKS.map(n => toolCall(n)),
         final('Store built'),

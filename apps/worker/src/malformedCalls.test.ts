@@ -133,7 +133,7 @@ function makeTemplatedProject(): string {
   fs.mkdirSync(path.join(fixture, 'backend', 'src', 'routes'), { recursive: true });
   fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'App.tsx'), 'export default function App(){return null}');
   fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'api.ts'), 'export const api={};');
-  fs.writeFileSync(path.join(fixture, 'backend', 'src', 'server.ts'), 'export const app={};');
+  fs.writeFileSync(path.join(fixture, 'backend', 'src', 'server.ts'), "import todos from './routes/todos.js';\nimport users from './routes/users.js';\nexport const app = {};");
   fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'todos.ts'), "export default async function todos(app:any){ app.get('/api/todos', async()=>[]); }");
   fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'users.ts'), "export default async function users(app:any){ app.get('/api/users', async()=>[]); }");
   return fixture;
@@ -274,6 +274,7 @@ const SIX_CHECKS = [
 const happyTail: LlmResponse[] = [
   ...SIX_CHECKS.map((n) => toolCall(n)),
   toolCall('write_files', { area: 'backend', files: [{ path: 'src/routes/products.ts', content: "export default async function products(app:any){ app.get('/api/products', async()=>[]); }" }] }),
+  toolCall('write_files', { area: 'backend', files: [{ path: 'src/server.ts', content: "import todos from './routes/todos.js';\nimport users from './routes/users.js';\nimport products from './routes/products.js';\nexport const app = {};" }] }),
   toolCall('write_files', { area: 'frontend', files: [{ path: 'src/App.tsx', content: 'export default function App(){ return <div>STORE</div>; }' }] }),
   ...SIX_CHECKS.map((n) => toolCall(n)),
   final('Store built'),
@@ -379,8 +380,9 @@ describe('malformed tool calls in the agent loop', () => {
       expect(signals[0]!.kind).toBe('argument-stagnation');
       expect(signals[0]!.level).toBe(1);
       expect(eventPayloads(runId, 'error')).toHaveLength(0);
-      // 3 rejected + 2 well-formed in the happy tail.
-      expect(toolCallCount(runId, 'write_files')).toBe(5);
+      // 3 rejected + 3 well-formed in the happy tail (route, its
+      // server.ts registration, and the frontend App).
+      expect(toolCallCount(runId, 'write_files')).toBe(6);
     } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
   }, 240000);
 });
