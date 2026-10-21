@@ -28,6 +28,8 @@ vi.mock('./llm.js', async (importOriginal) => {
 });
 
 import { runAgentOnce, type AgentSettings } from './agent.js';
+import { FAKE_SERVER } from './previewFixture.js';
+import { getPreview } from './previewManager.js';
 
 // ---------------------------------------------------------------------------
 // Minimal dynamic fixture (same shape as dynamicGate.test.ts)
@@ -103,7 +105,7 @@ function makeGateProject(): string {
   fs.writeFileSync(path.join(be, 'package-lock.json'), LOCK('fx-be'));
   fs.writeFileSync(path.join(fe, 'scripts', 'build.mjs'), BUILD_JS);
   fs.writeFileSync(path.join(be, 'scripts', 'build.mjs'), BACKEND_BUILD_JS);
-  fs.writeFileSync(path.join(be, 'scripts', 'fake-server.js'), 'export {};');
+  fs.writeFileSync(path.join(be, 'scripts', 'fake-server.js'), FAKE_SERVER);
   fs.writeFileSync(
     path.join(dir, 'package.json'),
     JSON.stringify({ name: 'fx', version: '0.1.0', scripts: { migrate: 'node scripts/migrate.mjs', test: 'node scripts/tests.mjs' } }),
@@ -148,6 +150,7 @@ const final = (content = 'Done.'): LlmResponse => ({ content, toolCalls: [], usa
 beforeAll(() => {
   vi.stubEnv('GROQ_API_KEY', 'test-key');
   vi.stubEnv('APPFORGE_LLM_STUB', '');
+  vi.stubEnv('APPFORGE_ENABLE_UNSAFE_LOCAL_PREVIEW', '1');
 });
 
 afterAll(() => {
@@ -178,6 +181,50 @@ function eventPayloads(runId: string, kind: string): Array<Record<string, unknow
   const rows = db.prepare('SELECT payload_json FROM run_events WHERE run_id=? AND kind=?').all(runId, kind) as Array<{ payload_json: string }>;
   return rows.map((r) => { try { return JSON.parse(r.payload_json) as Record<string, unknown>; } catch { return {}; } });
 }
+
+/** Scripted model: plays the queue, then keeps returning a final message. */
+function script(responses: LlmResponse[]): void {
+  const queue = [...responses];
+  model.mockImplementation(async () => (queue.length > 0 ? queue.shift()! : final('Done, for real this time.')));
+}
+
+/** DB-backed /a/:projectId proxy (same as dynamicGate.test.ts). */
+async function startGateProxy(): Promise<{ url: string; close: () => Promise<void> }> {
+  const http = await import('node:http');
+  const server = http.createServer((req, res) => {
+    const m = (req.url ?? '').match(/^\/a\/([^/]+)(\/.*)?$/);
+    if (!m) { res.writeHead(404); res.end(); return; }
+    const projectId = m[1]!;
+    const rest = m[2] || '/';
+    let port: number | null = null;
+    try {
+      const row = getPreview(db, projectId);
+      if (row?.status === 'ready') port = row.port;
+    } catch { /* no preview */ }
+    if (!port) { res.writeHead(503); res.end('no preview'); return; }
+    const proxy = http.request(
+      { host: '127.0.0.1', port, path: rest, method: req.method, headers: { ...req.headers, host: `127.0.0.1:${port}` } },
+      (upRes) => { res.writeHead(upRes.statusCode ?? 502, upRes.headers); upRes.pipe(res); },
+    );
+    proxy.on('error', () => { res.writeHead(502); res.end(); });
+    req.pipe(proxy);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+const SIX_CHECKS = [
+  'run_frontend_build',
+  'run_backend_build',
+  'run_migrations',
+  'run_api_tests',
+  'start_fullstack_preview',
+  'test_authenticated_flow',
+];
 
 describe('intervention ladder', () => {
   it('step 2 compacts the context: the next completion gets a recovery history plus the reinforced directive', async () => {
@@ -220,4 +267,49 @@ describe('intervention ladder', () => {
     expect(afterFirst.some((m) => String(m.content ?? '').includes('STUCK SIGNAL — intervention 1 of 3'))).toBe(true);
     db.close();
   }, 180000);
+});
+
+describe('degradation ledger', () => {
+  it('a placeholder degradation is recorded by the platform and declared in the final summary of a done run', async () => {
+    const runId = setupRun(makeGateProject());
+    const projectId = (db.prepare('SELECT project_id FROM runs WHERE id=?').get(runId) as { project_id: string }).project_id;
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    // Openverse is down: every search fails, so the fallback degrades.
+    // Only Openverse is intercepted — the preview health check also uses
+    // fetch (loopback) and must reach the real server.
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockImplementation((async (input: unknown, init?: unknown) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes('api.openverse.org')) return new Response('upstream down', { status: 503 });
+      return originalFetch(input as never, init as never);
+    }) as typeof fetch);
+    try {
+      script([
+        toolCall('write_file', { area: 'backend', path: 'src/domain.ts', content: 'export const implemented = true;' }),
+        toolCall('acquire_image', { query: 'red sports car', path: 'public/assets/car', fallback: 'placeholder' }),
+        ...SIX_CHECKS.map((n) => toolCall(n)),
+        final('Store built'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      const row = db.prepare('SELECT status FROM runs WHERE id=?').get(runId) as { status: string };
+      expect(row.status).toBe('done');
+      // The assistant summary carries the deterministic section — the
+      // model's own closing text never mentions the degradation.
+      const messages = db.prepare("SELECT content FROM messages WHERE project_id=? AND role='assistant' ORDER BY created_at DESC").all(projectId) as Array<{ content: string }>;
+      const summary = messages[0]!.content;
+      expect(summary).toContain('Store built');
+      expect(summary).toContain('## Declared degradations');
+      expect(summary).toContain('illustrative images (platform placeholder): 1');
+      expect(summary).toContain('"red sports car"');
+      // The placeholder asset really landed in the project.
+      expect(fs.existsSync(path.join(dataDir, 'projects', projectId, 'frontend', 'public', 'placeholder-illustrative.svg'))).toBe(true);
+    } finally {
+      fetchMock.mockRestore();
+      await proxy.close();
+      delete process.env.APPFORGE_STUDIO_URL;
+      db.close();
+    }
+  }, 240000);
 });

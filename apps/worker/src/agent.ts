@@ -119,7 +119,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     '- Project root layout: frontend/ (Vite+React app), backend/ (Fastify+SQLite API), migrations/ (SQL files), tests/ (*.test.mjs API tests).',
     '- File tools accept an explicit "area" on this project: {"area":"backend","path":"src/routes/items.ts"}. Areas: frontend (frontend/**/*), backend (backend/src/**/*), migrations (migrations/*.sql), tests (tests/*.test.mjs). Default area is frontend. Never invent paths outside an area: package.json, lockfiles, Dockerfile, docker-compose.yml, scripts/, .env, data/, dist/ and node_modules/ are AppForge-controlled and rejected.',
     '- Preserve the template session/authentication modules, runtime configuration and relative API URL resolver. Extend domain routes rather than replacing these working contracts. Keep auth-screen, auth-toggle-mode, auth-email, auth-password, auth-submit, user-email and logout-button data-testid selectors. Domain CRUD, isolation and transactions require app-specific API tests; the generic authentication check does not test business behavior.',
-    '- MANDATORY ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. The dynamic tools take no arguments: paths and commands are fixed and confined to the active project.',
+    '- RECOMMENDED ORDER for a dynamic app: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Following it avoids re-running checks, because receipts only stay valid as a canonical-order prefix; the order is a recommendation, not a cage — you may run a check earlier to learn, and the gate re-validates what remains valid. The dynamic tools take no arguments: paths and commands are fixed and confined to the active project.',
     '- Do NOT declare a dynamic app finished until all six succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
     '- run_migrations always runs against a temporary verification database; it never touches a live database.',
     '- start_fullstack_preview launches an ephemeral local preview (temporary SQLite, loopback only) published at /a/:projectId/ through the Studio proxy. test_authenticated_flow verifies it via API calls and real Chromium using stable data-testid selectors. Previews are provisional, never deployments.',
@@ -151,8 +151,9 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     '10. React uses the automatic JSX runtime: import only hooks you use; use import type for interfaces. Do not give a component and an imported data type the same name (CarCard vs CarData). noUnusedLocals/noUnusedParameters/verbatimModuleSyntax are enabled. Never weaken tsconfig or the build script to hide errors.',
     isDynamic ? '11. Use only dependencies already declared in the selected area package.json. Keep Vite base="./" and resolveApiUrl(document.baseURI) from the template: this app is hosted below /a/<projectId>/, possibly behind another prefix. Absolute /api requests reach the wrong service.' : '11. Only import packages declared in package.json; prefer native React and CSS for interface chrome and icons. Keep Vite base="./". For routing use hash routing or an explicit /p/<projectId>/ basename; apps are not hosted at the domain root.',
     '12. Implement every visible button/search/filter. No placeholder controls or fake success messages. Persist likes/tasks in a project-specific localStorage key when appropriate. Label example data clearly; never claim simulated data or bank connections are real.',
-    '13. For content-led cards, catalogs, destinations, products, people or hero sections, use acquire_image to obtain relevant real photography instead of drawing the subject with generic SVG/CSS. Search specifically, use the returned local publicUrl, preserve the .license.json receipt, and show a discreet visible creator/source credit. Never invent external photo URLs, hotlink random search results, or imply that a representative photo depicts the exact item for sale. If acquisition fails, use a polished neutral placeholder clearly labeled as illustrative — never a childish drawing of the product.',
+    '13. For content-led cards, catalogs, destinations, products, people or hero sections, use acquire_image to obtain relevant real photography instead of drawing the subject with generic SVG/CSS. Search specifically, use the returned local publicUrl, preserve the .license.json receipt, and show a discreet visible creator/source credit. Never invent external photo URLs, hotlink random search results, or imply that a representative photo depicts the exact item for sale. If acquisition fails, call acquire_image again with fallback: "placeholder" to use the official illustrative placeholder instead (the platform declares the degradation in the run summary) — never invent a photo URL or a childish drawing of the product.',
     '14. This template uses plain CSS only. Do not install or use Tailwind, shadcn, CSS-in-JS, Sass, PostCSS plugins, UI frameworks, or utility-class libraries. Write semantic className values in React and define every class in src/index.css (or imported .css files). Prefer a small design-token block with CSS custom properties and ordinary responsive CSS.',
+    '15. STUCK INTERVENTIONS AND HONEST DEGRADATION: repeated failures do NOT stop this run by themselves. When you receive a STUCK SIGNAL directive you MUST change strategy — never repeat the failed operation unchanged; after three interventions without progress the run ends as an exhausted loop. Degrading is legitimate when it stays declared: for an image you cannot acquire, call acquire_image with fallback: "placeholder" and the platform records the degradation in the run summary. Never present a placeholder, simulated data or an invented value as real.',
     ...dynamicSection,
   ].join('\n');
 }
@@ -277,6 +278,14 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const project = db.prepare('SELECT * FROM projects WHERE id=?').get(run.project_id) as Record<string, any> | undefined;
   const t = (key: string) => (settings.language === 'es' ? ES[key] : EN[key]);
   const modifiedFiles: string[] = [];
+  /**
+   * Flexibilidad agéntica (§4.3): degradation ledger of THIS run. Every
+   * time a tool reports a declared degradation (today: acquire_image's
+   * illustrative placeholder), perform() records it here and complete()
+   * appends the deterministic "Degradaciones declaradas" section to the
+   * final summary — it never depends on the model remembering to say it.
+   */
+  const degradations: Array<{ kind: string; detail: string }> = [];
   let lastError: string | null = null;
 
   const finishError = (message: string, code?: string) => {
@@ -559,9 +568,13 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       if (['write_file', 'patch_file', 'delete_file'].includes(name) && typeof args.path === 'string') modifiedFiles.push(args.path);
       if (name === 'write_files') modifiedFiles.push(...((result.data as { paths?: string[] })?.paths ?? []));
       if (name === 'acquire_image') {
-        const asset = result.data as { path?: string; attributionPath?: string } | undefined;
+        const asset = result.data as { path?: string; attributionPath?: string; degraded?: string; query?: string; requestedPath?: string } | undefined;
         if (asset?.path) modifiedFiles.push(asset.path);
         if (asset?.attributionPath) modifiedFiles.push(asset.attributionPath);
+        if (asset?.degraded === 'illustrative-placeholder') {
+          degradations.push({ kind: 'illustrative-image', detail: asset.query ?? asset.requestedPath ?? asset.path ?? '' });
+          emit(db, runId, 'log', { text: `degradation declared: illustrative placeholder for "${asset.query ?? asset.requestedPath ?? ''}"` });
+        }
       }
       if (fileTool && sourceFingerprint(isDynamicProject ? projectDir : frontendDir) !== beforeFingerprint) lastProgressAt = Date.now();
       // A later source change invalidates dynamic verification receipts;
@@ -678,8 +691,30 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     return changed;
   };
 
+  /**
+   * Deterministic degradations section for the final summary (§4.3):
+   * grouped counts with a brief detail, in the user's language. Empty
+   * string when the run degraded nothing — `done` stays plain `done`.
+   */
+  const degradationsSection = (): string => {
+    if (degradations.length === 0) return '';
+    const es = settings.language === 'es';
+    const images = degradations.filter((d) => d.kind === 'illustrative-image');
+    const lines: string[] = [es ? '## Degradaciones declaradas' : '## Declared degradations'];
+    if (images.length > 0) {
+      const details = [...new Set(images.map((d) => d.detail).filter(Boolean))].slice(0, 5);
+      const suffix = details.length > 0 ? ` — ${details.map((d) => `"${d}"`).join(', ')}` : '';
+      lines.push(es
+        ? `- imágenes ilustrativas (placeholder de plataforma): ${images.length}${suffix}`
+        : `- illustrative images (platform placeholder): ${images.length}${suffix}`);
+    }
+    const others = degradations.filter((d) => d.kind !== 'illustrative-image');
+    if (others.length > 0) lines.push(`- ${others[0]!.kind}: ${others.length}`);
+    return `\n\n${lines.join('\n')}`;
+  };
+
   const complete = () => {
-    const summary = proposedSummary || t(isDynamicProject ? 'verifiedDynamicSummary' : 'verifiedSummary');
+    const summary = (proposedSummary || t(isDynamicProject ? 'verifiedDynamicSummary' : 'verifiedSummary')) + degradationsSection();
     addAssistantMessage(db, project.id, summary);
     try { rewriteProjectContext({ projectDir, projectName: project.name, prompt: run.prompt, modifiedFiles: [...new Set(modifiedFiles)], summary, lastError: null, runId, status: 'done' }); } catch { /* best effort */ }
     updateRun(db, runId, { status: 'done', finishedAt: nowIso(), stats, error: null });
