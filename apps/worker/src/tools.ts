@@ -16,7 +16,7 @@ import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from '.
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
 import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
 import { checkWriteGuard, frontendRootScriptError } from './writeGuard.js';
-import { backendContractsNote } from './backendContracts.js';
+import { backendContractsNote, migrationSqlNote } from './backendContracts.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -267,12 +267,26 @@ async function backendTypecheckNote(ctx: ToolContext): Promise<BackendTypecheckN
  * The contract lint is pure text scanning, so unlike tsc it also speaks
  * before the backend dependencies are installed (see backendContracts.ts).
  */
-async function withBackendNotes(ctx: ToolContext, result: ToolResult, touchedBackend: boolean, snippets: string[]): Promise<ToolResult> {
-  const noted = await withBackendTypecheck(ctx, result, touchedBackend);
-  if (!touchedBackend || !noted.ok) return noted;
-  const note = backendContractsNote(ctx.projectDir, snippets);
-  if (!note) return noted;
-  return { ...noted, output: noted.output ? `${noted.output}\n${note}` : note };
+async function withBackendNotes(
+  ctx: ToolContext,
+  result: ToolResult,
+  touchedBackend: boolean,
+  snippets: string[],
+  migrationSnippets: string[] = [],
+): Promise<ToolResult> {
+  let noted = await withBackendTypecheck(ctx, result, touchedBackend);
+  if (touchedBackend && noted.ok) {
+    const note = backendContractsNote(ctx.projectDir, snippets);
+    if (note) noted = { ...noted, output: noted.output ? `${noted.output}\n${note}` : note };
+  }
+  // Schema lint for migration writes (guarda de esquema): a core
+  // CREATE TABLE that drops a template column is flagged in this same
+  // turn; run_migrations remains the authoritative check.
+  if (noted.ok && migrationSnippets.length > 0) {
+    const sqlNote = migrationSqlNote(migrationSnippets);
+    if (sqlNote) noted = { ...noted, output: noted.output ? `${noted.output}\n${sqlNote}` : sqlNote };
+  }
+  return noted;
 }
 
 /** Annotates a successful write result with the backend typecheck note (never fails the write). */
@@ -367,7 +381,7 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
     const result: ToolResult = { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
-    return withBackendNotes(ctx, result, r.area === 'backend', [content]);
+    return withBackendNotes(ctx, result, r.area === 'backend', [content], r.area === 'migrations' ? [content] : []);
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -409,7 +423,13 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
       fs.writeFileSync(file.abs, file.content, 'utf8');
     }
     const result: ToolResult = { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
-    return withBackendNotes(ctx, result, files.some((f) => f.area === 'backend'), files.filter((f) => f.area === 'backend').map((f) => f.content));
+    return withBackendNotes(
+      ctx,
+      result,
+      files.some((f) => f.area === 'backend'),
+      files.filter((f) => f.area === 'backend').map((f) => f.content),
+      files.filter((f) => f.area === 'migrations').map((f) => f.content),
+    );
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -430,7 +450,10 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     assertAreaText(next, p);
     fs.writeFileSync(abs, next, 'utf8');
     const result: ToolResult = { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
-    return withBackendNotes(ctx, result, r.area === 'backend', [replace]);
+    // patch_file: the lint sees only the pasted replacement text, so the
+    // SQL note fires only when that text carries a complete CREATE TABLE
+    // block — exactly the desired behaviour.
+    return withBackendNotes(ctx, result, r.area === 'backend', [replace], r.area === 'migrations' ? [replace] : []);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
     return fail((e as { code?: string }).code ?? 'PATCH_FAILED', (e as Error).message, Date.now() - t0);

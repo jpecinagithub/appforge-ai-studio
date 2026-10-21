@@ -23,6 +23,8 @@ import {
   createDynamicTools,
   sanitizeSecrets,
   buildChildEnv,
+  compareSchemas,
+  readDbSchema,
   invalidateDynamicChecks,
   dynamicGateStatus,
   previewGateStatus,
@@ -783,5 +785,147 @@ describe('dynamic tools — fase 5A', () => {
     expect(out).not.toMatch(/abcdef123456/);
     expect(out).not.toMatch(/tokengoeshere123/);
     expect(out).toMatch(/plain text stays/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema contract guard (guarda de esquema): run_migrations introspects the
+// applied schema and compares it against the served template's schema.
+// ---------------------------------------------------------------------------
+
+/** Faithful copy of the template 001 core (users/sessions/todos). */
+const TEMPLATE_CORE_SQL = `CREATE TABLE users(
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  display_name TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE sessions(
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL
+);
+CREATE TABLE todos(
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);`;
+
+/** Templates root (the dir APPFORGE_TEMPLATES_DIR points at) with a runnable fake migrate. */
+function makeTemplateFixture(): string {
+  const root = mkdtempSync(path.join(tmpdir(), 'af-dyn-templates-'));
+  const tdir = path.join(root, 'dynamic-react-node');
+  mkdirSync(path.join(tdir, 'scripts'), { recursive: true });
+  mkdirSync(path.join(tdir, 'migrations'), { recursive: true });
+  writeFileSync(
+    path.join(tdir, 'package.json'),
+    JSON.stringify({ name: 'fx-template', version: '0.1.0', private: true, scripts: { migrate: 'node scripts/fake-migrate.mjs' } }),
+  );
+  writeFileSync(path.join(tdir, 'scripts', 'fake-migrate.mjs'), FAKE_MIGRATE);
+  writeFileSync(path.join(tdir, 'migrations', '001_init.sql'), TEMPLATE_CORE_SQL);
+  return root;
+}
+
+describe('schema contract guard', () => {
+  test('compareSchemas: supersets pass, missing columns and tables are named', () => {
+    const template = new Map<string, Set<string>>([
+      ['users', new Set(['id', 'email'])],
+      ['sessions', new Set(['id', 'last_seen_at'])],
+    ]);
+    const superset = new Map<string, Set<string>>([
+      ['users', new Set(['id', 'email', 'extra'])],
+      ['sessions', new Set(['id', 'last_seen_at'])],
+      ['products', new Set(['id'])],
+    ]);
+    expect(compareSchemas(template, superset)).toEqual([]);
+    const missingCol = new Map<string, Set<string>>([
+      ['users', new Set(['id', 'email'])],
+      ['sessions', new Set(['id'])],
+    ]);
+    expect(compareSchemas(template, missingCol)).toEqual(['sessions.last_seen_at']);
+    const missingTable = new Map<string, Set<string>>([['users', new Set(['id', 'email'])]]);
+    expect(compareSchemas(template, missingTable)).toEqual(['sessions.id', 'sessions.last_seen_at']);
+  });
+
+  test('readDbSchema introspects tables/columns and excludes runner bookkeeping', () => {
+    const dir = track(mkdtempSync(path.join(tmpdir(), 'af-schema-')));
+    const dbPath = path.join(dir, 'x.db');
+    const w = new Database(dbPath);
+    w.exec(
+      `CREATE TABLE users(id TEXT PRIMARY KEY, email TEXT);
+       CREATE TABLE migrations(version INTEGER PRIMARY KEY, name TEXT);
+       CREATE TABLE products(id TEXT PRIMARY KEY, name TEXT, price REAL);`,
+    );
+    w.close();
+    const schema = readDbSchema(dbPath);
+    expect([...schema.keys()].sort()).toEqual(['products', 'users']);
+    expect([...schema.get('users')!].sort()).toEqual(['email', 'id']);
+    expect(schema.get('products')!.has('price')).toBe(true);
+  });
+
+  test('run_migrations fails with SCHEMA_CONTRACT_VIOLATION when sessions loses last_seen_at (the pcBOX case)', async () => {
+    const templatesRoot = track(makeTemplateFixture());
+    const dir = track(makeProject());
+    writeFileSync(path.join(dir, 'migrations', '001_init.sql'), TEMPLATE_CORE_SQL.replace(',\n  last_seen_at TEXT NOT NULL', ''));
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const before = new Set(readdirSync(tmpdir()));
+    process.env.APPFORGE_TEMPLATES_DIR = templatesRoot;
+    try {
+      const r = await tools.run_migrations(ctx, {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('SCHEMA_CONTRACT_VIOLATION');
+      expect(r.error).toContain('sessions.last_seen_at');
+      expect(r.error).toContain('ALTER TABLE');
+      // the check is NOT recorded for a violating schema
+      expect(ctx.dynamicChecks?.migrations).toBeUndefined();
+    } finally {
+      delete process.env.APPFORGE_TEMPLATES_DIR;
+    }
+    // temp dirs (project verify DB + template verify DB) cleaned up
+    const after = readdirSync(tmpdir()).filter((f) => f.startsWith(`af-migrate-${process.pid}-`) && !before.has(f));
+    expect(after).toEqual([]);
+    db.close();
+  });
+
+  test('run_migrations passes the guard with a template-faithful 001 (extra domain tables allowed)', async () => {
+    const templatesRoot = track(makeTemplateFixture());
+    const dir = track(makeProject());
+    writeFileSync(path.join(dir, 'migrations', '001_init.sql'), TEMPLATE_CORE_SQL);
+    writeFileSync(path.join(dir, 'migrations', '002_shop.sql'), 'CREATE TABLE products(id TEXT PRIMARY KEY, name TEXT NOT NULL);');
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    process.env.APPFORGE_TEMPLATES_DIR = templatesRoot;
+    try {
+      const r = await tools.run_migrations(ctx, {});
+      expect(r.ok).toBe(true);
+      expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    } finally {
+      delete process.env.APPFORGE_TEMPLATES_DIR;
+    }
+    db.close();
+  });
+
+  test('run_migrations skips the guard (with a note) when the templates dir is unavailable', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    delete process.env.APPFORGE_TEMPLATES_DIR;
+    const r = await tools.run_migrations(ctx, {});
+    expect(r.ok).toBe(true);
+    expect(r.output).toContain('schema contract check skipped');
+    expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    db.close();
   });
 });

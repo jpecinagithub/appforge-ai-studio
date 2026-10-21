@@ -84,7 +84,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     '- start_fullstack_preview launches an ephemeral local preview (temporary SQLite, loopback only) published at /a/:projectId/ through the Studio proxy. test_authenticated_flow verifies it via API calls and real Chromium using stable data-testid selectors. Previews are provisional, never deployments.',
     '- During repair, consult get_dynamic_status BEFORE acting: it shows the current gate (valid/stale/missing checks, current prefix and best state reached this run), so you fix the earliest broken check instead of guessing.',
     '- IMPLEMENT BEFORE YOU VERIFY: the six checks pass on the untouched template, so running them first proves nothing and wastes the run. Write the backend routes and the frontend FIRST; run run_backend_build immediately after the backend writes to surface compiler errors while they are cheap; run the full six-check sequence only when the implementation exists.',
-    '- TEMPLATE API FACTS (these are mechanical, do not improvise alternatives): (1) The backend database is node:sqlite DatabaseSync — there is NO .transaction() helper (that is better-sqlite3 API). Wrap multi-statement writes with db.exec(\'BEGIN IMMEDIATE\') / db.exec(\'COMMIT\') / on error db.exec(\'ROLLBACK\'), or use withTransaction(db, fn) from backend/src/db/index.ts when present. Use the queryOne/queryAll helpers from that same file. (2) sendError codes form a CLOSED union in backend/src/lib/errors.ts (in your context below): inventing a code such as INSUFFICIENT_STOCK is a compile error — either use a valid code or add the new code to the union AND its STATUS map in that one file. (3) Register new route modules in backend/src/server.ts following the existing register*Routes pattern.',
+    '- TEMPLATE API FACTS (these are mechanical, do not improvise alternatives): (1) The backend database is node:sqlite DatabaseSync — there is NO .transaction() helper (that is better-sqlite3 API). Wrap multi-statement writes with db.exec(\'BEGIN IMMEDIATE\') / db.exec(\'COMMIT\') / on error db.exec(\'ROLLBACK\'), or use withTransaction(db, fn) from backend/src/db/index.ts when present. Use the queryOne/queryAll helpers from that same file. (2) sendError codes form a CLOSED union in backend/src/lib/errors.ts (in your context below): inventing a code such as INSUFFICIENT_STOCK is a compile error — either use a valid code or add the new code to the union AND its STATUS map in that one file. (3) Register new route modules in backend/src/server.ts following the existing register*Routes pattern. (4) CORE SCHEMA: migration 001 of the template defines the core tables users and sessions, and the auth code depends on their EXACT columns — sessions is (id, user_id, token_hash, created_at, expires_at, last_seen_at) and users is (id, email, password_hash, display_name, created_at, updated_at). NEVER rewrite 001 to drop or rename a core table or column; put new tables in 002+ and extend a core table only with ALTER TABLE in a NEW migration. run_migrations introspects the applied schema and fails with SCHEMA_CONTRACT_VIOLATION if any template column is missing.',
   ] : [];
   return [
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
@@ -401,7 +401,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         `\nCURRENT CORE FILES:\n${['package.json', 'tsconfig.app.json', 'src/App.tsx', 'src/index.css'].map((file) => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, 14000)}`; } catch { return `--- ${file}: missing ---`; }
         }).join('\n')}`,
-        ...(isDynamicProject ? [`\nDYNAMIC TEMPLATE CONTRACTS (project-relative paths; preserve these contracts):\n${['backend/package.json', 'backend/src/server.ts', 'backend/src/auth/routes.ts', 'backend/src/db/index.ts', 'backend/src/lib/errors.ts', 'backend/src/routes/todos.ts', 'frontend/src/api.ts', 'frontend/src/api-url.ts'].map(file => {
+        ...(isDynamicProject ? [`\nDYNAMIC TEMPLATE CONTRACTS (project-relative paths; preserve these contracts):\n${['backend/package.json', 'backend/src/server.ts', 'backend/src/auth/routes.ts', 'backend/src/auth/session.ts', 'backend/src/db/index.ts', 'backend/src/lib/errors.ts', 'backend/src/routes/todos.ts', 'frontend/src/api.ts', 'frontend/src/api-url.ts'].map(file => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(projectDir, file), 'utf8').slice(0, 9000)}`; } catch { return `--- ${file}: missing ---`; }
         }).join('\n')}`] : []),
         `\nRECENT CONVERSATION:\n${recent || '(none)'}`,
@@ -534,12 +534,21 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         bestState = { ...bestState, apiTestsPassed: apiTestsPassedCurrent };
       }
       // Autonomy: a failed backend build almost always means a violated
-      // template contract. Attach the two contract files the errors refer
-      // to (error codes and the database helpers) to THIS result, so the
+      // template contract. Attach the contract files the errors refer to
+      // (error codes and the database helpers) to THIS result, so the
       // model repairs against the real contracts in the next turn instead
-      // of spending turns discovering them (live case a9864671).
-      if (name === 'run_backend_build' && !result.ok) {
-        const excerpts = ['backend/src/lib/errors.ts', 'backend/src/db/index.ts'].map((file) => {
+      // of spending turns discovering them (live case a9864671). A failed
+      // run_api_tests gets the session contract instead: the API tests
+      // exercise register/login, whose 500s trace back to the sessions
+      // schema the session module writes (live case b6de6a05).
+      const contractFiles =
+        name === 'run_backend_build' && !result.ok
+          ? ['backend/src/lib/errors.ts', 'backend/src/db/index.ts']
+          : name === 'run_api_tests' && !result.ok
+            ? ['backend/src/auth/session.ts']
+            : null;
+      if (contractFiles) {
+        const excerpts = contractFiles.map((file) => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(projectDir, file), 'utf8').slice(0, 4500)}`; }
           catch { return `--- ${file}: missing ---`; }
         }).join('\n');

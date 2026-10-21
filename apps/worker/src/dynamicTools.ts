@@ -20,6 +20,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -542,6 +543,102 @@ async function runBackendBuild(ctx: ToolContext, args: Record<string, unknown>):
 
 const MIGRATION_FILE_RE = /^\d+_.+\.sql$/;
 
+// ---------------------------------------------------------------------------
+// Schema contract guard (guarda de esquema, 2026-10-21).
+//
+// Live case (project 07007457): a run rewrote migrations/001_init.sql and
+// its `sessions` table lost `last_seen_at`, a column the template's
+// session code writes on every create/validate. Nothing noticed until
+// run_api_tests cascaded (register 500 → 10/17). The migrations check now
+// proves, by introspection, that the schema the project's migrations
+// produce is a SUPERSET of the schema the served template's migrations
+// produce: every template table with every template column must exist in
+// the project's resulting database. Extra project tables/columns are the
+// project's own business and always pass.
+//
+// The template reference is derived live from APPFORGE_TEMPLATES_DIR (the
+// same source implementationEvidence and verify() use): the template's
+// own `npm run migrate` is executed against a second temporary database
+// inside the same temp dir run_migrations already cleans up. When the
+// templates dir is unavailable, the template cannot run its migrations,
+// or introspection itself fails, the guard is SKIPPED with a note in the
+// tool output — it never turns an unverifiable environment into a failed
+// check (same philosophy as the implementation-evidence fallback).
+// ---------------------------------------------------------------------------
+
+/** Runner bookkeeping tables, not schema contract: excluded both sides. */
+const SCHEMA_GUARD_EXCLUDED_TABLES = new Set(['migrations']);
+
+/** Read table → column names from a SQLite database file (read-only). */
+export function readDbSchema(dbPath: string): Map<string, Set<string>> {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const schema = new Map<string, Set<string>>();
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+      .all() as Array<{ name: string }>;
+    for (const { name } of tables) {
+      if (SCHEMA_GUARD_EXCLUDED_TABLES.has(name)) continue;
+      const quoted = `"${name.replace(/"/g, '""')}"`;
+      const cols = db.prepare(`PRAGMA table_info(${quoted})`).all() as Array<{ name: string }>;
+      schema.set(name, new Set(cols.map((c) => c.name)));
+    }
+    return schema;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Pure comparison: returns the missing `table.column` entries of the
+ * template schema with respect to the project schema (a missing table
+ * lists every one of its columns), sorted for stable diagnostics.
+ */
+export function compareSchemas(templateSchema: Map<string, Set<string>>, projectSchema: Map<string, Set<string>>): string[] {
+  const missing: string[] = [];
+  for (const table of [...templateSchema.keys()].sort()) {
+    const templateCols = templateSchema.get(table)!;
+    const projectCols = projectSchema.get(table);
+    for (const col of [...templateCols].sort()) {
+      if (!projectCols || !projectCols.has(col)) missing.push(`${table}.${col}`);
+    }
+  }
+  return missing;
+}
+
+type SchemaGuardOutcome =
+  | { kind: 'ok' }
+  | { kind: 'skipped'; note: string }
+  | { kind: 'violation'; missing: string[] };
+
+async function checkSchemaContract(ctx: ToolContext, projectDbPath: string, tmpDir: string): Promise<SchemaGuardOutcome> {
+  const templatesDir = (process.env.APPFORGE_TEMPLATES_DIR ?? '').trim();
+  if (!templatesDir) return { kind: 'skipped', note: 'schema contract check skipped (APPFORGE_TEMPLATES_DIR is not set)' };
+  const templateDir = path.join(templatesDir, 'dynamic-react-node');
+  if (!fs.existsSync(path.join(templateDir, 'package.json')) || !fs.existsSync(path.join(templateDir, 'migrations'))) {
+    return { kind: 'skipped', note: 'schema contract check skipped (dynamic template not found under APPFORGE_TEMPLATES_DIR)' };
+  }
+  // Same mechanism as the project passes: closed `npm run migrate` with a
+  // throwaway DB_PATH, here inside run_migrations' own temp dir so the
+  // existing cleanup covers it on every path.
+  const templateDbPath = path.join(tmpDir, 'template-verify.db');
+  const r = await runLive('npm', ['run', 'migrate'], {
+    cwd: templateDir,
+    timeoutMs: ctx.buildTimeoutMs,
+    isCancelled: ctx.isCancelled,
+    extraEnv: { DB_PATH: templateDbPath },
+  });
+  if (r.cancelled || r.timedOut || r.code !== 0) {
+    return { kind: 'skipped', note: 'schema contract check skipped (the template migrations could not be applied in this environment)' };
+  }
+  try {
+    const missing = compareSchemas(readDbSchema(templateDbPath), readDbSchema(projectDbPath));
+    return missing.length === 0 ? { kind: 'ok' } : { kind: 'violation', missing };
+  } catch {
+    return { kind: 'skipped', note: 'schema contract check skipped (schema introspection failed)' };
+  }
+}
+
 function parseMigrationLog(output: string): {
   newlyApplied: string[];
   alreadyApplied: string[];
@@ -720,6 +817,23 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
         pass2.result.output,
       );
     }
+    // Schema contract guard (see checkSchemaContract): the applied schema
+    // must keep every table/column the served template defines. A
+    // violation fails WITHOUT recording the check — the project does not
+    // get a migrations receipt for a schema its own auth code cannot use.
+    const guard = await checkSchemaContract(ctx, dbPath, tmpDir);
+    if (guard.kind === 'violation') {
+      cleanupTemp();
+      return fail(
+        'SCHEMA_CONTRACT_VIOLATION',
+        `the applied schema is missing template column(s): ${guard.missing.join(', ')}. ` +
+          'The template auth/session code depends on the exact core tables of migration 001 (users, sessions). ' +
+          'Fix it by ADDING a new migration (next number) with ALTER TABLE ... ADD COLUMN for each missing column, then re-run run_migrations — ' +
+          'never rewrite an already-applied migration: its stored checksum would no longer match.',
+        Date.now() - t0,
+        sanitizeSecrets(trunc(`${pass1.result.output ?? ''}\n${pass2.result.output ?? ''}`)),
+      );
+    }
     recordDynamicCheck(ctx, 'migrations');
     cleanupTemp();
     const durationMs = Date.now() - t0;
@@ -727,7 +841,9 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
       ok: true,
       data: { files, applied: pass1.newlyApplied, idempotent: true },
       durationMs,
-      output: sanitizeSecrets(trunc(`${pass1.result.output ?? ''}\n${pass2.result.output ?? ''}`)),
+      output: sanitizeSecrets(
+        trunc(`${pass1.result.output ?? ''}\n${pass2.result.output ?? ''}${guard.kind === 'skipped' ? `\n${guard.note}` : ''}`),
+      ),
     };
   } catch (e) {
     const durationMs = Date.now() - t0;
