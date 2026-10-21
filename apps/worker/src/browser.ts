@@ -34,12 +34,20 @@ const MIME: Record<string, string> = {
 // they are reported so the agent can see e.g. an `HTTP 500 POST .../api/...`
 // instead of patching blind.
 //
-// Images are asserted TWICE: on the first screen (before the steps) and again
-// after the steps, on the final screen, after a full scroll + settle so lazy
-// images load. The first screen of the authenticated flow is the login form
-// (no data), so a post-login catalog full of broken images used to verify
-// green; the post-steps assertion is what catches it, and its failure
-// snapshot shows that final screen.
+// Images are asserted on the first screen (before the steps), after EVERY
+// step on whatever screen that step leaves behind, and once more after
+// the steps, on the final screen, after a full scroll + settle so lazy
+// images load. The per-step assertions are not a luxury: the screens a
+// flow passes THROUGH are where the authenticated content lives, and the
+// two endpoints never see it — the first screen of the authenticated
+// flow is the login form (no data) and the flow ends in logout, so the
+// final screen is the login form again. Asserting only the endpoints
+// left the middle unjudged, and production proved it: run fac615d3
+// (T-shirts) closed 6/6 with 40 image_url values pointing at files that
+// never existed and zero acquire_image calls, because the product grid
+// lived between steps and no assertion ever ran on it. A per-step
+// assertion failure stops the steps there, so its failure snapshot
+// shows the offending screen.
 //
 // "Loaded" is an honest criterion, not just a rendered one: a completed
 // <img> counts only when it rendered real pixels (naturalWidth > 0) AND
@@ -228,18 +236,39 @@ function attachPageDiagnostics(page: Page, diag: PageDiagnostics): void {
   });
 }
 
-/** Run the steps in order, remembering which one failed (1-based). */
+/**
+ * Run the steps in order, remembering which one failed (1-based). After
+ * each step completes, the optional `afterStep` hook judges the screen
+ * the step left behind (in practice: the per-step image assertion, see
+ * assertImagesLoadedAfterStep). If the hook rejects, the step that led
+ * to that screen is marked failed and the thrown error names it
+ * ("image assertion failed after step N/M (action "…")"), so the
+ * composed diagnostic points at the screen where the problem lives
+ * instead of letting the flow walk away from it.
+ */
 async function runSteps(
   page: Page,
   steps: BrowserStep[],
   markFailed: (failed: FailedStep) => void,
+  afterStep?: (completed: FailedStep) => Promise<void>,
 ): Promise<void> {
   for (let i = 0; i < steps.length; i++) {
+    const ref: FailedStep = { index: i + 1, total: steps.length, step: steps[i]! };
     try {
       await browserStep(page, steps[i]!);
     } catch (error) {
-      markFailed({ index: i + 1, total: steps.length, step: steps[i]! });
+      markFailed(ref);
       throw error;
+    }
+    if (afterStep) {
+      try {
+        await afterStep(ref);
+      } catch (error) {
+        markFailed(ref);
+        throw new Error(
+          `image assertion failed after step ${ref.index}/${ref.total} (${describeStep(ref.step)}): ${(error as Error).message}`,
+        );
+      }
     }
   }
 }
@@ -498,10 +527,13 @@ export async function checkBrowser(
           clip: { x: 0, y: 0, width: 1280, height: 720 },
         })
         : null;
-      await runSteps(page!, steps, (f) => { failedStep = f; });
-      // Post-steps: re-assert images on the FINAL screen (after the mobile
-      // viewport pass below there is a third check); errors collected during
-      // the steps are judged by the hasHardErrors gate further down.
+      await runSteps(page!, steps, (f) => { failedStep = f; }, () => assertImagesLoadedAfterStep(page!, diag));
+      // Post-steps: re-assert images on the FINAL screen, whichever one
+      // the steps end on (the per-step assertions inside runSteps have
+      // already judged every intermediate screen; after the mobile
+      // viewport pass below there is a third check); errors collected
+      // during the steps are judged by the hasHardErrors gate further
+      // down.
       await assertImagesLoadedAfterSteps(page!, diag);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       // Capture accessible controls as feedback for the agent's next interaction test.
@@ -570,12 +602,14 @@ export async function checkBrowserAtUrl(
       await page!.goto(url, { waitUntil: 'load', timeout: Math.min(remaining, 15_000) });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       await assertImagesLoaded(page!, diag);
-      await runSteps(page!, steps, (f) => { failedStep = f; });
-      // Post-steps: re-assert images on the FINAL screen — in the
-      // authenticated flow that is the post-login content, which the
-      // pre-steps check (login screen) cannot see. Page errors collected
-      // during the steps are judged by the hasHardErrors gate just below,
-      // and the failure snapshot is taken from this same final screen.
+      await runSteps(page!, steps, (f) => { failedStep = f; }, () => assertImagesLoadedAfterStep(page!, diag));
+      // Post-steps: re-assert images on the FINAL screen, whichever one
+      // the steps end on — in the authenticated flow that is the login
+      // screen again, because the flow ends in logout; the post-login
+      // content in between is judged by the per-step assertions inside
+      // runSteps, not by this one. Page errors collected during the
+      // steps are judged by the hasHardErrors gate just below, and the
+      // failure snapshot is taken from this same final screen.
       await assertImagesLoadedAfterSteps(page!, diag);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       const snapshot = (await page!.locator('body').ariaSnapshot()).slice(0, 8000);
@@ -679,6 +713,65 @@ async function scrollThroughPage(page: Page): Promise<void> {
     /* page may be navigating; ignore and let the image check judge */
   }
   await page.waitForTimeout(300);
+}
+
+/**
+ * Per-step image assertion: the exact same honest criterion as
+ * assertImagesLoaded, applied to the screen a step just left behind —
+ * the screens BETWEEN the first and the final one, where the
+ * authenticated content lives and which the endpoint assertions never
+ * judge (run fac615d3 verified green with a catalog of nonexistent
+ * photos because the grid sat between steps; see the header note).
+ *
+ * No full scroll: images already in the DOM were requested when they
+ * rendered, and lazy ones below the fold that were never requested stay
+ * complete === false and are skipped by the assertion itself. What the
+ * step does get is a bounded settle: a short wait for the document the
+ * step may have navigated to, and for in-flight image requests to
+ * finish — a broken or substituted image only becomes judgeable once
+ * its request settles. Both waits are best effort and never fail the
+ * step on their own: an image still loading afterwards is simply not
+ * judged yet, the same patience the criterion itself has, and the
+ * scroll + settle assertion on the final screen remains the backstop.
+ *
+ * Cost per step: when the screen is already settled (the common case)
+ * the two waits resolve on their first poll and the assertion is one
+ * DOM sample — tens of milliseconds. The bounded worst case is ~2.5 s,
+ * paid only while image requests hang (they are then skipped, not
+ * failed — hanging photos must not fail a correct app, cf. the reload
+ * regression: session persistence is judged by expectations, not by
+ * network rest).
+ */
+async function assertImagesLoadedAfterStep(page: Page, diag: PageDiagnostics): Promise<void> {
+  const settle = async (): Promise<void> => {
+    try {
+      await page.waitForLoadState('domcontentloaded', { timeout: 1500 });
+      await page.waitForFunction(
+        'Array.from(document.images).every((img) => img.complete)',
+        undefined,
+        { timeout: 1000 },
+      );
+    } catch {
+      /* page may be navigating or an image may hang: judge the state as-is */
+    }
+  };
+  await settle();
+  try {
+    await assertImagesLoaded(page, diag);
+  } catch (error) {
+    // A step can trigger a navigation only AFTER it returns — the auth
+    // flow's logout click first awaits its API call, then the app
+    // reloads — so the settle above ran against the OLD document and
+    // the sample dies with "Execution context was destroyed". That is
+    // a race with the browser, not a verdict on any photo: wait for the
+    // new document, settle again and judge the screen the step actually
+    // left behind — once. A second failure is a real verdict and
+    // propagates like any other assertion failure.
+    if (!/Execution context was destroyed/.test((error as Error).message)) throw error;
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => undefined);
+    await settle();
+    await assertImagesLoaded(page, diag);
+  }
 }
 
 /**
