@@ -24,7 +24,7 @@ import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
 import { DYNAMIC_TOOL_DEFS, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks } from './dynamicTools.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
-import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairStateKey } from './recovery.js';
+import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairErrorSignature, repairStateKey } from './recovery.js';
 
 export interface AgentSettings {
   provider: 'groq' | 'openrouter';
@@ -32,6 +32,10 @@ export interface AgentSettings {
   temperature: number;
   maxTokens: number;
   maxIterations: number;
+  /** Fase 1: hard cap that actually stops the loop (maxIterations only forces verify()). */
+  maxHardIterations?: number;
+  /** Fase 1: max failed repair verifications before the run is stopped. */
+  maxRepairAttempts?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -48,11 +52,21 @@ export interface RunAgentOptions {
 
 const DEFAULT_LIMITS: AgentLimits = {
   maxIterations: 8,
-  maxRepairAttempts: 2,
+  maxHardIterations: 60,
+  // Until Fase 1 this value (2) was dead configuration: defined here and in
+  // appforge-shared but never read anywhere. It now bounds the number of
+  // FAILED repair verifications per run. 2 was calibrated for a limit that
+  // never fired; as a real budget it must leave room for legitimate
+  // multi-step repairs (the identical-signature circuit breaker, at 3, is
+  // the tight net for true loops), so the effective default is 12.
+  maxRepairAttempts: 12,
   llmTimeoutMs: 120_000,
   cmdTimeoutMs: 180_000,
   runTimeoutMs: 900_000,
 };
+
+/** Consecutive failed verifications with the SAME diagnostic signature stop the run. */
+const MAX_REPEATED_ERROR_SIGNATURE = 3;
 
 function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean): string {
   const userLang = lang === 'es' ? 'Spanish' : 'English';
@@ -200,7 +214,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const settings = opts.settings;
   const limits: AgentLimits = {
     maxIterations: settings.maxIterations || DEFAULT_LIMITS.maxIterations,
-    maxRepairAttempts: DEFAULT_LIMITS.maxRepairAttempts,
+    maxHardIterations: settings.maxHardIterations || DEFAULT_LIMITS.maxHardIterations,
+    maxRepairAttempts: settings.maxRepairAttempts || DEFAULT_LIMITS.maxRepairAttempts,
     llmTimeoutMs: settings.llmTimeoutMs || DEFAULT_LIMITS.llmTimeoutMs,
     cmdTimeoutMs: settings.cmdTimeoutMs || DEFAULT_LIMITS.cmdTimeoutMs,
     runTimeoutMs: settings.runTimeoutMs || DEFAULT_LIMITS.runTimeoutMs,
@@ -337,6 +352,15 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   let stagnantRepairs = 0;
   let lastRepairState = '';
   let proposedSummary = '';
+  // Fase 1 circuit breakers (independent of the fingerprint-based
+  // stagnation key above, which any source edit resets): count failed
+  // repair verifications, and how many of them in a row produced the SAME
+  // diagnostic signature (repairErrorSignature ignores source changes).
+  let lastToolError: string | null = null;
+  let failedRepairVerifications = 0;
+  let lastErrorSignature = '';
+  let repeatedErrorSignature = 0;
+  let repairAbortMessage: string | null = null;
   const initialFingerprint = sourceFingerprint(frontendDir);
 
   const perform = async (name: string, args: Record<string, unknown>, id: string = randomUUID()): Promise<ToolResult> => {
@@ -364,6 +388,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     if (!result.ok) {
       stats.errors++;
       lastError = `${result.error ?? result.code}\n${result.output ?? ''}`.slice(0, 12000);
+      lastToolError = lastError;
       if (tracked) {
         if (fileTool) for (const file of filePaths) criticalFailures.set(`file:${file}`, lastError);
         else criticalFailures.set(name, lastError);
@@ -451,6 +476,40 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     clearCancel(runId);
   };
 
+  /**
+   * Fase 1: account for one FAILED verification. Two independent circuit
+   * breakers live here (the fingerprint-based stagnation counter remains
+   * as a third net, inside verify()):
+   *  - identical diagnostic signature MAX_REPEATED_ERROR_SIGNATURE times
+   *    in a row → the repair is going in circles even though files change;
+   *  - more than limits.maxRepairAttempts failed repair verifications in
+   *    total → the repair budget is exhausted even if errors keep varying.
+   * Tripping only RECORDS the abort; the loop performs it (checkRepairAbort)
+   * so verify() keeps its boolean contract for every caller.
+   */
+  const noteFailedVerification = (diagnostic: string): void => {
+    failedRepairVerifications++;
+    const signature = repairErrorSignature(diagnostic);
+    if (signature && signature === lastErrorSignature) repeatedErrorSignature++;
+    else {
+      lastErrorSignature = signature;
+      repeatedErrorSignature = 1;
+    }
+    if (repairAbortMessage) return;
+    if (repeatedErrorSignature >= MAX_REPEATED_ERROR_SIGNATURE) {
+      repairAbortMessage = `${t('loopDetected')}\n\nThe same verification errors repeated ${repeatedErrorSignature} times in a row without change, so further repair turns would repeat them. Last diagnostic:\n${diagnostic.slice(0, 6000)}`;
+    } else if (failedRepairVerifications > limits.maxRepairAttempts) {
+      repairAbortMessage = `${t('repairLimit')}\n\nAutomatic repair stopped after ${failedRepairVerifications} failed verification attempts (maxRepairAttempts=${limits.maxRepairAttempts}). Last diagnostic:\n${diagnostic.slice(0, 6000)}`;
+    }
+  };
+
+  /** Performs a recorded circuit-breaker abort, if any. Returns true when the run was finished. */
+  const checkRepairAbort = (): boolean => {
+    if (!repairAbortMessage) return false;
+    finishError(repairAbortMessage, 'REPAIR_LIMIT');
+    return true;
+  };
+
   const verify = async (): Promise<boolean> => {
     emit(db, runId, 'status', { phase: 'validating' });
     if (isDynamicProject) {
@@ -473,7 +532,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
           lastProgressAt = Date.now();
         }
         history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. ${lastError} repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled.` });
-        emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, progressAware: true });
+        noteFailedVerification(`${lastError}\n${lastToolError ?? ''}`);
+        emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, errorSignatureRepeats: repeatedErrorSignature, failedRepairVerifications, progressAware: true });
         return false;
       }
       criticalFailures.delete('dynamicChecks');
@@ -511,7 +571,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
     // Include actual diagnostics, not just "exit code 2", and keep JSON intact.
     history.push({ role: 'user', content: `AUTOMATIC VERIFICATION FAILED. Fix the existing app, keeping the user's requirements. repair turns are progress-aware and continue while diagnostics improve; ${maxStagnantRepairs - stagnantRepairs} unchanged attempts remain before recovery is considered stalled. Batch related fixes with write_files or multiple patch_file calls. Then test_preview with real interactions and start_preview.\n${[...criticalFailures.values()].join('\n').slice(0, 18000) || lastError}` });
-    emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, progressAware: true });
+    noteFailedVerification([...criticalFailures.values()].join('\n') || lastError || 'unknown');
+    emit(db, runId, 'status', { phase: 'repairing', stagnantAttempts: stagnantRepairs, errorSignatureRepeats: repeatedErrorSignature, failedRepairVerifications, progressAware: true });
     return false;
   };
 
@@ -525,6 +586,14 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
     if (Date.now() - lastProgressAt > limits.runTimeoutMs) {
       finishError(t('runTimeout'));
+      return;
+    }
+    // Fase 1: hard iteration cap. Unlike maxIterations (which only forces
+    // verify() and lets the repair phase run on), this always stops the
+    // loop, so a runaway repair cannot iterate indefinitely.
+    if (iter > limits.maxHardIterations) {
+      stats.iterations = limits.maxHardIterations;
+      finishError(`${t('maxIterations')}\n\nHard iteration cap reached (${limits.maxHardIterations} iterations).`, 'ITERATION_LIMIT');
       return;
     }
 
@@ -577,6 +646,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         history.push({ role: 'user', content: lastError });
         if ((repairing || iter >= limits.maxIterations) && await verify()) return;
       } else if (await verify()) return;
+      if (checkRepairAbort()) return;
     }
 
     for (const tc of resp.toolCalls) {
@@ -594,6 +664,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     // response, not only after spending the entire repair reserve on patches.
     if ((!repairing && iter >= limits.maxIterations) || (repairing && resp.toolCalls.length > 0)) {
       if (await verify()) return;
+      if (checkRepairAbort()) return;
       if (stagnantRepairs >= maxStagnantRepairs) break;
     }
   }

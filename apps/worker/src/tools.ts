@@ -15,6 +15,7 @@ import type { DeploymentDriver } from './deploy/driver.js';
 import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from './fingerprint.js';
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
 import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
+import { checkWriteGuard, frontendRootScriptError } from './writeGuard.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -58,6 +59,12 @@ export interface ToolContext {
   >;
   browserSession?: BrowserSession;
   lastBrowserSteps?: BrowserStep[];
+  /**
+   * Fase 1: normalized `error TS…` lines from the last backend typecheck
+   * attached to a write (see backendTypecheckNote). Used as the baseline
+   * so the next backend write only reports NEW errors.
+   */
+  backendTypeErrors?: string[];
   lastBrowserStart?: BrowserSession;
   /**
    * Base URL of the Studio server (Fase 5B): the authenticated-flow
@@ -160,6 +167,86 @@ function relPosix(root: string, abs: string): string {
   return path.relative(root, abs).split(path.sep).join('/');
 }
 
+// ---------------------------------------------------------------------------
+// Fase 1: immediate backend coherence feedback. After a successful write in
+// the backend area of a dynamic project, run the backend's own TypeScript
+// compiler in --noEmit mode and attach the NEW type errors to the tool
+// result, so the agent sees incoherence in the same turn instead of many
+// iterations later at verify(). The write itself already succeeded: this
+// only annotates the result and never fails it. Bounded by cmdTimeoutMs;
+// silently skipped while the backend dependencies are not installed yet
+// (run_backend_build performs the npm ci that provides tsc).
+// ---------------------------------------------------------------------------
+
+interface BackendTypecheckNote {
+  text: string;
+  data: { newErrors: string[]; totalErrors: number; timedOut?: boolean };
+}
+
+async function backendTypecheckNote(ctx: ToolContext): Promise<BackendTypecheckNote | null> {
+  const backendDir = path.join(ctx.projectDir, 'backend');
+  const tscBin = path.join(backendDir, 'node_modules', 'typescript', 'bin', 'tsc');
+  if (!fs.existsSync(path.join(backendDir, 'tsconfig.json')) || !fs.existsSync(tscBin)) return null;
+  const r = await runCmd(process.execPath, [tscBin, '--noEmit', '-p', 'tsconfig.json'], {
+    cwd: backendDir,
+    timeoutMs: ctx.cmdTimeoutMs,
+  });
+  if (r.timedOut) {
+    return {
+      text: `Backend typecheck timed out after ${ctx.cmdTimeoutMs}ms; run run_backend_build for the full check.`,
+      data: { newErrors: [], totalErrors: -1, timedOut: true },
+    };
+  }
+  const errors = [
+    ...new Set(
+      `${r.stdout}\n${r.stderr}`
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => /error TS\d+/.test(l)),
+    ),
+  ];
+  const baseline = ctx.backendTypeErrors;
+  const newErrors = baseline === undefined ? errors : errors.filter((l) => !new Set(baseline).has(l));
+  ctx.backendTypeErrors = errors;
+  const show = (list: string[]): string =>
+    list.slice(0, 20).join('\n') + (list.length > 20 ? `\n… and ${list.length - 20} more` : '');
+  if (errors.length === 0) {
+    return { text: 'Backend typecheck after this write: no type errors.', data: { newErrors: [], totalErrors: 0 } };
+  }
+  if (baseline === undefined) {
+    return {
+      text: `Backend typecheck after this write: ${errors.length} type error(s) currently in the backend:\n${show(errors)}`,
+      data: { newErrors, totalErrors: errors.length },
+    };
+  }
+  if (newErrors.length > 0) {
+    return {
+      text: `Backend typecheck after this write: ${newErrors.length} NEW type error(s) (${errors.length} total in the backend). Fix them now instead of discovering them at verification:\n${show(newErrors)}`,
+      data: { newErrors, totalErrors: errors.length },
+    };
+  }
+  return {
+    text: `Backend typecheck after this write: no NEW type errors (${errors.length} pre-existing error(s) remain).`,
+    data: { newErrors: [], totalErrors: errors.length },
+  };
+}
+
+/** Annotates a successful write result with the backend typecheck note (never fails the write). */
+async function withBackendTypecheck(ctx: ToolContext, result: ToolResult, touchedBackend: boolean): Promise<ToolResult> {
+  if (!touchedBackend || !result.ok) return result;
+  try {
+    const note = await backendTypecheckNote(ctx);
+    if (!note) return result;
+    const data =
+      result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+        ? { ...(result.data as Record<string, unknown>), typecheck: note.data }
+        : { typecheck: note.data };
+    return { ...result, data, output: result.output ? `${result.output}\n${note.text}` : note.text };
+  } catch {
+    return result;
+  }
+}
+
 function buildTree(root: string, dir: string, relBase: string): FileNode[] {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   const nodes: FileNode[] = [];
@@ -223,9 +310,20 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     assertAreaText(content, p);
     const r = resolveAreaPath(ctx, args.area, p);
     const abs = r.abs;
+    // Fase 1 guards (see writeGuard.ts): no loose scripts at the frontend
+    // root of dynamic projects (the route the observed junk took; static
+    // projects keep exactly their previous behaviour), and never gut a
+    // file its importers depend on. A rejected write is NOT applied.
+    if (r.area === 'frontend') {
+      const rootScript = frontendRootScriptError(r.rel, p);
+      if (rootScript) return fail('ROOT_SCRIPT_REJECTED', rootScript, Date.now() - t0);
+    }
+    const guard = checkWriteGuard({ projectDir: ctx.projectDir, targetAbs: abs, displayPath: p, newContent: content });
+    if (!guard.ok) return fail('WRITE_GUARD_REJECTED', guard.message, Date.now() - t0);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
-    return { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
+    const result: ToolResult = { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
+    return withBackendTypecheck(ctx, result, r.area === 'backend');
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -241,13 +339,33 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
       const content = contentArg(file);
       assertTextDestination(p);
       assertAreaText(content, p);
-      return { path: p, abs: resolveAreaPath(ctx, args.area, p).abs, content };
+      const r = resolveAreaPath(ctx, args.area, p);
+      return { path: p, abs: r.abs, rel: r.rel, area: r.area, content };
     });
+    // Fase 1 guards (see writeGuard.ts), judged against the batch's final
+    // state: an atomic refactor may change an export AND its importers in
+    // one call. Any rejection aborts the whole batch before any write.
+    const batchContents = new Map(files.map((f) => [path.resolve(f.abs), f.content]));
+    for (const file of files) {
+      if (file.area === 'frontend') {
+        const rootScript = frontendRootScriptError(file.rel, file.path);
+        if (rootScript) return fail('ROOT_SCRIPT_REJECTED', rootScript, Date.now() - t0);
+      }
+      const guard = checkWriteGuard({
+        projectDir: ctx.projectDir,
+        targetAbs: file.abs,
+        displayPath: file.path,
+        newContent: file.content,
+        batchContents,
+      });
+      if (!guard.ok) return fail('WRITE_GUARD_REJECTED', guard.message, Date.now() - t0);
+    }
     for (const file of files) {
       fs.mkdirSync(path.dirname(file.abs), { recursive: true });
       fs.writeFileSync(file.abs, file.content, 'utf8');
     }
-    return { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
+    const result: ToolResult = { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
+    return withBackendTypecheck(ctx, result, files.some((f) => f.area === 'backend'));
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -267,7 +385,8 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     const next = current.replace(search, replace);
     assertAreaText(next, p);
     fs.writeFileSync(abs, next, 'utf8');
-    return { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
+    const result: ToolResult = { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
+    return withBackendTypecheck(ctx, result, r.area === 'backend');
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
     return fail((e as { code?: string }).code ?? 'PATCH_FAILED', (e as Error).message, Date.now() - t0);

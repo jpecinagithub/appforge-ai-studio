@@ -115,6 +115,10 @@ interface StoredSettings {
   temperature: number;
   maxTokens: number;
   maxIterations: number;
+  /** Fase 1: hard loop stop for the worker agent (optional: older stored settings may lack it). */
+  maxHardIterations?: number;
+  /** Fase 1: max failed repair verifications per run. */
+  maxRepairAttempts?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -132,6 +136,8 @@ function defaultSettings(): StoredSettings {
     temperature: Number(process.env.LLM_TEMPERATURE ?? 0.2),
     maxTokens: Number(process.env.LLM_MAX_TOKENS ?? 8000),
     maxIterations: 8,
+    maxHardIterations: 60,
+    maxRepairAttempts: 12,
     llmTimeoutMs: Number(process.env.LLM_TIMEOUT_MS ?? 120_000),
     cmdTimeoutMs: 180_000,
     runTimeoutMs: 900_000,
@@ -158,6 +164,8 @@ export function toPublicSettings(s: StoredSettings): Settings {
     temperature: s.temperature,
     maxTokens: s.maxTokens,
     maxIterations: s.maxIterations,
+    maxHardIterations: s.maxHardIterations,
+    maxRepairAttempts: s.maxRepairAttempts,
     llmTimeoutMs: s.llmTimeoutMs,
     cmdTimeoutMs: s.cmdTimeoutMs,
     runTimeoutMs: s.runTimeoutMs,
@@ -181,6 +189,8 @@ export function getAgentSettings(db: Database.Database): AgentSettings {
     temperature: s.temperature,
     maxTokens: s.maxTokens,
     maxIterations: s.maxIterations,
+    maxHardIterations: s.maxHardIterations,
+    maxRepairAttempts: s.maxRepairAttempts,
     llmTimeoutMs: s.llmTimeoutMs,
     cmdTimeoutMs: s.cmdTimeoutMs,
     runTimeoutMs: s.runTimeoutMs,
@@ -540,6 +550,8 @@ const SettingsPatch = z.object({
   temperature: z.number().min(0).max(2).optional(),
   maxTokens: z.number().int().min(1).max(128_000).optional(),
   maxIterations: z.number().int().min(1).max(32).optional(),
+  maxHardIterations: z.number().int().min(8).max(500).optional(),
+  maxRepairAttempts: z.number().int().min(1).max(50).optional(),
   llmTimeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   cmdTimeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   runTimeoutMs: z.number().int().min(60_000).max(3_600_000).optional(),

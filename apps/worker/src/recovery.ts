@@ -112,3 +112,68 @@ export function repairStateKey(frontendFingerprint: string, diagnostic: string):
     .slice(0, 12_000);
   return `${frontendFingerprint}\n${stableDiagnostic}`;
 }
+
+/**
+ * Fase 1 (agent hardening): signature of a verification DIAGNOSTIC alone,
+ * independent of any source fingerprint.
+ *
+ * The stagnation key above mixes fingerprint + diagnostic, so ANY source
+ * edit — even one that leaves the exact same compiler error standing —
+ * resets the stagnation counter and the run can die on the identical error
+ * for dozens of iterations (observed in the pcBOX / PlayStation regression
+ * cases). This signature deliberately ignores the sources: it extracts the
+ * salient, stable parts of the diagnostic (compiler errors by file + TS
+ * code + message, process exit lines, gate headers, ALL-CAPS error codes),
+ * drops ephemeral details (ports, line/column numbers, durations) and
+ * returns them sorted and deduplicated. Two failed verifications with the
+ * same signature mean the repair is going in circles even if files changed
+ * between them.
+ */
+export function repairErrorSignature(diagnostic: string): string {
+  const salient = new Set<string>();
+  for (const rawLine of diagnostic.split('\n')) {
+    const line = rawLine
+      .replaceAll(/127\.0\.0\.1:\d+/g, '127.0.0.1:PORT')
+      .replaceAll(/\b\d{4}-\d{2}-\d{2}T[\d:.]+Z\b/g, 'TIMESTAMP')
+      .replaceAll(/\s+/g, ' ')
+      .trim();
+    if (!line) continue;
+    // Compiler diagnostics: keep file + TS code + message; drop (line,col)
+    // so an edit that merely MOVES the same error still counts as the same
+    // signature.
+    const tsError = line.match(/(\S+?\.(?:ts|tsx|js|jsx|mts|cts))\(\d+,\d+\):\s*(error TS\d+:\s*.*)$/);
+    if (tsError) {
+      salient.add(`${tsError[1]}: ${tsError[2]}`);
+      continue;
+    }
+    if (line.includes('error TS')) {
+      salient.add(line.replace(/\(\d+,\d+\)/g, ''));
+      continue;
+    }
+    // Process outcomes (build/test/migration exits) — counts inside the
+    // line (e.g. "10/17 passed") are meaningful: same counts = no progress.
+    if (/exited with code \d+/.test(line)) {
+      salient.add(line);
+      continue;
+    }
+    // The dynamic gate header already names the missing/stale checks.
+    if (line.startsWith('DYNAMIC CHECKS INCOMPLETE')) {
+      salient.add(line);
+      continue;
+    }
+    // Bare tool error codes: API_TESTS_FAILED, MIGRATION_CHECKSUM_MISMATCH…
+    const codeLine = line.match(/^([A-Z][A-Z0-9_]{3,})(?::|\s-)\s*(.*)$/);
+    if (codeLine) {
+      salient.add(`${codeLine[1]}: ${codeLine[2]}`.trim());
+      continue;
+    }
+  }
+  if (salient.size > 0) return [...salient].sort().join('\n').slice(0, 12_000);
+  // Fallback: the normalized diagnostic itself (same normalization as the
+  // repair state key, minus the fingerprint).
+  return diagnostic
+    .replaceAll(/127\.0\.0\.1:\d+/g, '127.0.0.1:PORT')
+    .replaceAll(/\s+/g, ' ')
+    .trim()
+    .slice(0, 12_000);
+}
