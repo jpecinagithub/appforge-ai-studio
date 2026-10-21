@@ -142,3 +142,7 @@ navegador contra el fixture) pasan sin cambios.
   diagnóstico), `apps/worker/src/browser.test.ts` (+4 tests),
   `apps/worker/src/authFlow.ts` (1 línea: recorte 2000 → 6000).
 - Sin tocar producción, ni el checkout del servidor, ni la plantilla.
+
+## Despliegue (21-oct-2026)
+
+Fusionado en `master` (fast-forward a `af4491b`) y redesplegado en la instancia edu con el procedimiento seguro (sin runs activos). Verificado dentro del contenedor healthy: `collectFailureDiagnostics` y el veredicto `NOT PRESENT in DOM` presentes en el browser.ts en ejecución; health local y público 200.
