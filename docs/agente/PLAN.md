@@ -232,3 +232,7 @@ y herramienta de solo lectura `get_dynamic_status`. Detalle completo en
 `FASE2_RESULTADOS.md`. Cierre: worker 397 ✓ / 0 ✗, servidor 104 ✓ / 0 ✗,
 studio 9 ✓ / 0 ✗, typechecks limpios. La regresión real (Fase 4) sigue
 pendiente.
+
+## Puerta de implementación — COMPLETADA (21-oct-2026, rama `fix/agente-puerta-implementacion`)
+
+Corrección en el backend (no en el prompt) del hueco detectado en el run real de «PcBox online»: las seis comprobaciones se podían satisfacer con la plantilla intacta más una migración. `verify()` exige ahora evidencia estructural (`apps/worker/src/implementationEvidence.ts`): `frontend/src` y `backend/src` distintos de la plantilla, superficie de rutas nueva y superficie de frontend nueva; el diagnóstico `NO_IMPLEMENTATION` enumera los huecos. Si la plantilla no se localiza, se conserva la guarda anterior. 8 tests nuevos (6 de unidad + 2 de bucle, uno reproduce el caso pcBOX); worker 415 ✓, server 110 ✓. Detalle: `docs/agente/PUERTA_IMPLEMENTACION_RESULTADOS.md`. Sin fusionar ni desplegar.

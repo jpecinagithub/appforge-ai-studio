@@ -295,6 +295,64 @@ describe('dynamic completion gate', () => {
   }, 240000);
 
 
+  /** Fixture + starter template with real src trees, for the implementation gate. */
+  function makeTemplatedProject(): string {
+    const fixture = makeGateProject();
+    fs.mkdirSync(path.join(fixture, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(fixture, 'backend', 'src', 'routes'), { recursive: true });
+    fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'App.tsx'), 'export default function App(){return null}');
+    fs.writeFileSync(path.join(fixture, 'frontend', 'src', 'api.ts'), 'export const api={};');
+    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'server.ts'), 'export const app={};');
+    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'todos.ts'), "export default async function todos(app:any){ app.get('/api/todos', async()=>[]); }");
+    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'routes', 'users.ts'), "export default async function users(app:any){ app.get('/api/users', async()=>[]); }");
+    return fixture;
+  }
+
+  function stubTemplatesFrom(fixture: string): void {
+    const templates = path.join(dataDir, 'templates');
+    fs.cpSync(fixture, path.join(templates, 'dynamic-react-node'), { recursive: true });
+    vi.stubEnv('APPFORGE_TEMPLATES_DIR', templates);
+  }
+
+  it('rejects the PcBox case: six checks green, only a migration written', async () => {
+    const fixture = makeTemplatedProject();
+    stubTemplatesFrom(fixture);
+    const runId = setupRun(fixture);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        ...SIX_CHECKS.map(n => toolCall(n)),
+        toolCall('write_files', { area: 'migrations', files: [{ path: '002_catalog.sql', content: 'CREATE TABLE products(id TEXT PRIMARY KEY, name TEXT);' }] }),
+        toolCall('run_migrations'), toolCall('run_api_tests'), toolCall('start_fullstack_preview'), toolCall('test_authenticated_flow'),
+        ...Array.from({ length: 9 }, () => final('Store complete')),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runStatus(runId).status).toBe('error');
+      expect(runStatus(runId).error).toContain('NO_IMPLEMENTATION');
+      expect(runStatus(runId).error).toContain('backend/src is still the untouched starter template');
+    } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
+  }, 240000);
+
+  it('finishes when the run adds a backend route and changes the frontend', async () => {
+    const fixture = makeTemplatedProject();
+    stubTemplatesFrom(fixture);
+    const runId = setupRun(fixture);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        ...SIX_CHECKS.map(n => toolCall(n)),
+        toolCall('write_files', { area: 'backend', files: [{ path: 'src/routes/products.ts', content: "export default async function products(app:any){ app.get('/api/products', async()=>[]); }" }] }),
+        toolCall('write_files', { area: 'frontend', files: [{ path: 'src/App.tsx', content: 'export default function App(){ return <div>STORE</div>; }' }] }),
+        ...SIX_CHECKS.map(n => toolCall(n)),
+        final('Store built'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runStatus(runId).status).toBe('done');
+    } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
+  }, 240000);
+
   it('blocks finishing when the model never runs the tools', async () => {
     const runId = setupRun(makeGateProject());
     script([

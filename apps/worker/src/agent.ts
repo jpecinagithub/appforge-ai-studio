@@ -23,6 +23,7 @@ import { createTools, nowIso, restoreRevision, type BestDynamicStateInfo, type T
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
 import { DYNAMIC_CHECK_ORDER, DYNAMIC_TOOL_DEFS, checkScopeFingerprint, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks, validDynamicPrefixLength, type DynamicCheckKey } from './dynamicTools.js';
+import { implementationEvidence } from './implementationEvidence.js';
 import { deleteVerificationReceipts, recordVerificationReceipt } from './deploy/receipts.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
 import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairErrorSignature, repairStateKey } from './recovery.js';
@@ -725,10 +726,22 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       // unless all six checks are valid on the CURRENT sources and were
       // completed in canonical order. This never depends on the prompt.
       const gate = dynamicGateStatus(ctx);
-      const untouchedTemplate = unchangedStarter() || (isFirstRun && sourceFingerprint(projectDir) === initialProjectFingerprint);
+      // Puerta de implementación: the six checks prove the present code
+      // works, not that the requested app exists — the starter template
+      // passes them by design. Require structural evidence (key areas
+      // changed + new route/frontend surface) instead of the old
+      // any-area-changed guard, which a single migration file defeated
+      // (live case "PcBox online", 2026-10-21). When the template cannot
+      // be located, fall back to the legacy untouched checks.
+      const evidence = implementationEvidence(projectDir, process.env.APPFORGE_TEMPLATES_DIR);
+      const untouchedTemplate = evidence.checked
+        ? !evidence.implemented
+        : (unchangedStarter() || (isFirstRun && sourceFingerprint(projectDir) === initialProjectFingerprint));
       if (!gate.complete || untouchedTemplate) {
         const reasons: string[] = [];
-        if (untouchedTemplate) reasons.push('NO_IMPLEMENTATION: only the starter template was checked; implement the user request before finishing');
+        if (untouchedTemplate) reasons.push(evidence.checked
+          ? `NO_IMPLEMENTATION: ${evidence.missing.join('; ')}. Implement the user request before finishing`
+          : 'NO_IMPLEMENTATION: only the starter template was checked; implement the user request before finishing');
         if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
         if (!gate.orderValid) reasons.push('checks were not completed in the required order');
         const diagnostics = [...criticalFailures.entries()].filter(([key]) => key !== 'dynamicChecks').map(([, value]) => value).join('\n').slice(0, 12000);
