@@ -1072,7 +1072,13 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     const defs = availableToolDefs();
     const once = (messages: LlmMessage[]): Promise<LlmResponse> => stub
       ? stub.chat(messages, TOOL_DEFS)
-      : chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs, ...(singleFileMode ? { maxTokens: Math.min(llmConfig!.maxTokens, 4096) } : {}) }, messages, defs);
+      : chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs, ...(singleFileMode ? { maxTokens: Math.min(llmConfig!.maxTokens, 4096) } : {}), onRetry: (info) => {
+        // A transient provider failure being retried inside the call is
+        // activity, not a hang: refresh the inactivity watchdog and
+        // leave the retry, with its reason, in the run log.
+        lastProgressAt = Date.now();
+        emit(db, runId, 'log', { text: `llm transient failure (${info.code}): ${info.message} — retrying, attempt ${info.attempt + 1}/${info.maxAttempts} after ${info.backoffMs}ms backoff` });
+      } }, messages, defs);
     let resp = await once(history);
     for (let retry = 1; ; retry++) {
       const bad = findMalformedToolCalls(resp.toolCalls, defs);

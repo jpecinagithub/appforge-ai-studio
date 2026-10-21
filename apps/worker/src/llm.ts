@@ -10,9 +10,15 @@
  * endpoints in proxied environments while curl is 100% reliable. curl honors
  * the standard HTTPS_PROXY/NO_PROXY env vars.
  *
- * Retries happen on HTTP 429 / 5xx and on timeouts (max 3 attempts,
- * exponential backoff honoring Retry-After). Other network errors and 4xx
- * fail fast.
+ * Retries happen on TRANSIENT provider failures (max 3 attempts,
+ * exponential backoff honoring Retry-After): HTTP 429 / 5xx, timeouts,
+ * transport failures, and HTTP 200 responses that carry nothing usable
+ * (no choices at all, or neither content nor tool calls). Those are
+ * provider hiccups, not facts — a single one must not kill a run
+ * (production run 8a141027 died on one "LLM returned no choices").
+ * Non-transient HTTP errors (401/402/403/404: auth, quota, unknown
+ * model) and parse-level failures (truncation, bad tool arguments)
+ * fail fast: retrying them would only burn tokens.
  */
 
 import type { LlmMessage, LlmResponse, LlmToolCall, LlmUsage } from 'appforge-shared';
@@ -21,6 +27,20 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+/** One transient provider failure that is about to be retried in-call. */
+export interface LlmRetryInfo {
+  /** The attempt that just failed (1-based). */
+  attempt: number;
+  /** Total attempts the call is allowed, including the first one. */
+  maxAttempts: number;
+  /** LlmError code of the transient failure (see isTransientLlmError). */
+  code: string;
+  /** Provider error message of the failed attempt. */
+  message: string;
+  /** Backoff that will be waited before the next attempt. */
+  backoffMs: number;
+}
 
 export interface LlmConfig {
   provider: 'groq' | 'openrouter';
@@ -31,6 +51,12 @@ export interface LlmConfig {
   apiKey: string;
   /** Absolute run deadline, shared across HTTP retries. */
   deadline?: number;
+  /**
+   * Invoked before each in-call retry of a transient provider failure.
+   * The agent loop uses it to count retries as activity for the
+   * inactivity watchdog and to record them in the run's event log.
+   */
+  onRetry?: (info: LlmRetryInfo) => void;
 }
 
 export interface ToolDef {
@@ -53,6 +79,12 @@ export class LlmError extends Error {
    * calls after the completion-retry budget).
    */
   public fatal = false;
+
+  /**
+   * Raw Retry-After header value (seconds) carried by an HTTP failure,
+   * when the provider sent one. The retry driver honors it via backoffMs.
+   */
+  public retryAfter: string | null = null;
 
   constructor(
     public readonly code: string,
@@ -88,7 +120,7 @@ function toOpenAITools(tools: ToolDef[]): unknown[] {
   }));
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 /**
  * POST JSON via curl (see module docstring for why not undici fetch).
@@ -154,6 +186,84 @@ function backoffMs(attempt: number, retryAfter: string | null): number {
     if (Number.isFinite(s) && s >= 0) return Math.min(s * 1000, 30_000);
   }
   return Math.min(1000 * 2 ** (attempt - 1), 15_000);
+}
+
+/**
+ * Error codes that describe a TRANSIENT provider failure: the provider
+ * hiccuped and the identical request can plausibly succeed a moment
+ * later.
+ *  - LLM_RATE_LIMIT / LLM_SERVER_ERROR: HTTP 429 / 5xx.
+ *  - LLM_TIMEOUT: the per-attempt transport timed out (provider stall).
+ *  - LLM_REQUEST_FAILED: the transport produced no parseable response
+ *    (connection reset, proxy drop) or the 200 body was not valid JSON.
+ *  - LLM_EMPTY: HTTP 200 carrying nothing usable — no `choices` at all
+ *    (thrown by parseResponse), or a choice with neither content nor
+ *    tool calls (isUnusableEmptyResponse).
+ * Everything else fails fast: LLM_HTTP_ERROR (401/402/403/404 — auth,
+ * quota, unknown model; retrying only burns tokens), LLM_TRUNCATED and
+ * LLM_BAD_TOOL_ARGS (parse-level; the agent loop owns their recovery),
+ * RUN_TIMEOUT (the run deadline is a fact, not a hiccup).
+ */
+const TRANSIENT_LLM_CODES: ReadonlySet<string> = new Set([
+  'LLM_RATE_LIMIT',
+  'LLM_SERVER_ERROR',
+  'LLM_TIMEOUT',
+  'LLM_REQUEST_FAILED',
+  'LLM_EMPTY',
+]);
+
+export function isTransientLlmError(err: unknown): err is LlmError {
+  return err instanceof LlmError && TRANSIENT_LLM_CODES.has(err.code);
+}
+
+/**
+ * A parsed response with neither text nor tool calls carries nothing
+ * the agent loop can act on. When the provider reported no error, that
+ * is an empty completion — a transient hiccup, NOT the malformed
+ * tool-call case: a response WITH tool calls, however broken their
+ * arguments, belongs to findMalformedToolCalls and the loop's own
+ * completion-retry path.
+ */
+export function isUnusableEmptyResponse(resp: LlmResponse): boolean {
+  return resp.toolCalls.length === 0 && (resp.content === null || resp.content.trim() === '');
+}
+
+/**
+ * Drives one logical LLM call: runs `attemptOnce` until it succeeds,
+ * retrying transient failures (isTransientLlmError) with the shared
+ * backoff — the pre-existing scheme, exponential 1s/2s/4s capped at
+ * 15s, honoring Retry-After when the failure carried one — up to
+ * MAX_ATTEMPTS total attempts. Each retry is reported through
+ * `onRetry` BEFORE the backoff wait, so the caller can count it as
+ * activity (inactivity watchdog) and record it in the run's log. When
+ * the attempts run out, the last provider error is thrown with the
+ * attempt count in its message — never the bare raw error. A
+ * non-transient LlmError propagates untouched on first occurrence; an
+ * exception that is not an LlmError at all was not exposed by the
+ * client as a provider failure and keeps the historical fail-fast
+ * wrapping. `sleepFn` is injectable for tests.
+ */
+export async function callWithTransientRetries(
+  attemptOnce: () => Promise<LlmResponse>,
+  onRetry?: (info: LlmRetryInfo) => void,
+  sleepFn: (ms: number) => Promise<void> = sleep,
+): Promise<LlmResponse> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await attemptOnce();
+    } catch (err) {
+      if (!(err instanceof LlmError)) {
+        throw new LlmError('LLM_REQUEST_FAILED', String((err as Error)?.message ?? err));
+      }
+      if (!isTransientLlmError(err)) throw err;
+      if (attempt >= MAX_ATTEMPTS) {
+        throw new LlmError(err.code, `${err.message} (attempt ${attempt}/${MAX_ATTEMPTS} — transient retries exhausted)`);
+      }
+      const waitMs = backoffMs(attempt, err.retryAfter);
+      onRetry?.({ attempt, maxAttempts: MAX_ATTEMPTS, code: err.code, message: err.message, backoffMs: waitMs });
+      await sleepFn(waitMs);
+    }
+  }
 }
 
 export function parseResponse(body: unknown): LlmResponse {
@@ -257,50 +367,36 @@ export async function chatLlm(cfg: LlmConfig, messages: LlmMessage[], tools: Too
     tool_choice: 'auto',
   });
 
-  let lastError: unknown = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const remaining = (cfg.deadline ?? Infinity) - Date.now();
-      if (remaining <= 0) throw new LlmError('RUN_TIMEOUT', 'The run deadline was reached');
-      const res = await postJsonCurl(url, headers, payload, Math.min(cfg.timeoutMs, remaining));
-      if (res.status === 429 || res.status >= 500) {
-        lastError = new LlmError(
-          res.status === 429 ? 'LLM_RATE_LIMIT' : 'LLM_SERVER_ERROR',
-          `LLM HTTP ${res.status} (attempt ${attempt}/${MAX_ATTEMPTS})`,
-        );
-        if (attempt < MAX_ATTEMPTS) {
-          await sleep(backoffMs(attempt, res.responseHeaders['retry-after'] ?? null));
-          continue;
-        }
-        throw lastError;
-      }
-      if (res.status < 200 || res.status >= 300) {
-        throw new LlmError('LLM_HTTP_ERROR', `LLM HTTP ${res.status}: ${res.bodyText.slice(0, 500)}`);
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(res.bodyText);
-      } catch {
-        throw new LlmError('LLM_REQUEST_FAILED', `LLM returned invalid JSON: ${res.bodyText.slice(0, 300)}`);
-      }
-      return parseResponse(parsed);
-    } catch (err) {
-      if (err instanceof LlmError && (err.code === 'LLM_RATE_LIMIT' || err.code === 'LLM_SERVER_ERROR')) throw err;
-      if (err instanceof LlmError && err.code === 'LLM_TIMEOUT') {
-        // Timeouts are transient (provider-side stalls): retry with backoff
-        // like 429/5xx instead of failing the whole run on the first stall.
-        lastError = new LlmError('LLM_TIMEOUT', `${err.message} (attempt ${attempt}/${MAX_ATTEMPTS})`);
-        if (attempt < MAX_ATTEMPTS) {
-          await sleep(backoffMs(attempt, null));
-          continue;
-        }
-        throw lastError;
-      }
-      // Any other error (network, parse): fail fast per contract (retries only on 429/5xx).
-      throw err instanceof LlmError ? err : new LlmError('LLM_REQUEST_FAILED', String((err as Error)?.message ?? err));
+  const attemptOnce = async (): Promise<LlmResponse> => {
+    const remaining = (cfg.deadline ?? Infinity) - Date.now();
+    if (remaining <= 0) throw new LlmError('RUN_TIMEOUT', 'The run deadline was reached');
+    const res = await postJsonCurl(url, headers, payload, Math.min(cfg.timeoutMs, remaining));
+    if (res.status === 429 || res.status >= 500) {
+      const err = new LlmError(
+        res.status === 429 ? 'LLM_RATE_LIMIT' : 'LLM_SERVER_ERROR',
+        `LLM HTTP ${res.status}`,
+      );
+      err.retryAfter = res.responseHeaders['retry-after'] ?? null;
+      throw err;
     }
-  }
-  throw lastError;
+    if (res.status < 200 || res.status >= 300) {
+      throw new LlmError('LLM_HTTP_ERROR', `LLM HTTP ${res.status}: ${res.bodyText.slice(0, 500)}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(res.bodyText);
+    } catch {
+      throw new LlmError('LLM_REQUEST_FAILED', `LLM returned invalid JSON: ${res.bodyText.slice(0, 300)}`);
+    }
+    const resp = parseResponse(parsed);
+    if (isUnusableEmptyResponse(resp)) {
+      // HTTP 200, no provider error, yet nothing to act on: an empty
+      // completion is a transient hiccup (see TRANSIENT_LLM_CODES).
+      throw new LlmError('LLM_EMPTY', 'LLM returned an empty response (no content and no tool calls)');
+    }
+    return resp;
+  };
+  return callWithTransientRetries(attemptOnce, cfg.onRetry);
 }
 
 // ---------------------------------------------------------------------------
