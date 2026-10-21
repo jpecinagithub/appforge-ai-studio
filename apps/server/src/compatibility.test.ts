@@ -63,4 +63,30 @@ describe('technology compatibility', () => {
       'OAuth / login social',
     ]);
   });
+
+  describe('URLs are not technology prose', () => {
+    it('accepts a store prompt whose product photo lives on a .net CDN domain', () => {
+      const result = assessTechnologyCompatibility(
+        'Crea una tienda de ordenadores con React y usa esta foto de producto: ' +
+          'https://n11scdn.akamaized.net/a1/1000_1426/16/64/55/98/IMG-7552243188611803526.jpg',
+      );
+
+      expect(result).toEqual({ compatible: true, incompatible: [], message: null });
+    });
+
+    it('still rejects .NET / C# written as prose', () => {
+      const result = assessTechnologyCompatibility('Quiero un backend ASP.NET con C#');
+
+      expect(result.compatible).toBe(false);
+      expect(result.incompatible).toEqual(['Backend .NET / C#']);
+    });
+
+    it('accepts a markdown link whose destination is on a .net domain', () => {
+      const result = assessTechnologyCompatibility(
+        'Crea un catálogo con esta imagen: [foto del producto](https://imagenes.ejemplo.net/foto.jpg)',
+      );
+
+      expect(result).toEqual({ compatible: true, incompatible: [], message: null });
+    });
+  });
 });

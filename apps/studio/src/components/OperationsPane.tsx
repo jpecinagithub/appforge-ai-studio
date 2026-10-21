@@ -149,7 +149,7 @@ export function OperationsPane() {
         <div className="rounded-xl border border-zinc-200 p-3 dark:border-zinc-800">
           <p className="text-xs text-zinc-500">Live</p>
           {runtime?.status === 'running' ? (
-            <a className="mt-2 inline-flex items-center gap-1 text-xs text-cyan-600 hover:underline dark:text-cyan-300" href={publicAppUrlFor(project.id)} target="_blank" rel="noreferrer">
+            <a className="mt-2 inline-flex items-center gap-1 text-xs text-cyan-600 hover:underline dark:text-cyan-300" href={publicAppUrlFor(project.id, undefined, project.type)} target="_blank" rel="noreferrer">
               {es ? 'Abrir aplicación' : 'Open application'} <ExternalLink size={12} />
             </a>
           ) : <p className="mt-2 text-xs text-zinc-500">—</p>}

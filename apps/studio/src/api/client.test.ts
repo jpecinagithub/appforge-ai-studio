@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { API_BASE, api, apiResourceUrl, liveAppUrlFor } from './client';
+import { API_BASE, api, apiResourceUrl, isProjectDeployed, liveAppUrlFor, publicAppUrlFor } from './client';
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -20,6 +20,38 @@ describe('liveAppUrlFor', () => {
 
   it('encodes project ids', () => {
     expect(liveAppUrlFor('project/with spaces?')).toBe(`${API_BASE}/a/project%2Fwith%20spaces%3F/`);
+  });
+});
+
+describe('publicAppUrlFor', () => {
+  it('points static projects at the /p/ route by default', () => {
+    expect(publicAppUrlFor('my app', 'https://studio.example')).toBe(
+      'https://studio.example/p/my%20app/',
+    );
+  });
+
+  it('points dynamic projects at the full-stack /a/ route, never /p/', () => {
+    expect(publicAppUrlFor('my app', 'https://studio.example', 'dynamic')).toBe(
+      'https://studio.example/a/my%20app/',
+    );
+  });
+});
+
+describe('isProjectDeployed', () => {
+  it('is true when the deployment wrote productionUrl even if previewUrl is null', () => {
+    expect(isProjectDeployed({ previewUrl: null, productionUrl: '/a/p1/' }, false)).toBe(true);
+  });
+
+  it('is true for legacy rows that only carry a previewUrl', () => {
+    expect(isProjectDeployed({ previewUrl: '/p/p1/', productionUrl: null }, false)).toBe(true);
+  });
+
+  it('is false when both URLs are null', () => {
+    expect(isProjectDeployed({ previewUrl: null, productionUrl: null }, false)).toBe(false);
+  });
+
+  it('is false in demo mode even with URLs present', () => {
+    expect(isProjectDeployed({ previewUrl: '/p/p1/', productionUrl: '/a/p1/' }, true)).toBe(false);
   });
 });
 

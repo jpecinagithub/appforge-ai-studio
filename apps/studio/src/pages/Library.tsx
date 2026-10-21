@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowDownToLine, FolderOpen, Globe2, Search, Server, Trash2, X } from 'lucide-react';
-import { api, apiResourceUrl, downloadArchive, isDemoMode, liveAppUrlFor, openProjectPreview, publicAppUrlFor } from '../api/client';
+import { api, apiResourceUrl, downloadArchive, isDemoMode, isProjectDeployed, liveAppUrlFor, openProjectPreview, publicAppUrlFor } from '../api/client';
 import type { Project } from '../api/types';
 import { useT } from '../i18n';
 import {
@@ -66,7 +66,7 @@ export function Library() {
     const list = projects.filter((p) => {
       if (typeFilter !== 'all' && p.type !== typeFilter) return false;
       if (statusFilter !== 'all' && p.status !== statusFilter) return false;
-      const deployed = !demoMode && p.previewUrl != null;
+      const deployed = isProjectDeployed(p, demoMode);
       if (deploymentFilter === 'deployed' && !deployed) return false;
       if (deploymentFilter === 'notDeployed' && deployed) return false;
       if (q && !p.name.toLowerCase().includes(q) && !(p.description ?? '').toLowerCase().includes(q)) return false;
@@ -78,7 +78,7 @@ export function Library() {
     return list;
   }, [projects, search, sort, typeFilter, statusFilter, deploymentFilter, demoMode]);
 
-  const deployedCount = projects?.filter((p) => !demoMode && p.previewUrl != null).length ?? 0;
+  const deployedCount = projects?.filter((p) => isProjectDeployed(p, demoMode)).length ?? 0;
   const filtersActive = search.trim() !== ''
     || sort !== 'newest'
     || typeFilter !== 'all'
@@ -212,7 +212,7 @@ export function Library() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {filtered.map((p) => {
-            const deployed = !demoMode && p.previewUrl != null;
+            const deployed = isProjectDeployed(p, demoMode);
             const appUrl = deployed
               ? p.type === 'dynamic'
                 ? liveAppUrlFor(p.id)
@@ -283,7 +283,7 @@ export function Library() {
                     variant="primary"
                     size="sm"
                     onClick={() => openProjectPreview(p.id, p.type)}
-                    disabled={!p.previewUrl}
+                    disabled={!deployed}
                   >
                     <Globe2 className="h-3.5 w-3.5" />
                     {deployed ? t('library.openApp') : t('library.previewAction')}

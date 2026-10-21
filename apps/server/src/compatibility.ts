@@ -54,6 +54,20 @@ function normalize(value: string): string {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
+/**
+ * Las URL no son prosa tecnológica: el dominio «…akamaized.net/…» de la foto
+ * de un producto disparaba /\b\.net\b/ y un encargo legítimo de tienda nacía
+ * rechazado como «Backend .NET / C#». Antes de aplicar los patrones se
+ * retiran del corpus los destinos de enlaces markdown ](…) y las URL con
+ * esquema (https?://… hasta el siguiente espacio); el resto del texto se
+ * analiza exactamente igual que antes.
+ */
+function stripUrls(text: string): string {
+  return text
+    .replace(/\]\([^)]*\)/g, ']')
+    .replace(/https?:\/\/\S+/g, ' ');
+}
+
 function isNegated(text: string, matchIndex: number): boolean {
   const prefix = text.slice(Math.max(0, matchIndex - 60), matchIndex);
   return /(?:\bno\s+(?:usar|uses?|quiero|incluyas?|necesito)|\bsin|\bevita(?:r)?|\bwithout|\bdo\s+not\s+use|\bdon't\s+use|\bavoid)\s+(?:\w+[\s,]+){0,3}$/.test(prefix);
@@ -101,7 +115,7 @@ export function assessTechnologyCompatibility(
   prompt: string,
   language: CompatibilityLanguage = 'es',
 ): CompatibilityAssessment {
-  const text = normalize(prompt);
+  const text = stripUrls(normalize(prompt));
   const incompatible = UNSUPPORTED_TECHNOLOGIES.filter((technology) =>
     technology.patterns.some((pattern) => {
       const match = pattern.exec(text);

@@ -254,10 +254,30 @@ export function liveAppUrlFor(projectId: string): string {
   return apiResourceUrl(`/a/${encodeURIComponent(projectId)}/`);
 }
 
-/** URL absoluta compartible de una app servida por Oracle. */
-export function publicAppUrlFor(projectId: string, origin?: string): string {
+/**
+ * URL absoluta compartible de una app servida por Oracle. La ruta depende
+ * del tipo: un proyecto dynamic vive en /a/<id>/ (full-stack, con API); la
+ * ruta /p/<id>/ es la preview estática y sus POST a /api/* devuelven 404.
+ */
+export function publicAppUrlFor(
+  projectId: string,
+  origin?: string,
+  type: 'static' | 'dynamic' = 'static',
+): string {
   const fallbackOrigin = origin ?? (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
-  return new URL(previewUrlFor(projectId), fallbackOrigin).href;
+  return new URL(type === 'dynamic' ? liveAppUrlFor(projectId) : previewUrlFor(projectId), fallbackOrigin).href;
+}
+
+/**
+ * ¿Muestra la Library el proyecto como desplegado? Manda la URL de
+ * producción que escribe la máquina de despliegue al pasar a live;
+ * previewUrl queda como respaldo para filas antiguas (algunas con ruta /p/).
+ */
+export function isProjectDeployed(
+  project: Pick<Project, 'previewUrl' | 'productionUrl'>,
+  demoMode = isDemoMode(),
+): boolean {
+  return !demoMode && (project.productionUrl ?? project.previewUrl) != null;
 }
 
 /** Abre la preview real o, en demo, un documento local funcional. */

@@ -275,6 +275,59 @@ describe('Fase 7B wiring', () => {
 });
 
 // ---------------------------------------------------------------------------
+// URL del proyecto al pasar a live (la Library del Studio las refleja)
+// ---------------------------------------------------------------------------
+
+describe('project URLs on the live transition', () => {
+  function projectUrls(id: string): { preview_url: string | null; production_url: string | null } {
+    return db
+      .prepare('SELECT preview_url, production_url FROM projects WHERE id=?')
+      .get(id) as { preview_url: string | null; production_url: string | null };
+  }
+
+  function walkToPromoting(depId: string): void {
+    transitionDeployment(db, depId, 'building');
+    transitionDeployment(db, depId, 'migrating');
+    transitionDeployment(db, depId, 'verifying');
+    transitionDeployment(db, depId, 'promoting');
+  }
+
+  it('writes /a/<id>/ into preview_url and production_url on live, idempotently', async () => {
+    addProject('p-urls');
+    const dep = createDeployment(db, { projectId: 'p-urls', target: 'oracle' });
+    expect(projectUrls('p-urls')).toEqual({ preview_url: null, production_url: null });
+    walkToPromoting(dep.id);
+    const { finalizeLiveDeployment } = await import('./stateMachine.js');
+    const runtime = {
+      projectId: 'p-urls',
+      containerName: 'appforge-app-p-urls',
+      liveImage: 'appforge/app-p-urls:dep-1',
+      previousImage: null,
+      status: 'running' as const,
+    };
+    finalizeLiveDeployment(db, dep.id, { runtime });
+    expect(projectUrls('p-urls')).toEqual({
+      preview_url: '/a/p-urls/',
+      production_url: '/a/p-urls/',
+    });
+    // Repetir la finalización sobre un deployment ya live es un no-op.
+    finalizeLiveDeployment(db, dep.id, { runtime });
+    expect(projectUrls('p-urls')).toEqual({
+      preview_url: '/a/p-urls/',
+      production_url: '/a/p-urls/',
+    });
+  });
+
+  it('leaves both URLs null when the deployment fails before live', () => {
+    addProject('p-fail-urls');
+    const dep = createDeployment(db, { projectId: 'p-fail-urls', target: 'oracle' });
+    transitionDeployment(db, dep.id, 'building');
+    transitionDeployment(db, dep.id, 'failed');
+    expect(projectUrls('p-fail-urls')).toEqual({ preview_url: null, production_url: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Criterio 1 — camino completo
 // ---------------------------------------------------------------------------
 

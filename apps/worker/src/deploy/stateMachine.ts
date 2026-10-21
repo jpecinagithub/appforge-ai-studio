@@ -563,12 +563,14 @@ export interface FinalizeLiveInput {
 /**
  * Revisión Codex final (bloqueo 4): finalización correcta ATÓMICA.
  * La actualización de `project_runtime`, la transición del deployment a
- * `live` y su evento correspondiente se persisten en UNA sola transacción
- * SQLite. Si falla cualquiera de las escrituras, la transacción revierte
- * por completo: el nuevo runtime NO queda publicado y el deployment no
- * pasa a `live` (el orquestador lo deja en `failed` vía catch-all, con el
- * diagnóstico del error). Repetir sobre un deployment ya `live` es
- * idempotente (no-op).
+ * `live`, su evento correspondiente y las URL públicas del proyecto
+ * (`projects.production_url`/`preview_url` = `/a/<projectId>/`, para que la
+ * Library del Studio refleje el despliegue) se persisten en UNA sola
+ * transacción SQLite. Si falla cualquiera de las escrituras, la transacción
+ * revierte por completo: el nuevo runtime NO queda publicado y el
+ * deployment no pasa a `live` (el orquestador lo deja en `failed` vía
+ * catch-all, con el diagnóstico del error). Repetir sobre un deployment ya
+ * `live` es idempotente (no-op).
  */
 export function finalizeLiveDeployment(
   db: Database.Database,
@@ -600,6 +602,13 @@ export function finalizeLiveDeployment(
     db.prepare(
       `UPDATE deployments SET status='live', updated_at=?, finished_at=?, error=? WHERE id=?`,
     ).run(now, now, current.error, deploymentId);
+    // El proyecto queda desplegado: sus URL públicas apuntan a la app viva
+    // (/a/<id>/). Solo en esta transición: failed/cancelled no las tocan y
+    // un rollback sigue sirviendo en la misma /a/<id>/.
+    const appPath = `/a/${r.projectId}/`;
+    db.prepare(
+      `UPDATE projects SET production_url=?, preview_url=?, updated_at=? WHERE id=?`,
+    ).run(appPath, appPath, now, r.projectId);
     insertEventRow(db, deploymentId, {
       phase: 'live',
       event: 'transition',
