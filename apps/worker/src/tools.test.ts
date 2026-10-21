@@ -135,6 +135,93 @@ describe('acquire_image', () => {
     const result = await createTools().acquire_image(ctx, { query: 'car', path: 'src/car' });
     expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });
   });
+
+  it('stops at the per-call budget and returns IMAGE_TIMEOUT with retryable + alternatives', async () => {
+    process.env.APPFORGE_IMAGE_CALL_BUDGET_MS = '300';
+    try {
+      const fetchMock = vi.spyOn(globalThis, 'fetch');
+      fetchMock.mockImplementation((async (input: unknown, init?: { signal?: AbortSignal }) => {
+        const url = String(input);
+        if (url.startsWith('https://api.openverse.org/v1/images/?')) {
+          return new Response(JSON.stringify({
+            results: [{
+              title: 'Slow photo', creator: 'Example photographer', license: 'by',
+              url: 'https://images.example.test/slow.jpg',
+              thumbnail: 'https://api.openverse.org/v1/images/example/thumb/',
+              foreign_landing_url: 'https://example.test/photo/slow',
+              width: 1600, height: 900, mature: false,
+            }],
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        // The thumbnail download hangs until the caller's signal aborts it.
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError')));
+        });
+      }) as typeof fetch);
+
+      const t0 = Date.now();
+      const result = await createTools().acquire_image(ctx, { query: 'slow photo', path: 'public/assets/slow' });
+      const elapsed = Date.now() - t0;
+      expect(result.ok).toBe(false);
+      expect(result.code).toBe('IMAGE_TIMEOUT');
+      expect(result.retryable).toBe(true);
+      expect(result.alternatives).toHaveLength(3);
+      expect(result.alternatives!.some((a) => a.includes('fallback: "placeholder"'))).toBe(true);
+      // The 90 s default chain must NOT have run: the 300 ms budget stopped it.
+      expect(elapsed).toBeLessThan(10_000);
+    } finally {
+      delete process.env.APPFORGE_IMAGE_CALL_BUDGET_MS;
+    }
+  });
+
+  it('without fallback, an empty search stays IMAGE_NOT_FOUND (now with alternatives)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: [] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }));
+    const result = await createTools().acquire_image(ctx, { query: 'nonexistent subject', path: 'public/assets/none' });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('IMAGE_NOT_FOUND');
+    expect(result.retryable).toBe(true);
+    expect(result.alternatives).toHaveLength(3);
+    expect(fs.existsSync(path.join(frontendDir, 'public', 'placeholder-illustrative.svg'))).toBe(false);
+  });
+
+  it('fallback "placeholder" writes the platform asset once and reports the degradation', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ results: [] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }));
+    const first = await createTools().acquire_image(ctx, {
+      query: 'unobtainable photo', path: 'public/assets/hero', fallback: 'placeholder',
+    });
+    expect(first.ok).toBe(true);
+    const data = first.data as { path: string; publicUrl: string; degraded: string; requestedPath: string; reason: string };
+    expect(data.degraded).toBe('illustrative-placeholder');
+    expect(data.path).toBe('public/placeholder-illustrative.svg');
+    expect(data.publicUrl).toBe('./placeholder-illustrative.svg');
+    expect(data.requestedPath).toBe('public/assets/hero');
+    expect(data.reason).toBe('IMAGE_NOT_FOUND');
+    const svgPath = path.join(frontendDir, 'public', 'placeholder-illustrative.svg');
+    expect(fs.readFileSync(svgPath, 'utf8')).toContain('Imagen ilustrativa');
+    // A second degraded acquisition reuses the same asset — no ASSET_EXISTS.
+    const second = await createTools().acquire_image(ctx, {
+      query: 'another unobtainable photo', path: 'public/assets/other', fallback: 'placeholder',
+    });
+    expect(second.ok).toBe(true);
+    expect((second.data as { degraded: string }).degraded).toBe('illustrative-placeholder');
+  });
+
+  it('fallback "placeholder" also covers a failed search (HTTP error)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValue(new Response('upstream down', { status: 503 }));
+    const result = await createTools().acquire_image(ctx, {
+      query: 'anything', path: 'public/assets/x', fallback: 'placeholder',
+    });
+    expect(result.ok).toBe(true);
+    expect((result.data as { degraded: string; reason: string }).degraded).toBe('illustrative-placeholder');
+    expect((result.data as { reason: string }).reason).toBe('IMAGE_SEARCH_FAILED');
+  });
 });
 
 describe('path confinement', () => {

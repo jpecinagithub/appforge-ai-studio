@@ -530,6 +530,36 @@ function assetPathWithExtension(requestedPath: string, extension: string): strin
 
 const IMAGE_RETRY_DELAYS_MS = [0, 1_000, 3_000] as const;
 
+/**
+ * Flexibilidad agéntica (§4.3): TOTAL budget for one acquire_image call.
+ * Each fetch keeps its own 30 s cap, but a call may chain up to 6
+ * candidates × 3 retries + trusted-original fallbacks (≈12 min worst
+ * case) — the T-shirts run died on exactly that. When the budget runs
+ * out the call stops trying and reports IMAGE_TIMEOUT with alternatives
+ * (or degrades, if the agent asked for the placeholder fallback).
+ * APPFORGE_IMAGE_CALL_BUDGET_MS overrides it (tests, operations).
+ */
+const IMAGE_CALL_BUDGET_MS = 90_000;
+
+/** Platform placeholder asset (relative to frontend/), written on demand. */
+const PLACEHOLDER_IMAGE_PATH = 'public/placeholder-illustrative.svg';
+const PLACEHOLDER_IMAGE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a4152"/>
+      <stop offset="1" stop-color="#232833"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="600" fill="url(#bg)"/>
+  <g fill="none" stroke="#8b94a7" stroke-width="6" opacity="0.8">
+    <rect x="290" y="205" width="220" height="160" rx="10"/>
+    <circle cx="345" cy="255" r="16"/>
+    <path d="M300 355 L375 290 L430 335 L470 305 L500 355 Z" fill="#8b94a7" stroke="none"/>
+  </g>
+  <text x="400" y="430" text-anchor="middle" font-family="system-ui, sans-serif" font-size="28" fill="#c7cdd9">Imagen ilustrativa</text>
+</svg>
+`;
+
 function retryableImageStatus(status: number): boolean {
   return status === 406 || status === 408 || status === 425 || status === 429 || status >= 500;
 }
@@ -555,9 +585,50 @@ function trustedOriginalImageUrl(value: string | undefined): string | null {
  */
 async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
   const t0 = Date.now();
+  // Flexibilidad agéntica (§4.3): one call, one TOTAL budget. Every fetch
+  // is capped by the smallest of the tool timeout, the 30 s per-fetch cap
+  // and the remaining call budget; when the budget runs out the call
+  // stops instead of chaining candidates in silence.
+  const budgetMs = Number(process.env.APPFORGE_IMAGE_CALL_BUDGET_MS) || IMAGE_CALL_BUDGET_MS;
+  const deadline = t0 + budgetMs;
+  const budgetLeftMs = () => deadline - Date.now();
+  const budgetExhausted = () => budgetLeftMs() <= 0;
+  const fetchSignal = () => AbortSignal.timeout(Math.max(1, Math.min(ctx.cmdTimeoutMs, 30_000, budgetLeftMs())));
+  const usePlaceholder = args.fallback === 'placeholder';
+  const imageAlternatives = [
+    'retry acquire_image with a narrower, more specific query',
+    'call acquire_image again with fallback: "placeholder" to use the platform illustrative placeholder (declared as a degradation in the run summary)',
+    'continue without this image and finish the rest of the app first',
+  ];
+  let query = '';
+  let requestedPath = '';
+  /** Degrade to the platform placeholder when the agent opted in; otherwise a failure that carries its alternatives. */
+  const acquisitionFailure = (code: string, message: string): ToolResult => {
+    if (usePlaceholder) {
+      const abs = resolveIn(ctx.frontendDir, PLACEHOLDER_IMAGE_PATH);
+      if (!fs.existsSync(abs)) {
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, PLACEHOLDER_IMAGE_SVG, 'utf8');
+      }
+      return {
+        ok: true,
+        data: {
+          path: PLACEHOLDER_IMAGE_PATH,
+          publicUrl: './' + PLACEHOLDER_IMAGE_PATH.slice('public/'.length),
+          degraded: 'illustrative-placeholder',
+          query,
+          requestedPath,
+          reason: code,
+        },
+        output: `No real photograph could be acquired for "${query}" (${code}: ${message}); placed the platform illustrative placeholder instead. Use ./placeholder-illustrative.svg in the UI and label it as illustrative. This degradation is declared in the run summary.`,
+        durationMs: Date.now() - t0,
+      };
+    }
+    return { ok: false, code, error: message, retryable: true, alternatives: imageAlternatives, durationMs: Date.now() - t0 };
+  };
   try {
-    const query = strArg(args, 'query').trim();
-    const requestedPath = strArg(args, 'path').replaceAll('\\', '/');
+    query = strArg(args, 'query').trim();
+    requestedPath = strArg(args, 'path').replaceAll('\\', '/');
     if (query.length < 2 || query.length > 160) return fail('INVALID_QUERY', 'query must contain 2 to 160 characters', Date.now() - t0);
     if (!requestedPath.startsWith('public/')) return fail('INVALID_PATH', 'image assets must be saved below public/', Date.now() - t0);
 
@@ -568,9 +639,9 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
     endpoint.searchParams.set('mature', 'false');
     const search = await fetch(endpoint, {
       headers: { Accept: 'application/json', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
-      signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+      signal: fetchSignal(),
     });
-    if (!search.ok) return fail('IMAGE_SEARCH_FAILED', `Openverse returned HTTP ${search.status}`, Date.now() - t0);
+    if (!search.ok) return acquisitionFailure('IMAGE_SEARCH_FAILED', `Openverse returned HTTP ${search.status}`);
     const payload = (await search.json()) as { results?: OpenverseImage[] };
     const candidates = (payload.results ?? [])
       .filter((item) => !item.mature
@@ -584,14 +655,16 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
         const bLandscape = (b.width ?? 0) >= (b.height ?? Infinity) ? 1 : 0;
         return bLandscape - aLandscape || bPixels - aPixels;
       });
-    if (candidates.length === 0) return fail('IMAGE_NOT_FOUND', `No reusable photograph found for "${query}"`, Date.now() - t0);
+    if (candidates.length === 0) return acquisitionFailure('IMAGE_NOT_FOUND', `No reusable photograph found for "${query}"`);
 
     let selected: OpenverseImage | undefined;
     let bytes: Buffer | undefined;
     let extension: string | null = null;
     const downloadDiagnostics: string[] = [];
     for (const candidate of candidates.slice(0, 6)) {
+      if (budgetExhausted()) break;
       for (const delayMs of IMAGE_RETRY_DELAYS_MS) {
+        if (budgetExhausted()) break;
         if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
         try {
           // Download through Openverse's thumbnail proxy instead of contacting
@@ -601,7 +674,7 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
           const response = await fetch(candidate.thumbnail!, {
             headers: { Accept: 'image/*', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
             redirect: 'error',
-            signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+            signal: fetchSignal(),
           });
           extension = imageExtension(response.headers.get('content-type') ?? '');
           const announced = Number(response.headers.get('content-length') ?? 0);
@@ -628,7 +701,7 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
           downloadDiagnostics.push((error as Error).message.slice(0, 120));
         }
       }
-      if (!selected) {
+      if (!selected && !budgetExhausted()) {
         const originalUrl = trustedOriginalImageUrl(candidate.url);
         if (originalUrl) {
           try {
@@ -638,7 +711,7 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
             const response = await fetch(originalUrl, {
               headers: { Accept: 'image/*', 'User-Agent': 'AppForge-AI-Studio/0.1 (licensed asset acquisition)' },
               redirect: 'error',
-              signal: AbortSignal.timeout(Math.min(ctx.cmdTimeoutMs, 30_000)),
+              signal: fetchSignal(),
             });
             extension = imageExtension(response.headers.get('content-type') ?? '');
             const announced = Number(response.headers.get('content-length') ?? 0);
@@ -661,7 +734,10 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
     }
     if (!selected || !bytes || !extension) {
       const detail = [...new Set(downloadDiagnostics)].slice(0, 4).join('; ');
-      return fail('IMAGE_DOWNLOAD_FAILED', `Reusable images were found for "${query}", but none could be downloaded safely${detail ? ` (${detail})` : ''}`, Date.now() - t0);
+      if (budgetExhausted()) {
+        return acquisitionFailure('IMAGE_TIMEOUT', `Image acquisition for "${query}" exceeded the per-call budget of ${budgetMs} ms and stopped trying${detail ? ` (last diagnostics: ${detail})` : ''}`);
+      }
+      return acquisitionFailure('IMAGE_DOWNLOAD_FAILED', `Reusable images were found for "${query}", but none could be downloaded safely${detail ? ` (${detail})` : ''}`);
     }
 
     const relativePath = assetPathWithExtension(requestedPath, extension);
@@ -700,6 +776,7 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
   } catch (e) {
     const name = (e as Error).name;
     const code = name === 'TimeoutError' || name === 'AbortError' ? 'IMAGE_TIMEOUT' : ((e as { code?: string }).code ?? 'IMAGE_ACQUISITION_FAILED');
+    if (code === 'IMAGE_TIMEOUT') return acquisitionFailure('IMAGE_TIMEOUT', (e as Error).message);
     return fail(code, (e as Error).message, Date.now() - t0);
   }
 }
@@ -981,7 +1058,7 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('File path relative to frontend/ (or to the area root).'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Directory path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
-  { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified.', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.') }, required: ['query', 'path'], additionalProperties: false } },
+  { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified. One call has a total time budget; on failure the result carries alternatives. With fallback "placeholder", an unobtainable photo degrades to the official illustrative placeholder asset instead of failing (the degradation is declared in the run summary).', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.'), fallback: { type: 'string', enum: ['placeholder'], description: 'Optional. When set and no real photo can be acquired, place the platform illustrative placeholder (public/placeholder-illustrative.svg) and report success with data.degraded="illustrative-placeholder" instead of an error.' } }, required: ['query', 'path'], additionalProperties: false } },
   { name: 'search_code', description: 'Substring search across text files under frontend/ (or the chosen area on dynamic projects; skips node_modules, dist, .git).', parameters: { type: 'object', properties: { ...AREA_PARAM, pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
   { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },

@@ -193,6 +193,18 @@ export interface ToolResult {
   code?: string;
   durationMs: number;
   output?: string;
+  /**
+   * Flexibilidad agéntica (§4.3): the failure may be retried (possibly
+   * after a change of approach). The loop presents it to the model as-is;
+   * the decision is the agent's.
+   */
+  retryable?: boolean;
+  /**
+   * Flexibilidad agéntica (§4.3): concrete alternative courses of action
+   * the agent may choose instead of repeating the failed call (retry
+   * differently, degrade, skip). Optional and backwards-compatible.
+   */
+  alternatives?: string[];
 }
 
 export type LlmProvider = 'groq' | 'openrouter';
