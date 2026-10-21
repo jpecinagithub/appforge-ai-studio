@@ -15,13 +15,13 @@ import {
 
 async function servePage(
   html: string,
-  routes: Record<string, { status: number; body?: string }> = {},
+  routes: Record<string, { status: number; body?: string | Buffer; contentType?: string }> = {},
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const server = http.createServer((req, res) => {
     const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
     const route = routes[pathname];
     if (route) {
-      res.writeHead(route.status, { 'Content-Type': 'application/json' });
+      res.writeHead(route.status, { 'Content-Type': route.contentType ?? 'application/json' });
       res.end(route.body ?? '{}');
       return;
     }
@@ -217,6 +217,12 @@ it('fails when a step reveals a broken or empty image (post-steps assertion sees
 });
 
 it('passes when the image revealed by a step is healthy', async () => {
+  // Deliberate semantic change (honest image criterion): this test used to
+  // reveal the "healthy" photo as an inline data URI. A data URI produces
+  // no network response, so its provenance cannot be verified — under the
+  // new criterion it no longer counts as a loaded photo (that is exactly
+  // the hole an onError substitution exploited). The healthy photo is now
+  // a real image served as image/png, which is what "healthy" must mean.
   const srv = await servePage(`<!doctype html><html><head><title>Healthy Shop</title></head><body>
     <h1>Sign in</h1>
     <button data-testid="show-products">Show products</button>
@@ -225,15 +231,104 @@ it('passes when the image revealed by a step is healthy', async () => {
       document.querySelector('[data-testid="show-products"]').addEventListener('click', () => {
         document.getElementById('slot').innerHTML =
           '<p>Products loaded</p>' +
-          '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" alt="Healthy product photo">';
+          '<img src="/healthy-product.png" alt="Healthy product photo">';
       });
     </script>
-  </body></html>`);
+  </body></html>`, {
+    '/healthy-product.png': {
+      status: 200,
+      contentType: 'image/png',
+      body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'),
+    },
+  });
   try {
     const result = await checkBrowserAtUrl(srv.url, [
       { action: 'click', selector: '[data-testid="show-products"]' },
       { action: 'expect_text', value: 'Products loaded' },
     ], 30000);
+    expect(result.ok).toBe(true);
+    expect(result.output ?? '').not.toContain('Broken images');
+  } finally { await srv.close(); }
+});
+
+it('fails when an onError handler substitutes a missing photo with an inline placeholder', async () => {
+  // Regression, deployed T-shirts 497f482d: product photos pointed at
+  // absolute paths of files that never existed (/assets/products/*.jpg)
+  // and the card's onError swapped each broken photo for an inline
+  // placeholder, so every <img> ended with naturalWidth > 0 and the flow
+  // verified green while production showed empty boxes. Under the honest
+  // criterion the substituted image has no valid image response — the
+  // swap target is a data URI, which produces no network response — and
+  // the assertion must reject it BY NAME with the substitution reason.
+  const srv = await servePage(`<!doctype html><html><head><title>Shirts Shop</title></head><body>
+    <h1>Tienda de Camisetas Premier League</h1>
+    <div class="card">
+      <img src="/assets/products/arsenal-away.jpg" alt="Arsenal Away Shirt"
+           onerror="this.onerror=null;this.src='data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==';">
+      <p>Arsenal Away Shirt</p>
+      <p>74,99 €</p>
+    </div>
+  </body></html>`, {
+    '/assets/products/arsenal-away.jpg': { status: 404, body: 'not found', contentType: 'text/plain' },
+  });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('Broken images detected');
+    expect(error).toContain('Arsenal Away Shirt');
+    expect(error).toContain('no valid image response observed');
+    expect(error).toContain('error substitution');
+    // The rejection reason is the missing provenance, not the old
+    // naturalWidth verdict — the substituted image DID render pixels.
+    expect(error).not.toContain('naturalWidth 0');
+  } finally { await srv.close(); }
+});
+
+it('passes the same product card when the photo really arrives as an image response', async () => {
+  // The A/B counterpart: identical page and onError handler, but the
+  // photo URL serves real image bytes (200, image/png) — the handler
+  // never fires and the observed response proves the photo loaded.
+  const srv = await servePage(`<!doctype html><html><head><title>Shirts Shop</title></head><body>
+    <h1>Tienda de Camisetas Premier League</h1>
+    <div class="card">
+      <img src="/assets/products/arsenal-away.jpg" alt="Arsenal Away Shirt"
+           onerror="this.onerror=null;this.src='data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==';">
+      <p>Arsenal Away Shirt</p>
+      <p>74,99 €</p>
+    </div>
+  </body></html>`, {
+    '/assets/products/arsenal-away.jpg': {
+      status: 200,
+      contentType: 'image/png',
+      body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'),
+    },
+  });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [], 30000);
+    expect(result.ok).toBe(true);
+    expect(result.output ?? '').not.toContain('Broken images');
+  } finally { await srv.close(); }
+});
+
+it('passes when the app serves the platform illustrative placeholder as image/svg+xml', async () => {
+  // The honest degradation path: the platform placeholder is a real file
+  // the app serves itself (public/placeholder-illustrative.svg), so it
+  // arrives as a 2xx image/svg+xml response and satisfies the criterion
+  // on its own merits — unlike an inline data-URI swap, which cannot.
+  const srv = await servePage(`<!doctype html><html><head><title>Placeholder Shop</title></head><body>
+    <h1>Catalog</h1>
+    <img src="/placeholder-illustrative.svg" alt="Imagen ilustrativa">
+    <p>Product without a real photo yet</p>
+  </body></html>`, {
+    '/placeholder-illustrative.svg': {
+      status: 200,
+      contentType: 'image/svg+xml',
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600" viewBox="0 0 800 600"><rect width="800" height="600" fill="#3a4152"/><text x="400" y="430" text-anchor="middle" font-family="system-ui, sans-serif" font-size="28" fill="#c7cdd9">Imagen ilustrativa</text></svg>',
+    },
+  });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [], 30000);
     expect(result.ok).toBe(true);
     expect(result.output ?? '').not.toContain('Broken images');
   } finally { await srv.close(); }
@@ -383,6 +478,7 @@ it('caps the composed diagnostic at ~6000 chars with the actionable parts first'
     network: ['HTTP 500 POST /a/shop1/api/auth/login'],
     networkUrls: ['http://127.0.0.1/a/shop1/api/auth/login'],
     consoleErrors: ['some console error'],
+    imageResponses: new Map(),
   };
   const out = composeFailureDiagnostic({
     primaryError: new Error('locator timed out'),
