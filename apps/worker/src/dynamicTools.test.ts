@@ -99,6 +99,7 @@ if (mode === 'secrets') {
 }
 mkdirSync(join(root, 'dist'), { recursive: true });
 writeFileSync(join(root, 'dist', out), '<html></html>');
+writeFileSync(join(root, 'dist', 'build-argv.txt'), process.argv.slice(2).join(' '));
 console.log('build ok');
 `;
 
@@ -306,6 +307,23 @@ describe('dynamic tools — fase 5A', () => {
     expect(row.status).toBe('success');
     expect(runningBuilds(db)).toBe(0);
     expect(ctx.dynamicChecks?.frontendBuild).toBeTruthy();
+    db.close();
+  });
+
+  test('run_frontend_build passes --sourcemap to the build (backend does not)', async () => {
+    const dir = track(makeProject());
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    const rf = await tools.run_frontend_build(ctx, {});
+    expect(rf.ok).toBe(true);
+    // Verification builds emit sourcemaps so browser page-error stacks can
+    // be resolved to original sources (stackResolve.ts). The flag reaches
+    // the build script through `npm run build -- --sourcemap`.
+    expect(readFileSync(path.join(dir, 'frontend', 'dist', 'build-argv.txt'), 'utf8')).toContain('--sourcemap');
+    const rb = await tools.run_backend_build(ctx, {});
+    expect(rb.ok).toBe(true);
+    expect(readFileSync(path.join(dir, 'backend', 'dist', 'build-argv.txt'), 'utf8')).not.toContain('--sourcemap');
     db.close();
   });
 

@@ -3,6 +3,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { chromium, type Page, type BrowserContext } from 'playwright-core';
 import type { ToolResult } from 'appforge-shared';
+import { enrichStackWithSourceLocations, type FetchText, type SourceMapCache } from './stackResolve.js';
 
 export interface BrowserStep {
   action: 'click' | 'fill' | 'select' | 'expect_text' | 'expect_visible' | 'reload';
@@ -71,6 +72,35 @@ export interface PageDiagnostics {
 
 function newPageDiagnostics(): PageDiagnostics {
   return { pageErrors: [], hardNetwork: [], network: [], consoleErrors: [] };
+}
+
+/** Bounded text fetch for sourcemap resolution (bundles can be MBs). */
+const stackFetchText: FetchText = async (url) => {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return null;
+    return (await res.text()).slice(0, 24_000_000);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Decorate the collected page errors with original source locations
+ * resolved through the bundle sourcemaps (stackResolve.ts), so the
+ * diagnostic names e.g. frontend/src/App.tsx:300 next to the minified
+ * frame. Best effort by construction: any failure leaves diag untouched.
+ */
+async function enrichPageErrorsWithSourceLocations(diag: PageDiagnostics): Promise<void> {
+  if (diag.pageErrors.length === 0) return;
+  try {
+    const cache: SourceMapCache = new Map();
+    diag.pageErrors = await Promise.all(
+      diag.pageErrors.map((entry) => enrichStackWithSourceLocations(entry, stackFetchText, cache)),
+    );
+  } catch {
+    /* diagnostics must never break the check itself */
+  }
 }
 
 function hasHardErrors(diag: PageDiagnostics): boolean {
@@ -372,6 +402,7 @@ export async function checkBrowser(
     ]);
     return { ok: true, data, output: `Chromium rendered the current bundle on desktop and mobile. ${steps.length} interaction steps passed.\n${data.snapshot}`, durationMs: Date.now() - t0 };
   } catch (error) {
+    await enrichPageErrorsWithSourceLocations(diag);
     const snapshot = page ? await collectFailureDiagnostics(page, failedStep) : null;
     const diagnostic = composeFailureDiagnostic({ primaryError: error as Error, failedStep, diag, snapshot });
     return { ok: false, code: 'BROWSER_FAILED', error: diagnostic, output: diagnostic, durationMs: Date.now() - t0 };
@@ -435,6 +466,7 @@ export async function checkBrowserAtUrl(
     ]);
     return { ok: true, data, output: `Chromium verified the live preview. ${steps.length} interaction steps passed.\n${data.snapshot}`, durationMs: Date.now() - t0 };
   } catch (error) {
+    await enrichPageErrorsWithSourceLocations(diag);
     const snapshot = page ? await collectFailureDiagnostics(page, failedStep) : null;
     const diagnostic = composeFailureDiagnostic({ primaryError: error as Error, failedStep, diag, snapshot });
     return { ok: false, code: 'BROWSER_FAILED', error: diagnostic, output: diagnostic, durationMs: Date.now() - t0 };

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { SourceMapGenerator } from 'source-map-js';
 import {
   checkBrowser,
   checkBrowserAtUrl,
@@ -200,6 +201,47 @@ it('a passing flow carries no failure diagnostic block', async () => {
     expect(result.output ?? '').not.toContain('NOT PRESENT in DOM');
     expect(result.output ?? '').not.toContain(') failed:');
   } finally { await srv.close(); }
+});
+
+it('resolves the page-error stack through the bundle sourcemap in the diagnostic', async () => {
+  // The T-shirts shape: a render crash whose stack only names the minified
+  // bundle. With a sourcemap next to the bundle, the diagnostic must also
+  // carry the ORIGINAL location (frontend/src/App.tsx:300) so the agent
+  // can open the file and fix the line instead of patching blind.
+  const gen = new SourceMapGenerator({ file: 'bundle.js' });
+  gen.addMapping({
+    generated: { line: 1, column: 0 },
+    original: { line: 300, column: 4 },
+    source: '../../src/App.tsx',
+  });
+  const bundle = "throw new Error('kaboom from the catalog render');\n//# sourceMappingURL=bundle.js.map";
+  const map = gen.toString();
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    if (pathname === '/a/shop1/assets/bundle.js') {
+      res.writeHead(200, { 'Content-Type': 'application/javascript' });
+      res.end(bundle);
+      return;
+    }
+    if (pathname === '/a/shop1/assets/bundle.js.map') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(map);
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><html><head><title>Crash Shop</title></head><body><h1>Crash Shop</h1><script src="./assets/bundle.js"></script></body></html>');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  try {
+    const result = await checkBrowserAtUrl(`http://127.0.0.1:${addr.port}/a/shop1/`, [], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('kaboom from the catalog render');
+    expect(error).toContain('↳ original: frontend/src/App.tsx:300');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });
 
 it('caps the composed diagnostic at ~6000 chars with the actionable parts first', () => {

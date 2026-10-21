@@ -427,6 +427,15 @@ async function runStackBuild(
     installCode: string; // e.g. FRONTEND_INSTALL_FAILED
     buildCode: string; // e.g. FRONTEND_BUILD_FAILED
     checkKey: 'frontendBuild' | 'backendBuild';
+    /**
+     * Extra args forwarded to the build script (`npm run build -- <args>`).
+     * The frontend verification build passes --sourcemap so browser
+     * page-error stacks can be resolved back to original sources
+     * (stackResolve.ts / browser.ts). Production app images build
+     * themselves inside Docker with the plain script and stay map-free:
+     * the flag exists only here, at verification time.
+     */
+    buildArgs?: string[];
   },
 ): Promise<ToolResult> {
   const t0 = Date.now();
@@ -449,10 +458,13 @@ async function runStackBuild(
     };
     const fingerprintBefore = sourceFingerprint(cwd);
     // Closed command list: exactly `npm ci` then `npm run build`. No shell,
-    // no arguments from the model.
+    // no arguments from the model (opts.buildArgs is fixed by the caller).
+    const buildStep = opts.buildArgs?.length
+      ? { cmd: 'npm', args: ['run', 'build', '--', ...opts.buildArgs], label: `$ npm run build -- ${opts.buildArgs.join(' ')}` }
+      : { cmd: 'npm', args: ['run', 'build'], label: '$ npm run build' };
     const steps: Array<{ cmd: string; args: string[]; label: string }> = [
       { cmd: 'npm', args: ['ci', '--no-audit', '--no-fund'], label: '$ npm ci' },
-      { cmd: 'npm', args: ['run', 'build'], label: '$ npm run build' },
+      buildStep,
     ];
     let output = '';
     for (const step of steps) {
@@ -521,6 +533,11 @@ async function runFrontendBuild(ctx: ToolContext, args: Record<string, unknown>)
     installCode: 'FRONTEND_INSTALL_FAILED',
     buildCode: 'FRONTEND_BUILD_FAILED',
     checkKey: 'frontendBuild',
+    // Verification builds emit sourcemaps so a page-error stack captured in
+    // Chromium can be resolved to the original source (see stackResolve.ts).
+    // npm appends the flag to the script, i.e. `tsc ... && vite build
+    // --sourcemap`; the template itself is unchanged.
+    buildArgs: ['--sourcemap'],
   });
 }
 
@@ -1288,7 +1305,7 @@ export const DYNAMIC_TOOL_DEFS: ToolDef[] = [
   {
     name: 'run_frontend_build',
     description:
-      'Dynamic projects only: install dependencies (npm ci) and run the production build (npm run build) in <project>/frontend. Verifies dist/index.html exists. Takes no arguments; paths and commands are fixed.',
+      'Dynamic projects only: install dependencies (npm ci) and run the production build with sourcemaps (npm run build -- --sourcemap) in <project>/frontend, so browser page errors can later be resolved to original sources. Verifies dist/index.html exists. Takes no arguments; paths and commands are fixed.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
   },
   {

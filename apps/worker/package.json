@@ -2,7 +2,8 @@
   "description": "AppForge AI Studio \u2014 autonomous coding agent worker (LLM client, tools, orchestrator, job queue)",
   "dependencies": {
     "playwright-core": "1.64.0",
-    "appforge-shared": "0.1.0"
+    "appforge-shared": "0.1.0",
+    "source-map-js": "^1.2.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
