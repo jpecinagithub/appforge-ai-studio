@@ -422,7 +422,13 @@ export async function checkBrowser(
     attachPageDiagnostics(page, diag);
     const remaining = Math.max(1, timeoutMs - (Date.now() - t0));
     const work = async () => {
-      await page!.goto(url, { waitUntil: 'networkidle', timeout: Math.min(remaining, 15_000) });
+      // Navigation waits for 'load' only — never for network rest. The fact
+      // being verified (the app loads and renders) is judged by the content
+      // wait, the image assertions and the steps below; 'networkidle' also
+      // demanded 500 ms of zero connections, which slow image grids,
+      // polling or keep-alive connections can postpone past any ceiling
+      // and fail correct apps (the auth-flow reload died of exactly this).
+      await page!.goto(url, { waitUntil: 'load', timeout: Math.min(remaining, 15_000) });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       await assertImagesLoaded(page!);
       const screenshot = screenshotPath
@@ -500,7 +506,9 @@ export async function checkBrowserAtUrl(
     attachPageDiagnostics(page, diag);
     const remaining = Math.max(1, timeoutMs - (Date.now() - t0));
     const work = async () => {
-      await page!.goto(url, { waitUntil: 'networkidle', timeout: Math.min(remaining, 15_000) });
+      // Same criterion as checkBrowser's goto: 'load', never network rest —
+      // rendering is judged by the assertions and steps that follow.
+      await page!.goto(url, { waitUntil: 'load', timeout: Math.min(remaining, 15_000) });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
       await assertImagesLoaded(page!);
       await runSteps(page!, steps, (f) => { failedStep = f; });
@@ -586,7 +594,21 @@ async function assertImagesLoadedAfterSteps(page: Page): Promise<void> {
 }
 
 async function browserStep(page: Page, step: BrowserStep): Promise<void> {
-  if (step.action === 'reload') { await page.reload({ waitUntil: 'networkidle' }); return; }
+  if (step.action === 'reload') {
+    // The fact this step sets up is session persistence, and it is judged
+    // by the NEXT step's visibility expectation (with its own locator
+    // timeout) — never by the navigation. Waiting for 'networkidle' made a
+    // correct app fail whenever the reloaded screen kept connections open
+    // longer than the page's 5s default navigation timeout: T-shirts
+    // 497f482d (run 0488ed8a) died 3x at this step, "waiting for navigation
+    // until networkidle", while the page already showed the catalog and
+    // the authenticated email — a ~20-photo grid simply takes longer than
+    // 5s to go idle. Even 'load' would gate on those photos, so wait only
+    // for the parsed document; the navigation ceiling matches the initial
+    // goto (15s) and the expectation after the reload does the judging.
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 });
+    return;
+  }
   if (step.action === 'expect_text') {
     if (!step.value) throw new Error('expect_text requires value');
     const scope = step.selector ? page.locator(step.selector) : page;
