@@ -915,6 +915,16 @@ function recordDynamicCheck(ctx: ToolContext, key: DynamicCheckKey): void {
   } catch {
     /* la observabilidad persistida nunca rompe la herramienta */
   }
+  // Fase 2 (Trabajo 6): avisar al orquestador de que se registró una
+  // comprobación. La foto NO se crea aquí (esta función es síncrona y el
+  // espacio de trabajo aún está dentro de la herramienta): el orquestador
+  // la crea al terminar la herramienta que la registró, con las fuentes
+  // quietas y exactamente en el estado que superó la comprobación.
+  try {
+    ctx.onDynamicCheckRecorded?.(key);
+  } catch {
+    /* un aviso roto nunca rompe la herramienta */
+  }
 }
 
 /**
@@ -1031,6 +1041,72 @@ export function dynamicGateStatus(ctx: ToolContext): {
 }
 
 /**
+ * Fase 2: length of the valid prefix — how many checks, from the start of
+ * the canonical order, are currently valid on the CURRENT sources. The
+ * valid checks always form a prefix (the receipts invariant), so this is
+ * simply the count of consecutive non-missing checks from position 0.
+ * Used by the orchestrator to detect progress (Trabajo 6) and to rank
+ * states (Trabajo 7), and by get_dynamic_status (Trabajo 8).
+ */
+export function validDynamicPrefixLength(ctx: ToolContext): number {
+  const { missing } = dynamicGateStatus(ctx);
+  const missingSet = new Set(missing);
+  let n = 0;
+  while (n < DYNAMIC_CHECK_ORDER.length && !missingSet.has(DYNAMIC_CHECK_ORDER[n])) n++;
+  return n;
+}
+
+/**
+ * Fase 2 (Trabajo 8) — `get_dynamic_status`: READ-ONLY view of the dynamic
+ * gate for the agent itself. It runs no check, edits nothing and records
+ * no receipt; it only reports what dynamicGateStatus already knows plus
+ * the best state of the current run (tracked by the orchestrator and read
+ * through ctx.getBestDynamicState). Per check it distinguishes:
+ *  - valid:   receipt exists and its fingerprint matches current sources;
+ *  - stale:   receipt exists but sources changed after it (caducada);
+ *  - missing: the check never recorded a receipt on these sources.
+ */
+async function getDynamicStatus(ctx: ToolContext, args: Record<string, unknown>): Promise<ToolResult> {
+  const t0 = Date.now();
+  const notDynamic = requireDynamic(ctx, t0);
+  if (notDynamic) return notDynamic;
+  if (Object.keys(args).length > 0) {
+    return fail('INVALID_ARGS', 'get_dynamic_status takes no arguments', Date.now() - t0);
+  }
+  const gate = dynamicGateStatus(ctx);
+  const scopes = checkScopes(ctx.projectDir);
+  const valid: DynamicCheckKey[] = [];
+  const stale: DynamicCheckKey[] = [];
+  const missing: DynamicCheckKey[] = [];
+  for (const key of DYNAMIC_CHECK_ORDER) {
+    const stored = ctx.dynamicChecks?.[key];
+    if (stored === undefined) missing.push(key);
+    else if (scopeFingerprint(scopes[key]) !== stored) stale.push(key);
+    else valid.push(key);
+  }
+  let prefixLength = 0;
+  while (prefixLength < DYNAMIC_CHECK_ORDER.length && valid[prefixLength] === DYNAMIC_CHECK_ORDER[prefixLength]) {
+    prefixLength++;
+  }
+  const best = ctx.getBestDynamicState?.() ?? null;
+  return {
+    ok: true,
+    data: {
+      valid,
+      stale,
+      missing,
+      prefixLength,
+      prefix: DYNAMIC_CHECK_ORDER.slice(0, prefixLength),
+      complete: gate.complete,
+      orderValid: gate.orderValid,
+      nextCheck: prefixLength < DYNAMIC_CHECK_ORDER.length ? DYNAMIC_CHECK_ORDER[prefixLength] : null,
+      best,
+    },
+    durationMs: Date.now() - t0,
+  };
+}
+
+/**
  * Fase 5B — is the fullstackPreview receipt still valid on the current
  * sources (and correctly ordered after the 5A prefix)? Used by
  * test_authenticated_flow to refuse a stale preview.
@@ -1110,6 +1186,12 @@ export const DYNAMIC_TOOL_DEFS: ToolDef[] = [
     parameters: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
+    name: 'get_dynamic_status',
+    description:
+      'Dynamic projects only (Fase 2): READ-ONLY status of the six-check verification gate on the CURRENT sources: which checks are valid, stale (sources changed after they passed) or missing, the current valid prefix length, the next check to run, and the best state reached this run with its automatic photo. Runs no check and changes nothing. Takes no arguments.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
     name: 'deploy_project',
     description:
       'Dynamic projects only (Fase 6): run the persistent full-stack deployment pipeline (pending → building → migrating → verifying → promoting → live, with single-attempt rollback and persistent cancellation) through the configured deployment driver. Requires the 5A/5B verification gate to be current on the present sources. Deterministic: takes no arguments — no commands, paths, image names, container names or Docker arguments are accepted; all identifiers are derived internally. Refuses with DEPLOYMENT_DRIVER_NOT_CONFIGURED when no real driver is configured (never simulates a real deployment). Cannot set deployment states manually.',
@@ -1125,6 +1207,7 @@ export function createDynamicTools(): Record<string, ToolHandler> {
     run_api_tests: runApiTests,
     start_fullstack_preview: startFullstackPreviewTool,
     test_authenticated_flow: testAuthenticatedFlowTool,
+    get_dynamic_status: getDynamicStatus,
     deploy_project: deployProjectTool,
   };
 }

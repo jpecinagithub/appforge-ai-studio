@@ -57,6 +57,19 @@ export interface ToolContext {
   dynamicChecksOrder?: Array<
     'frontendBuild' | 'backendBuild' | 'migrations' | 'apiTests' | 'fullstackPreview' | 'authenticatedFlow'
   >;
+  /**
+   * Fase 2 (Trabajo 6): invoked synchronously by recordDynamicCheck whenever
+   * a dynamic check is recorded. The orchestrator uses it to notice prefix
+   * growth after the tool that recorded the check finishes (the workspace
+   * is quiet then) and take the automatic photo. Optional: tools and tests
+   * that never set it behave exactly as before.
+   */
+  onDynamicCheckRecorded?: (checkKey: string) => void;
+  /**
+   * Fase 2 (Trabajo 8): best state of the CURRENT run as tracked by the
+   * orchestrator (prefix + photo). Read by the get_dynamic_status tool.
+   */
+  getBestDynamicState?: () => BestDynamicStateInfo | null;
   browserSession?: BrowserSession;
   lastBrowserSteps?: BrowserStep[];
   /**
@@ -82,6 +95,23 @@ export interface ToolContext {
 }
 
 export type ToolHandler = (ctx: ToolContext, args: Record<string, unknown>) => Promise<ToolResult>;
+
+/**
+ * Fase 2 (Trabajo 7/8): public view of the best dynamic state reached in the
+ * current run, as tracked by the orchestrator. Exposed to tools through
+ * `ToolContext.getBestDynamicState` so `get_dynamic_status` can report it
+ * without owning the tracking itself.
+ */
+export interface BestDynamicStateInfo {
+  /** Length of the valid-check prefix when the photo was taken (0–6). */
+  prefixLength: number;
+  /** Canonical key of the last check that extended the prefix. */
+  lastCheck: string;
+  /** API tests passed on those exact sources (tie-breaker; 0 if not run). */
+  apiTestsPassed: number;
+  /** Row id in the revisions table for the automatic photo. */
+  revisionId: string;
+}
 
 const TRUNC_CHARS = 20_000;
 const MAX_FILE_BYTES = 1_000_000;
@@ -849,6 +879,34 @@ async function createRevision(ctx: ToolContext, args: Record<string, unknown>): 
   } catch (e) {
     return fail('REVISION_FAILED', (e as Error).message, Date.now() - t0);
   }
+}
+
+/**
+ * Fase 2 (Trabajo 7) — orchestrator-only restore to a revision's commit.
+ * Deliberately NOT exposed as an agent tool: only the orchestrator decides
+ * to restore, and only after the agent loop has ended.
+ *
+ * Semantics: `git reset --hard <sha>` (same as the manual restore endpoint
+ * in the server) PLUS `git clean -fd`, so files created after the photo
+ * (which the photo never contained) do not survive either — the workspace
+ * ends up EXACTLY at the photo. `clean -fd` never touches ignored paths
+ * (node_modules/, dist/, .env, data/*.db, backups/), so the generated app's
+ * database and installed dependencies are preserved.
+ */
+export async function restoreRevision(
+  ctx: ToolContext,
+  gitSha: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const cwd = ctx.projectDir;
+  const reset = await runCmd('git', ['reset', '--hard', gitSha], { cwd, timeoutMs: 60_000 });
+  if (reset.code !== 0) {
+    return { ok: false, error: `git reset --hard ${gitSha} failed: ${(reset.stdout + reset.stderr).slice(0, 500)}` };
+  }
+  const clean = await runCmd('git', ['clean', '-fd'], { cwd, timeoutMs: 60_000 });
+  if (clean.code !== 0) {
+    return { ok: false, error: `git clean -fd failed: ${(clean.stdout + clean.stderr).slice(0, 500)}` };
+  }
+  return { ok: true };
 }
 
 const ALLOWED_COMMANDS = new Set(['npm', 'npx', 'node']);
