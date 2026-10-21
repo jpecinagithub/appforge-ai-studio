@@ -50,6 +50,84 @@ it('keeps localStorage between browser tool calls despite temporary port changes
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+it('reload does not wait for network rest: a slow product photo cannot fail a recovered session', async () => {
+  // Regression, T-shirts 497f482d run 0488ed8a: with the shop wired, the
+  // authenticated flow failed 3x at the reload step (6/9) — "page.reload:
+  // Timeout 5000ms exceeded, waiting for navigation until networkidle" —
+  // while its own failure snapshot showed the catalog and the signed-in
+  // email. A grid of ~20 product photos keeps connections open far longer
+  // than the 5s navigation ceiling. The reload's fact is session
+  // persistence, judged by the expectation that follows it — so a slow
+  // photo must not be able to fail the step sequence below.
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    if (pathname === '/slow-photo.jpg') {
+      // Slower than the old 5s navigation ceiling, faster than the 15s
+      // initial-goto ceiling: under the old networkidle waits the first
+      // load survived (idle at ~7s) and only the reload died — the exact
+      // production signature.
+      const timer = setTimeout(() => {
+        try {
+          res.writeHead(200, { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store' });
+          res.end(Buffer.from('R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==', 'base64'));
+        } catch { /* browser already gone */ }
+      }, 6_500);
+      timer.unref();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`<!doctype html><html><head><title>Premier League Shirts</title></head><body>
+      <h1>Tienda de Camisetas Premier League</h1>
+      <p data-testid="user-email">someone@example.com</p>
+      <img src="/slow-photo.jpg" alt="Arsenal Away Shirt">
+      <p>Arsenal Away Shirt 74,99 €</p>
+    </body></html>`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  try {
+    const result = await checkBrowserAtUrl(`http://127.0.0.1:${addr.port}/`, [
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+      { action: 'reload' },
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+    ], 60_000);
+    expect(result.ok).toBe(true);
+    expect((result.data as { stepsPassed: number }).stepsPassed).toBe(3);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+it('reload still fails at the expectation when the session is not recovered after it', async () => {
+  // The counterpart: when the reload genuinely loses the session, the flow
+  // must fail on the user-email expectation that follows the reload (step
+  // 3/3) — the fact the reload exists to set up — not on the navigation.
+  const srv = await servePage(`<!doctype html><html><head><title>Session Shop</title></head><body>
+    <h1>Session Shop</h1>
+    <div id="slot"></div>
+    <script>
+      const loads = Number(sessionStorage.getItem('loads') || 0) + 1;
+      sessionStorage.setItem('loads', String(loads));
+      document.getElementById('slot').innerHTML = loads > 1
+        ? '<div data-testid="auth-screen"><p>Sign in again</p></div>'
+        : '<p data-testid="user-email">someone@example.com</p>';
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+      { action: 'reload' },
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+    ], 30_000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('step 3/3 (expect_text "[data-testid="user-email"]") failed:');
+    expect(error).not.toContain('page.reload');
+    expect(error).not.toContain('waiting for navigation');
+  } finally { await srv.close(); }
+});
+
 it('rejects a bundle with a broken image', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-browser-image-'));
   try {
