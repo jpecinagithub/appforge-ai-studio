@@ -157,3 +157,7 @@ solo las validaciones internas de las herramientas.
 - Nada de esto protege contra un proveedor que directamente **no
   responde** o responde sin `choices`: esos caminos (`LLM_EMPTY`,
   timeouts, 429/5xx) ya tenían su tratamiento y no cambian.
+
+## Despliegue (21-oct-2026)
+
+Fusionada en `master` (fast-forward a `4f7e927`) y redesplegada en la instancia edu con el procedimiento seguro (sin runs activos, mod local del compose conservada). Verificado dentro del contenedor healthy: `findMalformedToolCalls` en llm.ts y agent.ts, `TOOL_ARGUMENT_STAGNATION` en agent.ts, marca `empty-arguments` en el parseo; health local y público 200.
