@@ -190,3 +190,7 @@ worker (`npx tsc --noEmit -p tsconfig.json` en `apps/worker`) limpio.
 - Tests: `apps/worker/src/backendContracts.test.ts`,
   `apps/worker/src/dynamicTools.test.ts`.
 - Docs: este fichero + apéndice en `docs/agente/PLAN.md`.
+
+## Despliegue (21-oct-2026)
+
+Fusionada en `master` (fast-forward a `bee0701`) y redesplegada en la instancia edu con el procedimiento seguro (sin runs activos, mod local del compose conservada). Verificado dentro del contenedor healthy: `SCHEMA_CONTRACT_VIOLATION` y `deriveTemplateSchema` en `dynamicTools.ts`, `auth/session.ts` en los contratos de `agent.ts`, y la plantilla servida SIN `backend/node_modules` — la condición pelada de los tests PARITY — con su `migrations/001_init.sql` presente: la derivación por SQL directo opera también en este entorno. Health local y público 200.
