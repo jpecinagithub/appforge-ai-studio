@@ -16,6 +16,7 @@ import { dependencyFingerprint, lockMatchesManifest, sourceFingerprint } from '.
 import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.js';
 import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
 import { checkWriteGuard, frontendRootScriptError } from './writeGuard.js';
+import { backendContractsNote } from './backendContracts.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -261,6 +262,19 @@ async function backendTypecheckNote(ctx: ToolContext): Promise<BackendTypecheckN
   };
 }
 
+/**
+ * Typecheck note + backend contract lint together (never fails the write).
+ * The contract lint is pure text scanning, so unlike tsc it also speaks
+ * before the backend dependencies are installed (see backendContracts.ts).
+ */
+async function withBackendNotes(ctx: ToolContext, result: ToolResult, touchedBackend: boolean, snippets: string[]): Promise<ToolResult> {
+  const noted = await withBackendTypecheck(ctx, result, touchedBackend);
+  if (!touchedBackend || !noted.ok) return noted;
+  const note = backendContractsNote(ctx.projectDir, snippets);
+  if (!note) return noted;
+  return { ...noted, output: noted.output ? `${noted.output}\n${note}` : note };
+}
+
 /** Annotates a successful write result with the backend typecheck note (never fails the write). */
 async function withBackendTypecheck(ctx: ToolContext, result: ToolResult, touchedBackend: boolean): Promise<ToolResult> {
   if (!touchedBackend || !result.ok) return result;
@@ -353,7 +367,7 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
     const result: ToolResult = { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
-    return withBackendTypecheck(ctx, result, r.area === 'backend');
+    return withBackendNotes(ctx, result, r.area === 'backend', [content]);
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -395,7 +409,7 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
       fs.writeFileSync(file.abs, file.content, 'utf8');
     }
     const result: ToolResult = { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
-    return withBackendTypecheck(ctx, result, files.some((f) => f.area === 'backend'));
+    return withBackendNotes(ctx, result, files.some((f) => f.area === 'backend'), files.filter((f) => f.area === 'backend').map((f) => f.content));
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -416,7 +430,7 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     assertAreaText(next, p);
     fs.writeFileSync(abs, next, 'utf8');
     const result: ToolResult = { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
-    return withBackendTypecheck(ctx, result, r.area === 'backend');
+    return withBackendNotes(ctx, result, r.area === 'backend', [replace]);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
     return fail((e as { code?: string }).code ?? 'PATCH_FAILED', (e as Error).message, Date.now() - t0);

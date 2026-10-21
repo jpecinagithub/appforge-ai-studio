@@ -353,6 +353,34 @@ describe('dynamic completion gate', () => {
     } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
   }, 240000);
 
+  it('annotates contract violations in the same write turn (agent autonomy)', async () => {
+    const fixture = makeTemplatedProject();
+    fs.mkdirSync(path.join(fixture, 'backend', 'src', 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(fixture, 'backend', 'src', 'lib', 'errors.ts'),
+      "export type ErrorCode = 'VALIDATION_ERROR' | 'NOT_FOUND' | 'CONFLICT';\nexport function sendError(reply: unknown, code: ErrorCode, message: string) { return { code, message }; }");
+    stubTemplatesFrom(fixture);
+    const runId = setupRun(fixture);
+    const proxy = await startGateProxy();
+    vi.stubEnv('APPFORGE_STUDIO_URL', proxy.url);
+    try {
+      script([
+        toolCall('write_files', { area: 'backend', files: [{ path: 'src/routes/products.ts', content: "import { sendError } from '../lib/errors.js';\nexport default async function products(app:any, db:any){\n  app.post('/api/cart', async (req:any, reply:any) => { const tx = db.transaction(() => 1); tx(); return sendError(reply, 'INSUFFICIENT_STOCK', 'Not enough stock.'); });\n}" }] }),
+        toolCall('write_files', { area: 'frontend', files: [{ path: 'src/App.tsx', content: 'export default function App(){ return <div>STORE</div>; }' }] }),
+        ...SIX_CHECKS.map(n => toolCall(n)),
+        final('Store built'),
+      ]);
+      await runAgentOnce(db, runId, { dataDir, settings });
+      expect(runStatus(runId).status).toBe('done');
+      const results = db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='tool_result'").all(runId) as Array<{ payload_json: string }>;
+      const writeOutputs = results.map((r) => { try { return JSON.parse(r.payload_json) as { name?: string; output?: string }; } catch { return {}; } })
+        .filter((p) => p.name === 'write_files').map((p) => p.output ?? '');
+      const annotated = writeOutputs.find((o) => o.includes('Backend contract check'));
+      expect(annotated).toBeTruthy();
+      expect(annotated).toContain('INSUFFICIENT_STOCK');
+      expect(annotated).toContain('BEGIN IMMEDIATE');
+    } finally { await proxy.close(); delete process.env.APPFORGE_STUDIO_URL; delete process.env.APPFORGE_TEMPLATES_DIR; db.close(); }
+  }, 240000);
+
   it('blocks finishing when the model never runs the tools', async () => {
     const runId = setupRun(makeGateProject());
     script([

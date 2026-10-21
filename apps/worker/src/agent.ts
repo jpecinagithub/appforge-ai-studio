@@ -83,6 +83,8 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     '- run_migrations always runs against a temporary verification database; it never touches a live database.',
     '- start_fullstack_preview launches an ephemeral local preview (temporary SQLite, loopback only) published at /a/:projectId/ through the Studio proxy. test_authenticated_flow verifies it via API calls and real Chromium using stable data-testid selectors. Previews are provisional, never deployments.',
     '- During repair, consult get_dynamic_status BEFORE acting: it shows the current gate (valid/stale/missing checks, current prefix and best state reached this run), so you fix the earliest broken check instead of guessing.',
+    '- IMPLEMENT BEFORE YOU VERIFY: the six checks pass on the untouched template, so running them first proves nothing and wastes the run. Write the backend routes and the frontend FIRST; run run_backend_build immediately after the backend writes to surface compiler errors while they are cheap; run the full six-check sequence only when the implementation exists.',
+    '- TEMPLATE API FACTS (these are mechanical, do not improvise alternatives): (1) The backend database is node:sqlite DatabaseSync — there is NO .transaction() helper (that is better-sqlite3 API). Wrap multi-statement writes with db.exec(\'BEGIN IMMEDIATE\') / db.exec(\'COMMIT\') / on error db.exec(\'ROLLBACK\'), or use withTransaction(db, fn) from backend/src/db/index.ts when present. Use the queryOne/queryAll helpers from that same file. (2) sendError codes form a CLOSED union in backend/src/lib/errors.ts (in your context below): inventing a code such as INSUFFICIENT_STOCK is a compile error — either use a valid code or add the new code to the union AND its STATUS map in that one file. (3) Register new route modules in backend/src/server.ts following the existing register*Routes pattern.',
   ] : [];
   return [
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
@@ -399,7 +401,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         `\nCURRENT CORE FILES:\n${['package.json', 'tsconfig.app.json', 'src/App.tsx', 'src/index.css'].map((file) => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(frontendDir, file), 'utf8').slice(0, 14000)}`; } catch { return `--- ${file}: missing ---`; }
         }).join('\n')}`,
-        ...(isDynamicProject ? [`\nDYNAMIC TEMPLATE CONTRACTS (project-relative paths; preserve these contracts):\n${['backend/package.json', 'backend/src/server.ts', 'backend/src/auth/routes.ts', 'backend/src/db/index.ts', 'frontend/src/api.ts', 'frontend/src/api-url.ts'].map(file => {
+        ...(isDynamicProject ? [`\nDYNAMIC TEMPLATE CONTRACTS (project-relative paths; preserve these contracts):\n${['backend/package.json', 'backend/src/server.ts', 'backend/src/auth/routes.ts', 'backend/src/db/index.ts', 'backend/src/lib/errors.ts', 'backend/src/routes/todos.ts', 'frontend/src/api.ts', 'frontend/src/api-url.ts'].map(file => {
           try { return `--- ${file} ---\n${fs.readFileSync(path.join(projectDir, file), 'utf8').slice(0, 9000)}`; } catch { return `--- ${file}: missing ---`; }
         }).join('\n')}`] : []),
         `\nRECENT CONVERSATION:\n${recent || '(none)'}`,
@@ -530,6 +532,21 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         apiTestsPassedCurrent > bestState.apiTestsPassed
       ) {
         bestState = { ...bestState, apiTestsPassed: apiTestsPassedCurrent };
+      }
+      // Autonomy: a failed backend build almost always means a violated
+      // template contract. Attach the two contract files the errors refer
+      // to (error codes and the database helpers) to THIS result, so the
+      // model repairs against the real contracts in the next turn instead
+      // of spending turns discovering them (live case a9864671).
+      if (name === 'run_backend_build' && !result.ok) {
+        const excerpts = ['backend/src/lib/errors.ts', 'backend/src/db/index.ts'].map((file) => {
+          try { return `--- ${file} ---\n${fs.readFileSync(path.join(projectDir, file), 'utf8').slice(0, 4500)}`; }
+          catch { return `--- ${file}: missing ---`; }
+        }).join('\n');
+        result = {
+          ...result,
+          output: `${result.output ?? ''}\n\nTEMPLATE CONTRACTS RELEVANT TO THIS FAILURE (repair against these exact APIs):\n${excerpts}`.slice(0, 12000),
+        };
       }
     }
     return result;
@@ -745,7 +762,12 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         if (gate.missing.length > 0) reasons.push(`missing or stale checks: ${gate.missing.join(', ')}`);
         if (!gate.orderValid) reasons.push('checks were not completed in the required order');
         const diagnostics = [...criticalFailures.entries()].filter(([key]) => key !== 'dynamicChecks').map(([, value]) => value).join('\n').slice(0, 12000);
-        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.\n${diagnostics}`;
+        // When the gap is implementation, ordering the model to re-run the
+        // checks teaches it to loop on verification; order it to build.
+        const instruction = untouchedTemplate
+          ? 'IMPLEMENT FIRST: write the missing backend routes and the frontend NOW. Do NOT re-run the checks until the implementation exists — they pass on the untouched template and prove nothing.'
+          : 'Run the missing tools now, in this exact order: run_frontend_build → run_backend_build → run_migrations → run_api_tests → start_fullstack_preview → test_authenticated_flow. Do not declare the app finished until all six succeed on the current sources.';
+        lastError = `DYNAMIC CHECKS INCOMPLETE (${reasons.join('; ')}). ${instruction}\n${diagnostics}`;
         criticalFailures.set('dynamicChecks', lastError);
         repairing = true;
         const state = repairStateKey(sourceFingerprint(projectDir), lastError);
