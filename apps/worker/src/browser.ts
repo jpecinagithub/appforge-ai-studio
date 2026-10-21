@@ -40,6 +40,17 @@ const MIME: Record<string, string> = {
 // (no data), so a post-login catalog full of broken images used to verify
 // green; the post-steps assertion is what catches it, and its failure
 // snapshot shows that final screen.
+//
+// "Loaded" is an honest criterion, not just a rendered one: a completed
+// <img> counts only when it rendered real pixels (naturalWidth > 0) AND
+// this check observed its currentSrc arrive as a 2xx image/* network
+// response. An onError handler that swaps a missing file for an inline
+// placeholder leaves naturalWidth > 0 but no such response — the deployed
+// T-shirts shop verified green with product photos that never existed
+// exactly that way (absolute /assets/products/*.jpg paths, masked by the
+// card's onError fallback). The platform placeholder is unaffected: it is
+// a real file served as image/svg+xml, so it satisfies the criterion on
+// its own merits (and is separately declared as a degradation).
 // ---------------------------------------------------------------------------
 
 /** Resource types whose failures were already fatal before this change. */
@@ -59,6 +70,14 @@ export interface FailedStep {
   step: BrowserStep;
 }
 
+/** One observed network response for an image resource. */
+export interface ObservedImageResponse {
+  status: number;
+  contentType: string;
+  /** True when the status is 2xx and the content type is image/*. */
+  valid: boolean;
+}
+
 export interface PageDiagnostics {
   /** Page errors with stack excerpts; these fail the check (as before). */
   pageErrors: string[];
@@ -70,10 +89,44 @@ export interface PageDiagnostics {
   networkUrls: string[];
   /** Console messages of type 'error', deduped, capped. Context only. */
   consoleErrors: string[];
+  /**
+   * Image responses observed during the check, keyed by URL without the
+   * query string. The image assertion consults this registry: a photo
+   * counts as loaded only when its bytes were seen arriving as a valid
+   * (2xx, image/*) response — provenance an onError substitution cannot
+   * fake, because a data-URI swap produces no network response at all.
+   */
+  imageResponses: Map<string, ObservedImageResponse>;
 }
 
 function newPageDiagnostics(): PageDiagnostics {
-  return { pageErrors: [], hardNetwork: [], network: [], networkUrls: [], consoleErrors: [] };
+  return { pageErrors: [], hardNetwork: [], network: [], networkUrls: [], consoleErrors: [], imageResponses: new Map() };
+}
+
+/** Registry key for image URLs: the full URL minus its query string. */
+function imageResponseKey(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl);
+    u.search = '';
+    return u.href;
+  } catch {
+    return rawUrl.split('?')[0] ?? rawUrl;
+  }
+}
+
+/**
+ * Record one observed image response. A valid observation is proof the
+ * bytes arrived and is never displaced by a later invalid one (a cache
+ * revalidation or a retried error page must not un-prove a photo that
+ * loaded); an invalid observation yields to any later one (a retry that
+ * eventually serves the real image replaces the earlier failure).
+ */
+function recordImageResponse(diag: PageDiagnostics, url: string, status: number, contentType: string): void {
+  const valid = status >= 200 && status < 300
+    && (contentType.split(';')[0] ?? '').trim().toLowerCase().startsWith('image/');
+  const key = imageResponseKey(url);
+  if (diag.imageResponses.get(key)?.valid && !valid) return;
+  diag.imageResponses.set(key, { status, contentType, valid });
 }
 
 /** Bounded text fetch for sourcemap resolution (bundles can be MBs). */
@@ -151,8 +204,14 @@ function attachPageDiagnostics(page: Page, diag: PageDiagnostics): void {
     if (hard) pushUnique(diag.hardNetwork, line, 200);
   };
   page.on('response', (response) => {
-    if (response.status() < 400) return;
     const request = response.request();
+    // Record EVERY image response (any status), not just failures: the
+    // image assertion needs the positive observations to tell a photo
+    // that really arrived from one an onError handler faked.
+    if (request.resourceType() === 'image') {
+      recordImageResponse(diag, response.url(), response.status(), response.headers()['content-type'] ?? '');
+    }
+    if (response.status() < 400) return;
     recordFailure(
       `HTTP ${response.status()} ${request.method()} ${urlPath(response.url())}`,
       response.url(),
@@ -430,7 +489,7 @@ export async function checkBrowser(
       // and fail correct apps (the auth-flow reload died of exactly this).
       await page!.goto(url, { waitUntil: 'load', timeout: Math.min(remaining, 15_000) });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
-      await assertImagesLoaded(page!);
+      await assertImagesLoaded(page!, diag);
       const screenshot = screenshotPath
         ? await page!.screenshot({
           type: 'webp',
@@ -443,14 +502,14 @@ export async function checkBrowser(
       // Post-steps: re-assert images on the FINAL screen (after the mobile
       // viewport pass below there is a third check); errors collected during
       // the steps are judged by the hasHardErrors gate further down.
-      await assertImagesLoadedAfterSteps(page!);
+      await assertImagesLoadedAfterSteps(page!, diag);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       // Capture accessible controls as feedback for the agent's next interaction test.
       const snapshot = (await page!.locator('body').ariaSnapshot()).slice(0, 8000);
       const interactiveControls = await page!.locator('button:visible, input:visible, select:visible, textarea:visible, [role="button"]:visible').count();
       await page!.setViewportSize({ width: 390, height: 844 });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
-      await assertImagesLoaded(page!);
+      await assertImagesLoaded(page!, diag);
       if (hasHardErrors(diag)) throw new CollectedPageErrors();
       if (screenshotPath && screenshot) {
         fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
@@ -510,14 +569,14 @@ export async function checkBrowserAtUrl(
       // rendering is judged by the assertions and steps that follow.
       await page!.goto(url, { waitUntil: 'load', timeout: Math.min(remaining, 15_000) });
       await page!.waitForFunction('document.body.innerText.trim().length > 0', undefined, { timeout: 5000 });
-      await assertImagesLoaded(page!);
+      await assertImagesLoaded(page!, diag);
       await runSteps(page!, steps, (f) => { failedStep = f; });
       // Post-steps: re-assert images on the FINAL screen — in the
       // authenticated flow that is the post-login content, which the
       // pre-steps check (login screen) cannot see. Page errors collected
       // during the steps are judged by the hasHardErrors gate just below,
       // and the failure snapshot is taken from this same final screen.
-      await assertImagesLoadedAfterSteps(page!);
+      await assertImagesLoadedAfterSteps(page!, diag);
       const text = (await page!.locator('body').innerText()).slice(0, 6000);
       const snapshot = (await page!.locator('body').ariaSnapshot()).slice(0, 8000);
       if (hasHardErrors(diag)) throw new CollectedPageErrors();
@@ -540,13 +599,52 @@ export async function checkBrowserAtUrl(
   }
 }
 
-async function assertImagesLoaded(page: Page): Promise<void> {
-  const broken = await page.locator('img').evaluateAll((images) => images
+/** Display form of an image src in diagnostics (data URIs are truncated). */
+function displayImageSrc(src: string): string {
+  return src.length > 160 ? `${src.slice(0, 160)}…` : src;
+}
+
+/**
+ * The honest image criterion, applied on every screen this module
+ * asserts. A completed <img> is rejected when:
+ *  - it rendered no image data (naturalWidth === 0) — the classic broken
+ *    image, exactly as before; or
+ *  - it rendered pixels but this check never observed its currentSrc
+ *    arrive as a 2xx image/* network response — the signature of an
+ *    onError substitution (or a resource that never existed): the swap
+ *    target (typically an inline data URI) produces no response at all,
+ *    so provenance cannot be proven and the photo does not count.
+ * Images still loading (complete === false) are not judged yet — the
+ * same patience the previous criterion had.
+ */
+async function assertImagesLoaded(page: Page, diag: PageDiagnostics): Promise<void> {
+  const images = await page.locator('img').evaluateAll((els) => els
     .map((image) => image as unknown as { complete: boolean; naturalWidth: number; currentSrc: string; src: string; alt: string })
-    .filter((image) => image.complete && image.naturalWidth === 0)
-    .map((image) => ({ src: image.currentSrc || image.src, alt: image.alt })));
-  if (broken.length > 0) {
-    const detail = broken.slice(0, 8).map((image) => `${image.alt || '(no alt)'}: ${image.src}`).join('\n');
+    .map((image) => ({
+      complete: image.complete,
+      naturalWidth: image.naturalWidth,
+      src: image.currentSrc || image.src,
+      alt: image.alt,
+    })));
+  const rejected: { src: string; alt: string; reason: string }[] = [];
+  for (const image of images) {
+    if (!image.complete) continue;
+    if (image.naturalWidth === 0) {
+      rejected.push({ src: image.src, alt: image.alt, reason: 'no image data rendered (naturalWidth 0)' });
+      continue;
+    }
+    if (!diag.imageResponses.get(imageResponseKey(image.src))?.valid) {
+      rejected.push({
+        src: image.src,
+        alt: image.alt,
+        reason: 'no valid image response observed (possible error substitution or missing resource)',
+      });
+    }
+  }
+  if (rejected.length > 0) {
+    const detail = rejected.slice(0, 8)
+      .map((image) => `${image.alt || '(no alt)'}: ${displayImageSrc(image.src)} — ${image.reason}`)
+      .join('\n');
     throw new Error(`Broken images detected:\n${detail}`);
   }
 }
@@ -586,11 +684,11 @@ async function scrollThroughPage(page: Page): Promise<void> {
 /**
  * Post-steps image assertion, shared by checkBrowser and checkBrowserAtUrl:
  * scroll so lazy images load, settle briefly, then apply the exact same
- * broken-image criterion as the pre-steps check — but on the final screen.
+ * honest image criterion as the pre-steps check — but on the final screen.
  */
-async function assertImagesLoadedAfterSteps(page: Page): Promise<void> {
+async function assertImagesLoadedAfterSteps(page: Page, diag: PageDiagnostics): Promise<void> {
   await scrollThroughPage(page);
-  await assertImagesLoaded(page);
+  await assertImagesLoaded(page, diag);
 }
 
 async function browserStep(page: Page, step: BrowserStep): Promise<void> {
