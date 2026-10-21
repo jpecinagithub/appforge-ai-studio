@@ -233,6 +233,19 @@ export interface LlmToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  /**
+   * The `function.arguments` string exactly as the provider sent it
+   * (undefined when the provider omitted the field entirely). Set by the
+   * worker's response parser; undefined for locally-built calls (stub).
+   */
+  rawArguments?: string;
+  /**
+   * Set by the parser when the provider sent NO argument payload at all
+   * (field absent, empty or whitespace-only). Distinct from an explicit
+   * "{}" — the agent loop decides, per tool definition, whether the call
+   * is executable (see findMalformedToolCalls in the worker).
+   */
+  malformed?: 'empty-arguments';
 }
 
 export interface LlmMessage {

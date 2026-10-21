@@ -13,11 +13,12 @@ import type {
   AgentLimits,
   FileNode,
   LlmMessage,
+  LlmResponse,
   RunEventKind,
   RunStats,
   ToolResult,
 } from 'appforge-shared';
-import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js';
+import { LlmError, StubLlm, chatLlm, findMalformedToolCalls, isStubMode, type LlmConfig } from './llm.js';
 import type { DeploymentDriver } from './deploy/driver.js';
 import { createTools, nowIso, restoreRevision, type BestDynamicStateInfo, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
@@ -69,6 +70,37 @@ const DEFAULT_LIMITS: AgentLimits = {
 
 /** Consecutive failed verifications with the SAME diagnostic signature stop the run. */
 const MAX_REPEATED_ERROR_SIGNATURE = 3;
+
+/**
+ * Extra completions the loop requests when a response carries malformed
+ * tool calls (missing/empty arguments) before giving up with
+ * LLM_BAD_TOOL_ARGS: 1 initial + 2 retries = 3 completions per iteration.
+ */
+const MAX_MALFORMED_COMPLETION_RETRIES = 2;
+
+/** Consecutive `missing required argument` results for the SAME tool that abort the run. */
+const MAX_ARGUMENT_STREAK = 3;
+
+export interface ArgumentStreak {
+  tool: string;
+  count: number;
+}
+
+/**
+ * Corte rápido (safety net): tracks consecutive tool results whose error
+ * is a `missing required argument` rejection for the same tool. Any other
+ * result (success, a different error, a different tool) resets the streak.
+ * The completion-retry layer (findMalformedToolCalls) catches top-level
+ * required parameters before execution; this net covers the shapes it
+ * cannot see, e.g. nested item validation inside write_files, whose
+ * failures surface with the same error prefix from the tools themselves.
+ */
+export function updateArgumentStreak(streak: ArgumentStreak, tool: string, error: string | null | undefined): ArgumentStreak {
+  if (error != null && error.startsWith('missing required argument')) {
+    return streak.tool === tool ? { tool, count: streak.count + 1 } : { tool, count: 1 };
+  }
+  return { tool: '', count: 0 };
+}
 
 function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean): string {
   const userLang = lang === 'es' ? 'Spanish' : 'English';
@@ -292,6 +324,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const ALL_TOOL_DEFS = isDynamicProject ? [...TOOL_DEFS, ...DYNAMIC_TOOL_DEFS] : TOOL_DEFS;
   let singleFileMode = false;
   let malformedResponses = 0;
+  let argumentStreak: ArgumentStreak = { tool: '', count: 0 };
   const availableToolDefs = () => singleFileMode ? ALL_TOOL_DEFS.filter(tool => tool.name !== 'write_files') : ALL_TOOL_DEFS;
   const ctx: ToolContext = {
     db,
@@ -831,6 +864,56 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     return false;
   };
 
+  /**
+   * One model completion with malformed-tool-call retries. When the
+   * response carries tool calls with missing/empty arguments (provider
+   * sent no payload, or required parameters are absent), NONE of its
+   * calls is executed: the completion is re-requested with a temporary
+   * user notice naming the tools and the missing parameters, up to
+   * MAX_MALFORMED_COMPLETION_RETRIES extra times. The notice and the
+   * malformed response NEVER enter the canonical history — an assistant
+   * message holding tool calls without matching tool results would
+   * invalidate the next provider request. Retried completions count as
+   * LLM calls (usage and time) but not as iterations or tool errors;
+   * their usage is accounted here for the discarded responses, while the
+   * surviving response is accounted by the caller as usual. If the last
+   * retry is still malformed, throws a fatal LlmError LLM_BAD_TOOL_ARGS
+   * so the run ends with that code instead of burning tool turns on
+   * identical `missing required argument` rejections (production run
+   * 3723178d died exactly that way).
+   */
+  const requestCompletion = async (): Promise<LlmResponse> => {
+    const defs = availableToolDefs();
+    const once = (messages: LlmMessage[]): Promise<LlmResponse> => stub
+      ? stub.chat(messages, TOOL_DEFS)
+      : chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs, ...(singleFileMode ? { maxTokens: Math.min(llmConfig!.maxTokens, 4096) } : {}) }, messages, defs);
+    let resp = await once(history);
+    for (let retry = 1; ; retry++) {
+      const bad = findMalformedToolCalls(resp.toolCalls, defs);
+      if (bad.length === 0) return resp;
+      // This response is discarded: count it as an LLM call, never as
+      // an iteration or a tool error.
+      stats.llmCalls += 1;
+      stats.tokensIn += resp.usage.promptTokens;
+      stats.tokensOut += resp.usage.completionTokens;
+      const detail = bad.map((b) => `${b.name} (missing: ${b.missing.join(', ') || 'arguments'})`).join('; ');
+      if (retry > MAX_MALFORMED_COMPLETION_RETRIES) {
+        const err = new LlmError(
+          'LLM_BAD_TOOL_ARGS',
+          `Model emitted tool call(s) with missing or empty arguments in ${1 + MAX_MALFORMED_COMPLETION_RETRIES} consecutive completions: ${detail}. No tool from those responses was executed.`,
+        );
+        err.fatal = true;
+        throw err;
+      }
+      emit(db, runId, 'log', { text: `llm malformed tool call(s): ${bad.map((b) => b.name).join(', ')} — retrying completion (${retry}/${MAX_MALFORMED_COMPLETION_RETRIES})` });
+      const notice: LlmMessage = {
+        role: 'user',
+        content: `Your previous reply contained tool call(s) with missing or empty arguments: ${detail}. Re-emit each call with its complete required arguments.`,
+      };
+      resp = await once([...history, notice]);
+    }
+  };
+
   for (let iter = 1; ; iter++) {
     if (cancelledNow()) {
       addAssistantMessage(db, project.id, t('cancelled'));
@@ -861,8 +944,19 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     let resp;
     const llmT0 = Date.now();
     try {
-      resp = stub ? await stub.chat(history, TOOL_DEFS) : await chatLlm({ ...llmConfig!, deadline: lastProgressAt + limits.runTimeoutMs, ...(singleFileMode ? { maxTokens: Math.min(llmConfig!.maxTokens, 4096) } : {}) }, history, availableToolDefs());
+      resp = await requestCompletion();
     } catch (e) {
+      if (e instanceof LlmError && e.fatal) {
+        // Persistent malformed tool calls: the completion retries inside
+        // requestCompletion are already exhausted, so the run ends here
+        // with the LLM error code (finishError accounts the error itself;
+        // the discarded completions were accounted by requestCompletion).
+        stats.llmMs += Date.now() - llmT0;
+        lastError = e.message;
+        emit(db, runId, 'log', { text: e.message });
+        finishError(e.message, e.code);
+        return;
+      }
       if (e instanceof LlmError && ['LLM_TRUNCATED', 'LLM_BAD_TOOL_ARGS'].includes(e.code)) {
         stats.errors++;
         stats.llmCalls++;
@@ -924,6 +1018,19 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         name: tc.name,
         content: JSON.stringify({ ...result, output: result.output?.slice(0, 16000) }),
       });
+      // Corte rápido: MAX_ARGUMENT_STREAK consecutive `missing required
+      // argument` rejections for the same tool mean the model keeps
+      // emitting calls this layer cannot fix (e.g. nested item shapes);
+      // stop instead of spending the run on identical rejections.
+      argumentStreak = updateArgumentStreak(argumentStreak, tc.name, result.error);
+      if (argumentStreak.count >= MAX_ARGUMENT_STREAK) {
+        await failRun(
+          `Tool ${tc.name} received calls without required arguments ${MAX_ARGUMENT_STREAK} times in a row (last rejection: ${result.error}). The model is emitting malformed calls for this tool; stopping instead of repeating identical rejections.`,
+          'TOOL_ARGUMENT_STAGNATION',
+          true,
+        );
+        return;
+      }
     }
     // Repair turns must receive fresh compiler/browser diagnostics after each
     // response, not only after spending the entire repair reserve on patches.

@@ -46,6 +46,14 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const MAX_ATTEMPTS = 3;
 
 export class LlmError extends Error {
+  /**
+   * When true, the agent loop must end the run with this error instead of
+   * attempting its recovery strategies (used when a failure has already
+   * exhausted its own in-call retries, e.g. persistent malformed tool
+   * calls after the completion-retry budget).
+   */
+  public fatal = false;
+
   constructor(
     public readonly code: string,
     message: string,
@@ -155,15 +163,29 @@ export function parseResponse(body: unknown): LlmResponse {
   const msg = choice.message ?? {};
   const toolCalls: LlmToolCall[] = [];
   for (const tc of msg.tool_calls ?? []) {
+    const raw: unknown = tc.function?.arguments;
+    const rawStr = typeof raw === 'string' ? raw : undefined;
+    // No argument payload at all (field absent/null, empty or whitespace
+    // only): the call parses to {} but is MARKED, so the agent loop can
+    // tell "the provider sent nothing" apart from "the tool needs no
+    // arguments" — silently treating both as {} is what let a run burn
+    // its whole budget on `missing required argument` rejections
+    // (production run 3723178d: read_file ×5 and write_file ×1, all {}).
+    const emptyPayload = rawStr !== undefined ? rawStr.trim() === '' : raw === undefined || raw === null;
     let args: Record<string, unknown> = {};
-    try {
-      args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {};
-      if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('not an object');
-    } catch (error) {
-      const position = /position (\d+)/.exec(String((error as Error).message))?.[1];
-      throw new LlmError('LLM_BAD_TOOL_ARGS', `Invalid JSON arguments for tool ${tc.function?.name} (${String(tc.function?.arguments ?? '').length} characters${position ? `, position ${position}` : ''}); expected a JSON object`);
+    if (!emptyPayload) {
+      try {
+        args = JSON.parse(rawStr ?? (raw as string));
+        if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('not an object');
+      } catch (error) {
+        const position = /position (\d+)/.exec(String((error as Error).message))?.[1];
+        throw new LlmError('LLM_BAD_TOOL_ARGS', `Invalid JSON arguments for tool ${tc.function?.name} (${String(tc.function?.arguments ?? '').length} characters${position ? `, position ${position}` : ''}); expected a JSON object`);
+      }
     }
-    toolCalls.push({ id: String(tc.id ?? ''), name: String(tc.function?.name ?? ''), arguments: args });
+    const call: LlmToolCall = { id: String(tc.id ?? ''), name: String(tc.function?.name ?? ''), arguments: args };
+    if (rawStr !== undefined) call.rawArguments = rawStr;
+    if (emptyPayload) call.malformed = 'empty-arguments';
+    toolCalls.push(call);
   }
   const usage = (body as { usage?: any }).usage ?? {};
   const llmUsage: LlmUsage = {
@@ -171,6 +193,49 @@ export function parseResponse(body: unknown): LlmResponse {
     completionTokens: Number(usage.completion_tokens ?? 0),
   };
   return { content: typeof msg.content === 'string' ? msg.content : null, toolCalls, usage: llmUsage };
+}
+
+export interface MalformedToolCall {
+  name: string;
+  /** Required parameters that are absent, null or empty strings. */
+  missing: string[];
+}
+
+function requiredParams(def: ToolDef | undefined): string[] {
+  const required = (def?.parameters as { required?: unknown } | undefined)?.required;
+  return Array.isArray(required) ? required.filter((p): p is string => typeof p === 'string') : [];
+}
+
+/**
+ * Pure detection of tool calls that cannot be executed as emitted:
+ *  (a) the parser marked them `malformed: 'empty-arguments'` (the provider
+ *      sent no payload at all) AND their tool definition requires at least
+ *      one parameter — every required parameter is missing by definition.
+ *      A no-required-parameter tool stays valid: its parsed arguments are
+ *      {} either way, so there is nothing to re-ask for.
+ *  (b) any required parameter of the tool definition is absent, null or
+ *      an empty/whitespace string in the parsed arguments (this catches
+ *      wrong-key emissions such as read_file {file: 'x'}, which parse
+ *      fine and carry no parser mark).
+ * Only top-level `parameters.required` is judged; nested item schemas
+ * (e.g. write_files files[].content) are validated by the tools
+ * themselves, and the loop's argument-stagnation breaker covers those.
+ */
+export function findMalformedToolCalls(toolCalls: LlmToolCall[], defs: ToolDef[]): MalformedToolCall[] {
+  const out: MalformedToolCall[] = [];
+  for (const tc of toolCalls) {
+    const required = requiredParams(defs.find((d) => d.name === tc.name));
+    if (tc.malformed === 'empty-arguments') {
+      if (required.length > 0) out.push({ name: tc.name, missing: [...required] });
+      continue;
+    }
+    const missing = required.filter((p) => {
+      const v = tc.arguments?.[p];
+      return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+    });
+    if (missing.length > 0) out.push({ name: tc.name, missing });
+  }
+  return out;
 }
 
 export async function chatLlm(cfg: LlmConfig, messages: LlmMessage[], tools: ToolDef[]): Promise<LlmResponse> {
