@@ -655,7 +655,33 @@ async function acquireImage(ctx: ToolContext, args: Record<string, unknown>): Pr
     query = strArg(args, 'query').trim();
     requestedPath = strArg(args, 'path').replaceAll('\\', '/');
     if (query.length < 2 || query.length > 160) return fail('INVALID_QUERY', 'query must contain 2 to 160 characters', Date.now() - t0);
-    if (!requestedPath.startsWith('public/')) return fail('INVALID_PATH', 'image assets must be saved below public/', Date.now() - t0);
+    // Destination contract: image assets live below public/. Normalize
+    // '.'/'..' segments away FIRST and re-check containment, so a path
+    // like 'public/../src/evil.jpg' is an INVALID_PATH instead of a
+    // quiet escape from public/. A missing destination DIRECTORY is not
+    // an error: it is created recursively right here — in the T-shirts
+    // run the agent burned two acquire_image calls and a manual
+    // create_directory on exactly that.
+    requestedPath = path.posix.normalize(requestedPath);
+    if (!requestedPath.startsWith('public/') || requestedPath === 'public/') {
+      return fail('INVALID_PATH', 'image assets must be saved below public/', Date.now() - t0);
+    }
+    const requestedExt = path.posix.extname(requestedPath).toLowerCase();
+    if (requestedExt && !['.jpg', '.jpeg', '.png', '.webp'].includes(requestedExt)) {
+      return fail(
+        'INVALID_PATH',
+        `unsupported destination extension "${requestedExt}"; save images as .jpg, .jpeg, .png or .webp (or pass no extension and let the downloaded image decide)`,
+        Date.now() - t0,
+      );
+    }
+    const destDir = path.posix.dirname(requestedPath);
+    if (destDir && destDir !== '.') {
+      try {
+        fs.mkdirSync(resolveIn(ctx.frontendDir, destDir), { recursive: true });
+      } catch (e) {
+        return fail((e as { code?: string }).code ?? 'INVALID_PATH', (e as Error).message, Date.now() - t0);
+      }
+    }
 
     const endpoint = new URL('https://api.openverse.org/v1/images/');
     endpoint.searchParams.set('q', query);
@@ -1083,7 +1109,7 @@ export const TOOL_DEFS: ToolDef[] = [
   { name: 'patch_file', description: 'Replace the FIRST occurrence of `search` with `replace` in a file relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('File path relative to frontend/ (or to the area root).'), search: S('Exact text to find (first occurrence).'), replace: S('Replacement text.') }, required: ['path', 'search', 'replace'], additionalProperties: false } },
   { name: 'delete_file', description: 'Delete a file or directory relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
   { name: 'create_directory', description: 'Create a directory (recursive) relative to frontend/ (or to the chosen area on dynamic projects).', parameters: { type: 'object', properties: { ...AREA_PARAM, path: S('Directory path relative to frontend/ (or to the area root).') }, required: ['path'], additionalProperties: false } },
-  { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified. One call has a total time budget; on failure the result carries alternatives. With fallback "placeholder", an unobtainable photo degrades to the official illustrative placeholder asset instead of failing (the degradation is declared in the run summary).', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.'), fallback: { type: 'string', enum: ['placeholder'], description: 'Optional. When set and no real photo can be acquired, place the platform illustrative placeholder (public/placeholder-illustrative.svg) and report success with data.degraded="illustrative-placeholder" instead of an error.' } }, required: ['query', 'path'], additionalProperties: false } },
+  { name: 'acquire_image', description: 'Find and download a relevant real photograph from Openverse under a commercial-reuse license. Saves the image below public/ plus a .license.json attribution receipt; the destination directory is created (recursively) when missing, so there is no need to create it first. Use the returned publicUrl in the UI and render a visible source/creator credit. Never claim the photo is the exact listed item unless independently verified. One call has a total time budget; on failure the result carries alternatives. With fallback "placeholder", an unobtainable photo degrades to the official illustrative placeholder asset instead of failing (the degradation is declared in the run summary).', parameters: { type: 'object', properties: { query: S('Specific visual search, including subject/model and desired angle or setting.'), path: S('Destination below public/, preferably without an extension, e.g. public/assets/cars/tesla-model-s.'), fallback: { type: 'string', enum: ['placeholder'], description: 'Optional. When set and no real photo can be acquired, place the platform illustrative placeholder (public/placeholder-illustrative.svg) and report success with data.degraded="illustrative-placeholder" instead of an error.' } }, required: ['query', 'path'], additionalProperties: false } },
   { name: 'search_code', description: 'Substring search across text files under frontend/ (or the chosen area on dynamic projects; skips node_modules, dist, .git).', parameters: { type: 'object', properties: { ...AREA_PARAM, pattern: S('Literal substring to search for.') }, required: ['pattern'], additionalProperties: false } },
   { name: 'install_dependencies', description: 'Ensure dependencies match package.json, updating a stale lockfile when needed. run_build does this automatically.', parameters: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'run_build', description: 'Install dependencies automatically, then run the strict TypeScript + Vite production build. Returns compiler diagnostics on failure.', parameters: { type: 'object', properties: {}, additionalProperties: false } },

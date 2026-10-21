@@ -136,6 +136,33 @@ describe('acquire_image', () => {
     expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });
   });
 
+  it('creates the destination directory up front instead of failing on it', async () => {
+    // Even when nothing is found, the destination folder the agent named
+    // must exist afterwards: a missing directory is created, never an
+    // INVALID_PATH detour through create_directory (T-shirts run).
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ results: [] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }));
+    const result = await createTools().acquire_image(ctx, { query: 'nothing found', path: 'public/brand/new/dir/hero' });
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe('IMAGE_NOT_FOUND');
+    expect(fs.existsSync(path.join(frontendDir, 'public', 'brand', 'new', 'dir'))).toBe(true);
+  });
+
+  it('rejects unsupported destination extensions with INVALID_PATH before searching', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const result = await createTools().acquire_image(ctx, { query: 'a photo', path: 'public/assets/anim.gif' });
+    expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects destinations that escape public/ through .. segments', async () => {
+    const result = await createTools().acquire_image(ctx, { query: 'a photo', path: 'public/../src/evil.jpg' });
+    expect(result).toMatchObject({ ok: false, code: 'INVALID_PATH' });
+    expect(fs.existsSync(path.join(frontendDir, 'src', 'evil.jpg'))).toBe(false);
+  });
+
   it('stops at the per-call budget and returns IMAGE_TIMEOUT with retryable + alternatives', async () => {
     process.env.APPFORGE_IMAGE_CALL_BUDGET_MS = '300';
     try {
