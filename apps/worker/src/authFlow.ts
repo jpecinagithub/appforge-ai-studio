@@ -283,6 +283,6 @@ export async function testAuthenticatedFlow(ctx: ToolContext): Promise<ToolResul
     };
   } catch (e) {
     const step = (e as { step?: string }).step ?? 'unknown';
-    return fail('AUTH_FLOW_FAILED', `authenticated flow failed at "${step}": ${(e as Error).message}`.slice(0, 2000), Date.now() - t0);
+    return fail('AUTH_FLOW_FAILED', `authenticated flow failed at "${step}": ${(e as Error).message}`.slice(0, 6000), Date.now() - t0);
   }
 }

@@ -1,8 +1,38 @@
 import { expect, it } from 'vitest';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { checkBrowser, type BrowserSession } from './browser.js';
+import {
+  checkBrowser,
+  checkBrowserAtUrl,
+  composeFailureDiagnostic,
+  type BrowserSession,
+  type PageDiagnostics,
+} from './browser.js';
+
+async function servePage(
+  html: string,
+  routes: Record<string, { status: number; body?: string }> = {},
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+    const route = routes[pathname];
+    if (route) {
+      res.writeHead(route.status, { 'Content-Type': 'application/json' });
+      res.end(route.body ?? '{}');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(html);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address() as { port: number };
+  return {
+    url: `http://127.0.0.1:${addr.port}/`,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
 
 it('keeps localStorage between browser tool calls despite temporary port changes', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-browser-'));
@@ -27,4 +57,93 @@ it('rejects a bundle with a broken image', async () => {
     expect(result.error).toContain('Broken images detected');
     expect(result.error).toContain('Missing motorcycle');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('failure diagnostic names the failed step, the page error and the missing data-testid', async () => {
+  // Reproduces the pcBOX shape: a render crash (toFixed on undefined) and a
+  // step waiting for a [data-testid="user-email"] that never appears.
+  const srv = await servePage(`<!doctype html><html><head><title>Diag Shop</title></head><body>
+    <div data-testid="auth-screen"><h1>Sign in to the shop</h1></div>
+    <p data-testid="product-price">Price pending</p>
+    <script>
+      const price = undefined;
+      document.querySelector('[data-testid="product-price"]').textContent = price.toFixed(2);
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('step 1/1 (expect_text "[data-testid="user-email"]") failed:');
+    expect(error).toContain('PAGE ERRORS:');
+    expect(error).toContain("Cannot read properties of undefined (reading 'toFixed')");
+    expect(error).toContain('selector [data-testid="user-email"]: NOT PRESENT in DOM');
+    expect(error).toContain('DATA-TESTID INVENTORY:');
+    expect(error).toContain('product-price');
+    expect(error).toContain('auth-screen');
+  } finally { await srv.close(); }
+});
+
+it('failure diagnostic lists /api/ network failures, not just static resources', async () => {
+  const srv = await servePage(`<!doctype html><html><head><title>Api Shop</title></head><body>
+    <h1>Shop home</h1>
+    <button data-testid="ok-button">OK</button>
+    <script>fetch('/api/boom').catch(() => {});</script>
+  </body></html>`, { '/api/boom': { status: 500, body: '{"error":{"code":"BOOM"}}' } });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'expect_visible', selector: '[data-testid="ok-button"]' },
+      { action: 'expect_visible', selector: '[data-testid="missing-thing"]' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('step 2/2 (expect_visible "[data-testid="missing-thing"]") failed:');
+    expect(error).toContain('NETWORK FAILURES:');
+    expect(error).toContain('HTTP 500 GET /api/boom');
+  } finally { await srv.close(); }
+});
+
+it('a passing flow carries no failure diagnostic block', async () => {
+  const srv = await servePage(`<!doctype html><html><head><title>Ok Shop</title></head><body>
+    <h1>Welcome</h1>
+    <p data-testid="user-email">someone@example.com</p>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+    ], 30000);
+    expect(result.ok).toBe(true);
+    expect(result.output ?? '').not.toContain('PAGE ERRORS:');
+    expect(result.output ?? '').not.toContain('NETWORK FAILURES:');
+    expect(result.output ?? '').not.toContain('NOT PRESENT in DOM');
+    expect(result.output ?? '').not.toContain(') failed:');
+  } finally { await srv.close(); }
+});
+
+it('caps the composed diagnostic at ~6000 chars with the actionable parts first', () => {
+  const diag: PageDiagnostics = {
+    pageErrors: ["TypeError: Cannot read properties of undefined (reading 'toFixed')"],
+    hardNetwork: [],
+    network: ['HTTP 500 POST /a/shop1/api/auth/login'],
+    consoleErrors: ['some console error'],
+  };
+  const out = composeFailureDiagnostic({
+    primaryError: new Error('locator timed out'),
+    failedStep: { index: 5, total: 9, step: { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'x@example.com' } },
+    diag,
+    snapshot: {
+      url: 'http://127.0.0.1/a/shop1/',
+      title: 'Shop',
+      selectorVerdict: 'selector [data-testid="user-email"]: NOT PRESENT in DOM',
+      testIds: Array.from({ length: 40 }, (_, i) => `tid-${i}`),
+      visibleText: 'lorem ipsum '.repeat(2000),
+    },
+  });
+  expect(out.length).toBeLessThanOrEqual(6000);
+  expect(out.startsWith('step 5/9 (expect_text "[data-testid="user-email"]") failed: locator timed out')).toBe(true);
+  expect(out).toContain('PAGE ERRORS:');
+  expect(out).toContain('NOT PRESENT in DOM');
+  expect(out).toContain('HTTP 500 POST /a/shop1/api/auth/login');
 });
