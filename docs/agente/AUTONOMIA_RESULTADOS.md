@@ -35,3 +35,7 @@ El desajuste de tipos de fila (punto 3 del fallo) no tiene lint mecánico barato
 - Worker: **424 ✓ / 0 ✗** (master: 415; +9 nuevos), 18 skipped preexistentes. Server: **110 ✓ / 0 ✗**. Typechecks de worker y server limpios.
 - La plantilla compila con su propio build (`npm ci && npm run build` en copia limpia) y `withTransaction` aparece en el `dist` generado.
 - Sin fusionar ni desplegar: pendiente de la decisión del usuario, como las fases anteriores.
+
+## Despliegue (21-oct-2026)
+
+Fusionada en `master` (fast-forward a `94a7c8d`) y redesplegada en la instancia edu de Oracle con el procedimiento seguro habitual (sin runs activos, mod local del compose conservada). Verificado dentro del contenedor: `backendContracts.ts` presente, sección «TEMPLATE API FACTS» en `agent.ts`, `withTransaction` en la plantilla servida; health local y público 200.
