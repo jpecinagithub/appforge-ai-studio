@@ -108,4 +108,4 @@ inventado una para este paquete.
 
 ## Despliegue (21-oct-2026)
 
-Fusionado en `master` (fast-forward a `170af12`) y redesplegado en la instancia edu con el procedimiento seguro (sin runs activos). Verificado dentro del contenedor healthy: la lista de copia del PATCH incluye `maxHardIterations` y `maxRepairAttempts`; `finalizeOnce` en ProjectView.tsx y `parseSseBlock` en sse.ts presentes en el código servido; health local y público 200.
+Fusionado en `master` (fast-forward a `170af12`) y redesplegado en la instancia edu con el procedimiento seguro (sin runs activos). Verificado dentro del contenedor healthy: la lista de copia del PATCH incluye `maxHardIterations` y `maxRepairAttempts` (línea 1936 del index.ts en ejecución). La imagen no incluye las fuentes del Studio, solo su `dist`: el bundle servido en el origen edu se compiló durante este despliegue (11:58 UTC) desde el checkout `170af12`, así que contiene los arreglos B1–B3; health local y público 200. Nota: un Studio servido desde otro origen (p. ej. Vercel) solo recibe el arreglo B al redesplegarse desde master.
