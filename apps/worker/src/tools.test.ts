@@ -273,6 +273,61 @@ describe('path confinement', () => {
   });
 });
 
+describe('frontend contract lint (write-time note)', () => {
+  it('annotates a write_file that hand-writes an absolute /api fetch', async () => {
+    const tools = createTools();
+    const r = await tools.write_file(ctx, {
+      path: 'src/App.tsx',
+      content: "export default function App() { return fetch('/api/shirts'); }",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.output ?? '').toContain('Frontend contract check');
+    expect(r.output ?? '').toContain('src/App.tsx');
+  });
+
+  it('does not annotate the API client file itself', async () => {
+    const tools = createTools();
+    const r = await tools.write_file(ctx, {
+      path: 'src/api.ts',
+      content: "export const login = () => fetch('/api/auth/login');",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.output ?? '').not.toContain('Frontend contract check');
+  });
+
+  it('annotates a patch_file whose replacement introduces the pattern', async () => {
+    const tools = createTools();
+    const w = await tools.write_file(ctx, { path: 'src/Cart.tsx', content: 'export function load() { return 1; }' });
+    expect(w.ok).toBe(true);
+    const r = await tools.patch_file(ctx, {
+      path: 'src/Cart.tsx',
+      search: 'return 1;',
+      replace: 'return fetch("/api/cart");',
+    });
+    expect(r.ok).toBe(true);
+    expect(r.output ?? '').toContain('Frontend contract check');
+  });
+
+  it('annotates write_files batches and stays silent on relative URLs', async () => {
+    const tools = createTools();
+    const bad = await tools.write_files(ctx, {
+      files: [
+        { path: 'src/Ok.tsx', content: "export const a = () => fetch('./api/shirts');" },
+        { path: 'src/Bad.tsx', content: "export const b = () => axios.get('/api/shirts');" },
+      ],
+    });
+    expect(bad.ok).toBe(true);
+    expect(bad.output ?? '').toContain('Frontend contract check');
+    expect(bad.output ?? '').toContain('src/Bad.tsx');
+    expect(bad.output ?? '').not.toContain('src/Ok.tsx');
+    const clean = await tools.write_files(ctx, {
+      files: [{ path: 'src/Ok2.tsx', content: "export const c = () => fetch('./api/shirts');" }],
+    });
+    expect(clean.ok).toBe(true);
+    expect(clean.output ?? '').not.toContain('Frontend contract check');
+  });
+});
+
 describe('patch_file', () => {
   it('reports PATCH_NOT_FOUND when search string is absent', async () => {
     const tools = createTools();

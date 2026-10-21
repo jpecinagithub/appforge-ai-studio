@@ -17,6 +17,7 @@ import { checkBrowser, type BrowserStep, type BrowserSession } from './browser.j
 import { resolveAreaPath, assertAreaText, readAreaTextFile } from './dynamicAreas.js';
 import { checkWriteGuard, frontendRootScriptError } from './writeGuard.js';
 import { backendContractsNote, migrationSqlNote } from './backendContracts.js';
+import { frontendContractsNote, isApiClientFile, type FrontendSnippet } from './frontendContracts.js';
 
 export interface ToolContext {
   db: Database.Database;
@@ -289,6 +290,27 @@ async function withBackendNotes(
   return noted;
 }
 
+/**
+ * Frontend contract lint annotation (see frontendContracts.ts): a
+ * hand-written absolute /api call in a frontend file compiles fine but
+ * escapes the app's /a/<projectId>/ prefix at runtime. Appended to the
+ * write result in the same non-blocking style as the backend notes.
+ * Only frontend files are judged (dynamic area "frontend", or any file
+ * of a static project), and never the API client itself.
+ */
+function frontendSnippet(area: string | null, rel: string, content: string): FrontendSnippet[] {
+  if (area !== null && area !== 'frontend') return [];
+  if (isApiClientFile(rel)) return [];
+  return [{ path: rel, content }];
+}
+
+function withFrontendNote(result: ToolResult, snippets: FrontendSnippet[]): ToolResult {
+  if (!result.ok || snippets.length === 0) return result;
+  const note = frontendContractsNote(snippets);
+  if (!note) return result;
+  return { ...result, output: result.output ? `${result.output}\n${note}` : note };
+}
+
 /** Annotates a successful write result with the backend typecheck note (never fails the write). */
 async function withBackendTypecheck(ctx: ToolContext, result: ToolResult, touchedBackend: boolean): Promise<ToolResult> {
   if (!touchedBackend || !result.ok) return result;
@@ -381,7 +403,8 @@ async function writeFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, 'utf8');
     const result: ToolResult = { ok: true, data: { bytes: Buffer.byteLength(content, 'utf8') }, durationMs: Date.now() - t0 };
-    return withBackendNotes(ctx, result, r.area === 'backend', [content], r.area === 'migrations' ? [content] : []);
+    const noted = await withBackendNotes(ctx, result, r.area === 'backend', [content], r.area === 'migrations' ? [content] : []);
+    return withFrontendNote(noted, frontendSnippet(r.area, r.rel, content));
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -423,13 +446,14 @@ async function writeFiles(ctx: ToolContext, args: Record<string, unknown>): Prom
       fs.writeFileSync(file.abs, file.content, 'utf8');
     }
     const result: ToolResult = { ok: true, data: { paths: files.map((file) => file.path) }, durationMs: Date.now() - t0 };
-    return withBackendNotes(
+    const noted = await withBackendNotes(
       ctx,
       result,
       files.some((f) => f.area === 'backend'),
       files.filter((f) => f.area === 'backend').map((f) => f.content),
       files.filter((f) => f.area === 'migrations').map((f) => f.content),
     );
+    return withFrontendNote(noted, files.flatMap((f) => frontendSnippet(f.area, f.rel, f.content)));
   } catch (e) {
     return fail((e as { code?: string }).code ?? 'WRITE_FAILED', (e as Error).message, Date.now() - t0);
   }
@@ -450,10 +474,11 @@ async function patchFile(ctx: ToolContext, args: Record<string, unknown>): Promi
     assertAreaText(next, p);
     fs.writeFileSync(abs, next, 'utf8');
     const result: ToolResult = { ok: true, data: { replacements: 1 }, durationMs: Date.now() - t0 };
-    // patch_file: the lint sees only the pasted replacement text, so the
+    // patch_file: the lints see only the pasted replacement text, so the
     // SQL note fires only when that text carries a complete CREATE TABLE
     // block — exactly the desired behaviour.
-    return withBackendNotes(ctx, result, r.area === 'backend', [replace], r.area === 'migrations' ? [replace] : []);
+    const noted = await withBackendNotes(ctx, result, r.area === 'backend', [replace], r.area === 'migrations' ? [replace] : []);
+    return withFrontendNote(noted, frontendSnippet(r.area, r.rel, replace));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return fail('FILE_NOT_FOUND', `file not found: ${args.path}`, Date.now() - t0);
     return fail((e as { code?: string }).code ?? 'PATCH_FAILED', (e as Error).message, Date.now() - t0);
