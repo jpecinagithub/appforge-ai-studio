@@ -1182,7 +1182,7 @@ export const DYNAMIC_TOOL_DEFS: ToolDef[] = [
   {
     name: 'test_authenticated_flow',
     description:
-      'Dynamic projects only: verify the authenticated user journey against the published preview at /a/:projectId/ (never a different server). Runs deterministic API checks (register, HttpOnly+SameSite cookie, session, CRUD, cross-user isolation, logout, 401) then real Chromium against the preview UI using stable data-testid selectors. Requires a ready fullstack preview. Takes no arguments: no URLs, selectors, credentials or commands are accepted.',
+      'Dynamic projects only: verify sessions against the published preview at /a/:projectId/. Checks registration, HttpOnly+SameSite cookie, independent user identities, logout and 401, then Chromium registration/session recovery/logout using stable auth data-testid selectors. Business CRUD and isolation belong in the mandatory project API tests. Requires a ready fullstack preview. Takes no arguments.',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
   },
   {

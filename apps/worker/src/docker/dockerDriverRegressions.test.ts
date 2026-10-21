@@ -1421,6 +1421,11 @@ describe('NO-GO2 B1: retención real de backups con protegidos desde SQLite', ()
     ) as BackupManifest;
     expect(m.hadDatabase).toBe(true);
     expect(m.files.map((f) => f.name)).toContain('app.db');
+    if (process.platform !== 'win32') {
+      const saved = fs.statSync(path.join(dataDir, 'project-backups', PID, created, 'app.db'));
+      expect(saved.uid).toBe(process.getuid!());
+      expect(saved.mode & 0o777).toBe(0o600);
+    }
     expect(r.data?.createdAt).toBe(m.createdAt);
     expect(r.data?.hadDatabase).toBe('true');
     expect(Number(r.data?.sizeBytes)).toBe(m.files.reduce((total, file) => total + file.size, 0));

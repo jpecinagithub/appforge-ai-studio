@@ -143,7 +143,7 @@ export const api = {
   listProjects: (p: { search?: string; type?: string; status?: string; page?: number; pageSize?: number } = {}) =>
     request<Page<Project>>(`/api/projects${qs(p)}`),
 
-  createProject: (body: { name: string; description?: string; type?: 'static' | 'dynamic' }) =>
+  createProject: (body: { name: string; description?: string; type?: 'static' | 'dynamic'; prompt?: string }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
 
   getProject: (id: string) => request<Project>(`/api/projects/${id}`),

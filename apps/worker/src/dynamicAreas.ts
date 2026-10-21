@@ -175,6 +175,13 @@ export function resolveAreaPath(
   const abs = resolveIn(areaRoot, p);
   const rel = toRel(path.resolve(areaRoot), abs);
   const relPosix = rel.split(path.sep).join('/');
+  const prefix = relPosix.split('/')[0] as DynamicArea;
+  if (AREA_NAMES.includes(prefix)) {
+    throw new AreaError(
+      'AREA_PREFIX_IN_PATH',
+      `Paths are relative to their area. Use area="${prefix}" and path="${relPosix.slice(prefix.length + 1) || '.'}" instead of "${p}". No file was changed.`,
+    );
+  }
   if (!def.allowed.test(relPosix)) {
     throw new AreaError(
       'AREA_PATH_NOT_ALLOWED',

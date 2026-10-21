@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { assessTechnologyCompatibility, SUPPORTED_TECHNOLOGIES } from './compatibility.js';
+import { assessTechnologyCompatibility, inferProjectType, SUPPORTED_TECHNOLOGIES } from './compatibility.js';
+
+it.each([
+  ['Tienda FULL-STACK con SQLite y cookies HttpOnly', 'dynamic'],
+  ['Catálogo con backend Node.js', 'dynamic'],
+  ['Landing responsive con React', 'static'],
+  ['Catálogo sin backend y sin SQLite, solo localStorage', 'static'],
+])('infers project type for %s', (prompt, type) => expect(inferProjectType(prompt)).toBe(type));
 
 describe('technology compatibility', () => {
   it('accepts the supported AppForge stack', () => {

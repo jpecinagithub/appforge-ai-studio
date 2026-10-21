@@ -59,6 +59,16 @@ function isNegated(text: string, matchIndex: number): boolean {
   return /(?:\bno\s+(?:usar|uses?|quiero|incluyas?|necesito)|\bsin|\bevita(?:r)?|\bwithout|\bdo\s+not\s+use|\bdon't\s+use|\bavoid)\s+(?:\w+[\s,]+){0,3}$/.test(prefix);
 }
 
+/** Strong backend requirements select the supported dynamic scaffold. */
+export function inferProjectType(prompt: string): 'static' | 'dynamic' {
+  const text = normalize(prompt);
+  const signals = /\b(?:full[ -]?stack|backend|sqlite|httpOnly)\b/gi;
+  for (const match of text.matchAll(signals)) {
+    if (!isNegated(text, match.index!)) return 'dynamic';
+  }
+  return 'static';
+}
+
 function formatMessage(incompatible: string[], language: CompatibilityLanguage): string {
   if (language === 'en') {
     return [

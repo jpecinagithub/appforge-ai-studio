@@ -61,6 +61,21 @@ describe('health', () => {
   });
 });
 
+describe('project type and backend requirements', () => {
+  it('scaffolds a backend when Automatic creation receives a full-stack prompt', async () => {
+    const created = await app.inject({method:'POST',url:'/api/projects',payload:{name:'PC Computers',prompt:'Tienda full-stack con backend Node.js y SQLite'}});
+    expect(created.statusCode).toBe(201);
+    const project=created.json();expect(project.type).toBe('dynamic');
+    expect(fs.existsSync(path.join(dataDir,'projects',project.id,'backend','src','server.ts'))).toBe(true);
+  });
+  it('rejects full-stack generation on an explicitly static project before consuming tokens', async () => {
+    const project=await createProject('Explicit static');
+    const response=await app.inject({method:'POST',url:`/api/projects/${project.id}/runs`,payload:{prompt:'Crear tienda full-stack con SQLite',language:'es'}});
+    expect(response.statusCode).toBe(409);expect(response.json().error.code).toBe('PROJECT_TYPE_MISMATCH');
+    expect(db.prepare('SELECT COUNT(*) n FROM runs WHERE project_id=?').get(project.id)).toEqual({n:0});
+  });
+});
+
 describe('production configuration', () => {
   it('requires a strong admin token and absolute data directory', () => {
     expect(() => assertProductionConfiguration({ APPFORGE_PRODUCTION: '1' }, '/data/appforge')).toThrow(

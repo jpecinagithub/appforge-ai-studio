@@ -11,7 +11,7 @@ export function CreateApp() {
   const navigate = useNavigate();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [type, setType] = useState<'static' | 'dynamic'>('static');
+  const [type, setType] = useState<'auto' | 'static' | 'dynamic'>('auto');
   const [prompt, setPrompt] = useState('');
   const [creating, setCreating] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -34,7 +34,8 @@ export function CreateApp() {
       const project = await api.createProject({
         name: name.trim(),
         description: description.trim() || undefined,
-        type,
+        type: type === 'auto' ? undefined : type,
+        prompt: prompt.trim(),
       });
       try {
         await api.createRun(project.id, prompt.trim(), lang);
@@ -76,7 +77,8 @@ export function CreateApp() {
           </Field>
 
           <Field label={t('create.typeLabel')}>
-            <Select value={type} onChange={(e) => setType(e.target.value as 'static' | 'dynamic')} disabled={creating}>
+            <Select value={type} onChange={(e) => setType(e.target.value as 'auto' | 'static' | 'dynamic')} disabled={creating}>
+              <option value="auto">{lang === 'es' ? 'Automático según la solicitud' : 'Automatic from request'}</option>
               <option value="static">{t('projects.typeStatic')}</option>
               <option value="dynamic">{t('projects.typeDynamic')}</option>
             </Select>
