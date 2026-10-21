@@ -222,3 +222,13 @@ implementación correría de mi cuenta: «no lo vas a hacer tú». La
 implementación de la Fase 2 (y con ella la regresión, que depende de que la
 fase exista) **no está asignada al asistente** salvo que Jon lo encargue de
 nuevo de forma explícita.
+
+## Fase 2 — COMPLETADA (21-oct-2026, rama `fix/agente-fase2` sobre `fix/agente-fase1`)
+
+Jon subió `fix/agente-fase1` a GitHub y encargó la implementación sobre esa
+rama exacta. Trabajos 6–8 implementados y verificados: fotos automáticas al
+crecer el prefijo, restauración verificada al mejor estado solo en fracaso,
+y herramienta de solo lectura `get_dynamic_status`. Detalle completo en
+`FASE2_RESULTADOS.md`. Cierre: worker 397 ✓ / 0 ✗, servidor 104 ✓ / 0 ✗,
+studio 9 ✓ / 0 ✗, typechecks limpios. La regresión real (Fase 4) sigue
+pendiente.

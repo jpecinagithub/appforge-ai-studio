@@ -19,10 +19,11 @@ import type {
 } from 'appforge-shared';
 import { LlmError, StubLlm, chatLlm, isStubMode, type LlmConfig } from './llm.js';
 import type { DeploymentDriver } from './deploy/driver.js';
-import { createTools, nowIso, type ToolContext } from './tools.js';
+import { createTools, nowIso, restoreRevision, type BestDynamicStateInfo, type ToolContext } from './tools.js';
 import { sourceFingerprint } from './fingerprint.js';
 import { TOOL_DEFS } from './tools.js';
-import { DYNAMIC_TOOL_DEFS, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks } from './dynamicTools.js';
+import { DYNAMIC_CHECK_ORDER, DYNAMIC_TOOL_DEFS, checkScopeFingerprint, createDynamicTools, dynamicGateStatus, invalidateDynamicChecks, validDynamicPrefixLength, type DynamicCheckKey } from './dynamicTools.js';
+import { deleteVerificationReceipts, recordVerificationReceipt } from './deploy/receipts.js';
 import { clearCancel, isCancelRequested } from './cancel.js';
 import { extractMissingLocalImages, imageQueryVariants, isUsableRasterAsset, patchImageReferences, repairErrorSignature, repairStateKey } from './recovery.js';
 
@@ -79,6 +80,7 @@ function systemPrompt(lang: 'es' | 'en', toolNames: string[], isDynamic: boolean
     '- Do NOT declare a dynamic app finished until all six succeed on the CURRENT sources. If you edit any source afterwards, the affected checks are invalidated automatically and you must re-run them in order. Never claim completion from the static checks (run_build/test_preview) alone.',
     '- run_migrations always runs against a temporary verification database; it never touches a live database.',
     '- start_fullstack_preview launches an ephemeral local preview (temporary SQLite, loopback only) published at /a/:projectId/ through the Studio proxy. test_authenticated_flow verifies it via API calls and real Chromium using stable data-testid selectors. Previews are provisional, never deployments.',
+    '- During repair, consult get_dynamic_status BEFORE acting: it shows the current gate (valid/stale/missing checks, current prefix and best state reached this run), so you fix the earliest broken check instead of guessing.',
   ] : [];
   return [
     'You are AppForge, an AI coding agent inside AppForge AI Studio. You operate on REAL files of a single project directory.',
@@ -298,6 +300,70 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     deploymentDriver: opts.deploymentDriver,
   };
 
+  // ---------------------------------------------------------------------
+  // Fase 2 — safety net for dynamic projects (Trabajos 6–8).
+  //
+  // The orchestrator (never the model) tracks the BEST state reached in
+  // this run: the longest valid-check prefix, tie-broken by API tests
+  // passed on those exact sources. Every prefix growth takes an automatic
+  // Git photo of that state (Trabajo 6). If the run later ends in failure,
+  // failRun() restores the best photo — and only that photo (Trabajo 7).
+  // get_dynamic_status exposes this tracking to the agent (Trabajo 8).
+  // Static projects are untouched by all of it.
+  // ---------------------------------------------------------------------
+  type BestState = BestDynamicStateInfo & { gitSha: string; fingerprint: string };
+  let bestState: BestState | null = null;
+  /** Check recorded by the tool currently executing (consumed in perform). */
+  let pendingRecordedCheck: DynamicCheckKey | null = null;
+  /** API tests passed on the CURRENT sources (reset by any source edit). */
+  let apiTestsPassedCurrent = 0;
+  ctx.onDynamicCheckRecorded = (key) => {
+    pendingRecordedCheck = key as DynamicCheckKey;
+  };
+  ctx.getBestDynamicState = () =>
+    bestState
+      ? {
+          prefixLength: bestState.prefixLength,
+          lastCheck: bestState.lastCheck,
+          apiTestsPassed: bestState.apiTestsPassed,
+          revisionId: bestState.revisionId,
+        }
+      : null;
+  const initialPrefixLength = isDynamicProject ? validDynamicPrefixLength(ctx) : 0;
+
+  const isBetterState = (a: BestState, b: BestState | null): boolean =>
+    !b || a.prefixLength > b.prefixLength || (a.prefixLength === b.prefixLength && a.apiTestsPassed > b.apiTestsPassed);
+
+  /**
+   * Trabajo 6: automatic photo of the state that just extended the valid
+   * prefix. Non-fatal by design (same criterion as the pre-run photo): a
+   * failed photo is logged and the run continues without it.
+   */
+  const takeAutoSnapshot = async (checkKey: DynamicCheckKey, prefixLength: number): Promise<void> => {
+    const label = `auto: tras ${checkKey} (run ${runId})`;
+    try {
+      const r = await tools.create_revision(ctx, { label });
+      if (!r.ok) {
+        emit(db, runId, 'log', { text: `auto snapshot failed (non-fatal): ${label}: ${r.error ?? r.code}` });
+        return;
+      }
+      const data = r.data as { id: string; sha: string };
+      const candidate: BestState = {
+        prefixLength,
+        lastCheck: checkKey,
+        apiTestsPassed: apiTestsPassedCurrent,
+        revisionId: data.id,
+        gitSha: data.sha,
+        fingerprint: sourceFingerprint(projectDir),
+      };
+      if (isBetterState(candidate, bestState)) bestState = candidate;
+      emit(db, runId, 'log', { text: `auto snapshot: ${label} — ${prefixLength}/6 checks valid` });
+      emit(db, runId, 'status', { phase: 'auto_snapshot', check: checkKey, prefixLength, revisionId: data.id });
+    } catch (e) {
+      emit(db, runId, 'log', { text: `auto snapshot failed (non-fatal): ${label}: ${(e as Error).message}` });
+    }
+  };
+
   // Optional checkpoint before touching files
   if (settings.autoRevision) {
     try {
@@ -366,6 +432,9 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
   const perform = async (name: string, args: Record<string, unknown>, id: string = randomUUID()): Promise<ToolResult> => {
     if (cancelledNow()) return { ok: false, code: 'CANCELLED', error: t('cancelled'), durationMs: 0 };
     const beforeFingerprint = sourceFingerprint(frontendDir);
+    // Fase 2: valid prefix before this tool, to detect growth afterwards.
+    const prefixBefore = isDynamicProject ? validDynamicPrefixLength(ctx) : 0;
+    pendingRecordedCheck = null;
     const remaining = limits.runTimeoutMs - (Date.now() - lastProgressAt);
     if (remaining <= 0) return { ok: false, code: 'RUN_TIMEOUT', error: t('runTimeout'), durationMs: 0 };
     ctx.cmdTimeoutMs = Math.min(limits.cmdTimeoutMs, remaining);
@@ -413,6 +482,37 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       if (isDynamicProject && fileTool) invalidateDynamicChecks(ctx);
     }
     emit(db, runId, 'tool_result', { id, name, ok: result.ok, code: result.code, error: result.error, output: (result.output ?? '').slice(0, 12000), durationMs: result.durationMs });
+    // Fase 2 (Trabajos 6–7): the tool has finished and the workspace is
+    // quiet, so this is the safe moment to photograph progress. A check
+    // recorded by THIS tool that extended the valid prefix triggers the
+    // automatic photo; repeating an already-valid check (no growth) does
+    // not. API test counts are tracked per-source for the best-state
+    // tie-break: any successful edit makes previous counts describe old
+    // sources, so they are reset.
+    if (isDynamicProject) {
+      if (name === 'run_api_tests') {
+        const counts = result.data as { pass?: unknown } | undefined;
+        if (counts && typeof counts.pass === 'number') apiTestsPassedCurrent = counts.pass;
+      }
+      if (result.ok && fileTool) apiTestsPassedCurrent = 0;
+      const recorded = pendingRecordedCheck;
+      pendingRecordedCheck = null;
+      if (recorded && result.ok) {
+        const prefixNow = validDynamicPrefixLength(ctx);
+        if (prefixNow > prefixBefore) await takeAutoSnapshot(recorded, prefixNow);
+      }
+      // Tie-break upkeep: an apiTests run (pass or fail) on the EXACT
+      // sources of the best photo can only improve its recorded count.
+      if (
+        name === 'run_api_tests' &&
+        bestState &&
+        validDynamicPrefixLength(ctx) === bestState.prefixLength &&
+        sourceFingerprint(projectDir) === bestState.fingerprint &&
+        apiTestsPassedCurrent > bestState.apiTestsPassed
+      ) {
+        bestState = { ...bestState, apiTestsPassed: apiTestsPassedCurrent };
+      }
+    }
     return result;
   };
 
@@ -503,10 +603,99 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     }
   };
 
+  /**
+   * Fase 2 (Trabajo 7): restore the workspace to the best photo of this
+   * run. Runs ONLY from failRun — i.e. after the agent loop has ended, on
+   * a quiet workspace — and returns the note that the final run message
+   * must carry (the restore, or the discrepancy if verification fails).
+   * Receipt coherence is explicit, not left to fingerprint side effects:
+   * persisted receipts after the restored prefix are deleted, the prefix
+   * receipts are re-recorded on the restored sources (degradation-era
+   * invalidation deletes receipts outright), and the in-memory gate is
+   * rebuilt to the same prefix — so a gate recomputed on the restored
+   * sources yields exactly the photo's state.
+   */
+  const restoreToBestState = async (target: BestState): Promise<string> => {
+    const es = settings.language === 'es';
+    emit(db, runId, 'status', { phase: 'restoring_best', check: target.lastCheck, prefixLength: target.prefixLength, revisionId: target.revisionId });
+    emit(db, runId, 'log', { text: `restoring best state: tras ${target.lastCheck} (${target.prefixLength}/6, revision ${target.revisionId})` });
+    const restored = await restoreRevision(ctx, target.gitSha);
+    if (!restored.ok) {
+      emit(db, runId, 'status', { phase: 'restore_failed', error: restored.error });
+      return es
+        ? `⚠️ Se intentó restaurar el mejor estado alcanzado (tras ${target.lastCheck}) pero la restauración falló: ${restored.error}`
+        : `⚠️ Tried to restore the best state reached (after ${target.lastCheck}) but the restore failed: ${restored.error}`;
+    }
+    const actualFingerprint = sourceFingerprint(projectDir);
+    if (actualFingerprint !== target.fingerprint) {
+      emit(db, runId, 'status', { phase: 'restore_mismatch', check: target.lastCheck, prefixLength: target.prefixLength });
+      return es
+        ? `⚠️ Restaurado a la foto tras ${target.lastCheck}, pero la huella de las fuentes NO coincide con la registrada en la foto: la restauración no se da por verificada.`
+        : `⚠️ Restored to the photo after ${target.lastCheck}, but the source fingerprint does NOT match the one recorded in the photo: the restore is not verified.`;
+    }
+    // Recibos coherentes con la foto, de forma explícita: se eliminan los
+    // posteriores al prefijo restaurado Y se re-registran los del prefijo
+    // con las huellas de las fuentes restauradas. Re-registrar es
+    // imprescindible: la invalidación durante la degradación ya había
+    // BORRADO todos los recibos (no los marca caducados), así que sin esto
+    // la puerta recalculada daría prefijo 0 sobre unas fuentes que son
+    // exactamente las de la foto.
+    try {
+      deleteVerificationReceipts(db, project.id, DYNAMIC_CHECK_ORDER.slice(target.prefixLength));
+      for (let i = 0; i < target.prefixLength; i++) {
+        const key = DYNAMIC_CHECK_ORDER[i]!;
+        const fp = checkScopeFingerprint(projectDir, key);
+        if (fp !== null) recordVerificationReceipt(db, project.id, key, fp, i);
+      }
+    } catch {
+      /* los recibos se recalculan por huella igualmente; nunca romper el cierre */
+    }
+    {
+      const keep = new Set<string>(DYNAMIC_CHECK_ORDER.slice(0, target.prefixLength));
+      const rebuilt: NonNullable<ToolContext['dynamicChecks']> = {};
+      for (let i = 0; i < target.prefixLength; i++) {
+        const key = DYNAMIC_CHECK_ORDER[i]!;
+        const fp = checkScopeFingerprint(projectDir, key);
+        if (fp !== null) rebuilt[key] = fp;
+      }
+      ctx.dynamicChecks = rebuilt;
+      ctx.dynamicChecksOrder = DYNAMIC_CHECK_ORDER.slice(0, target.prefixLength).filter((k) => keep.has(k));
+    }
+    emit(db, runId, 'status', { phase: 'restored_best', check: target.lastCheck, prefixLength: target.prefixLength, revisionId: target.revisionId });
+    emit(db, runId, 'log', { text: `restored to best state: tras ${target.lastCheck} (${target.prefixLength}/6 checks valid)` });
+    return es
+      ? `♻️ Restaurado al mejor estado alcanzado en esta ejecución: tras ${target.lastCheck} (${target.prefixLength}/6 comprobaciones válidas${target.apiTestsPassed > 0 ? `, ${target.apiTestsPassed} tests de API superados` : ''}). Los archivos coinciden con esa foto (huella verificada).`
+      : `♻️ Restored to the best state reached in this run: after ${target.lastCheck} (${target.prefixLength}/6 checks valid${target.apiTestsPassed > 0 ? `, ${target.apiTestsPassed} API tests passing` : ''}). The files match that photo (fingerprint verified).`;
+  };
+
+  /**
+   * Fase 2: unified failure exit for the agent loop. When `restore` is set
+   * (failure terminations only: repair limit, hard iteration limit,
+   * inactivity timeout) and a photo STRICTLY better than the run's initial
+   * state exists, the workspace is first restored to it; the final message
+   * always says expressly whether that happened. Success never reaches
+   * this path, and neither does cancellation.
+   */
+  const failRun = async (message: string, code: string | undefined, restore: boolean): Promise<void> => {
+    let finalMessage = message;
+    if (restore && isDynamicProject) {
+      if (bestState && bestState.prefixLength > initialPrefixLength) {
+        finalMessage = `${message}\n\n${await restoreToBestState(bestState)}`;
+      } else {
+        finalMessage =
+          `${message}\n\n` +
+          (settings.language === 'es'
+            ? 'No se restauró ningún estado anterior: la ejecución no llegó a superar el estado inicial, así que los archivos quedan como quedaron.'
+            : 'No earlier state was restored: the run never improved on its initial state, so the files are left as they ended.');
+      }
+    }
+    finishError(finalMessage, code);
+  };
+
   /** Performs a recorded circuit-breaker abort, if any. Returns true when the run was finished. */
-  const checkRepairAbort = (): boolean => {
+  const checkRepairAbort = async (): Promise<boolean> => {
     if (!repairAbortMessage) return false;
-    finishError(repairAbortMessage, 'REPAIR_LIMIT');
+    await failRun(repairAbortMessage, 'REPAIR_LIMIT', true);
     return true;
   };
 
@@ -585,7 +774,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       return;
     }
     if (Date.now() - lastProgressAt > limits.runTimeoutMs) {
-      finishError(t('runTimeout'));
+      await failRun(t('runTimeout'), undefined, true);
       return;
     }
     // Fase 1: hard iteration cap. Unlike maxIterations (which only forces
@@ -593,7 +782,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     // loop, so a runaway repair cannot iterate indefinitely.
     if (iter > limits.maxHardIterations) {
       stats.iterations = limits.maxHardIterations;
-      finishError(`${t('maxIterations')}\n\nHard iteration cap reached (${limits.maxHardIterations} iterations).`, 'ITERATION_LIMIT');
+      await failRun(`${t('maxIterations')}\n\nHard iteration cap reached (${limits.maxHardIterations} iterations).`, 'ITERATION_LIMIT', true);
       return;
     }
 
@@ -627,7 +816,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         emit(db, runId, 'status', { phase: 'recovering_model', code: e.code });
         continue;
       }
-      finishError(`${t('llmFailed')}: ${(e as Error).message}`, 'LLM_ERROR');
+      await failRun(`${t('llmFailed')}: ${(e as Error).message}`, 'LLM_ERROR', false);
       return;
     }
     stats.llmCalls += 1;
@@ -646,7 +835,7 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
         history.push({ role: 'user', content: lastError });
         if ((repairing || iter >= limits.maxIterations) && await verify()) return;
       } else if (await verify()) return;
-      if (checkRepairAbort()) return;
+      if (await checkRepairAbort()) return;
     }
 
     for (const tc of resp.toolCalls) {
@@ -664,12 +853,12 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     // response, not only after spending the entire repair reserve on patches.
     if ((!repairing && iter >= limits.maxIterations) || (repairing && resp.toolCalls.length > 0)) {
       if (await verify()) return;
-      if (checkRepairAbort()) return;
+      if (await checkRepairAbort()) return;
       if (stagnantRepairs >= maxStagnantRepairs) break;
     }
   }
 
-  finishError(`${t('repairLimit')}\n\n${lastError ?? t('maxIterations')}`, 'REPAIR_LIMIT');
+  await failRun(`${t('repairLimit')}\n\n${lastError ?? t('maxIterations')}`, 'REPAIR_LIMIT', true);
 }
 
 const ES: Record<string, string> = {
