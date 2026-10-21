@@ -185,7 +185,7 @@ it('failure diagnostic lists /api/ network failures, not just static resources',
   } finally { await srv.close(); }
 });
 
-it('fails when a step reveals a broken or empty image (post-steps assertion sees the final screen)', async () => {
+it('fails when a step reveals a broken or empty image (per-step assertion judges the screen the step leaves)', async () => {
   // The login/first screen has no images at all: the pre-steps assertion
   // passes. Only after the click does the (post-login) catalog render its
   // product photos — broken and empty — which is exactly the pcBOX shape
@@ -331,6 +331,127 @@ it('passes when the app serves the platform illustrative placeholder as image/sv
     const result = await checkBrowserAtUrl(srv.url, [], 30000);
     expect(result.ok).toBe(true);
     expect(result.output ?? '').not.toContain('Broken images');
+  } finally { await srv.close(); }
+});
+
+it('fails mid-flow when the content screen between steps carries a substituted photo, even if the final screen is clean', async () => {
+  // Regression, T-shirts run fac615d3: the product grid lives BETWEEN the
+  // authenticated flow's steps (after login, before logout), and the
+  // image assertions only judged the first and the final screen — both
+  // the login form — so a shop whose 40 product photos pointed at files
+  // that never existed closed 6/6. Three screens here: sign-in (no
+  // images) -> catalog (one onError-substituted photo, the exact
+  // production signature) -> signed out (no images). The endpoints are
+  // clean; only the new per-step assertion can fail this, and it must
+  // name the step that led to the offending screen.
+  const srv = await servePage(`<!doctype html><html><head><title>Flow Shirts Shop</title></head><body>
+    <h1>Sign in</h1>
+    <button data-testid="enter-shop">Enter shop</button>
+    <div id="slot"></div>
+    <script>
+      const slot = document.getElementById('slot');
+      document.querySelector('[data-testid="enter-shop"]').addEventListener('click', () => {
+        slot.innerHTML =
+          '<h2>Catalog</h2>' +
+          '<img src="/assets/products/arsenal-away.jpg" alt="Arsenal Away Shirt" onerror="this.onerror=null;this.src=\\'data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==\\';">' +
+          '<p>Arsenal Away Shirt</p>' +
+          '<button data-testid="leave-shop">Sign out</button>';
+        document.querySelector('[data-testid="leave-shop"]').addEventListener('click', () => {
+          slot.innerHTML = '<p>Signed out</p>';
+        });
+      });
+    </script>
+  </body></html>`, {
+    '/assets/products/arsenal-away.jpg': { status: 404, body: 'not found', contentType: 'text/plain' },
+  });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="enter-shop"]' },
+      { action: 'expect_text', value: 'Arsenal Away Shirt' },
+      { action: 'click', selector: '[data-testid="leave-shop"]' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('image assertion failed after step 1/3 (click "[data-testid="enter-shop"]")');
+    expect(error).toContain('Broken images detected');
+    expect(error).toContain('Arsenal Away Shirt');
+    expect(error).toContain('no valid image response observed');
+    // The flow stopped at the offending screen: the snapshot shows the
+    // catalog, and the clean sign-out screen was never reached.
+    expect(error).toContain('Catalog');
+    expect(error).not.toContain('Signed out');
+  } finally { await srv.close(); }
+});
+
+it('passes a three-screen flow whose middle screen carries a real photo', async () => {
+  // The counterpart: identical navigation shape, but the catalog photo
+  // really arrives as an image response — every per-step assertion
+  // passes and the flow completes all three steps.
+  const srv = await servePage(`<!doctype html><html><head><title>Flow Shirts Shop</title></head><body>
+    <h1>Sign in</h1>
+    <button data-testid="enter-shop">Enter shop</button>
+    <div id="slot"></div>
+    <script>
+      const slot = document.getElementById('slot');
+      document.querySelector('[data-testid="enter-shop"]').addEventListener('click', () => {
+        slot.innerHTML =
+          '<h2>Catalog</h2>' +
+          '<img src="/assets/products/arsenal-away.jpg" alt="Arsenal Away Shirt">' +
+          '<p>Arsenal Away Shirt</p>' +
+          '<button data-testid="leave-shop">Sign out</button>';
+        document.querySelector('[data-testid="leave-shop"]').addEventListener('click', () => {
+          slot.innerHTML = '<p>Signed out</p>';
+        });
+      });
+    </script>
+  </body></html>`, {
+    '/assets/products/arsenal-away.jpg': {
+      status: 200,
+      contentType: 'image/png',
+      body: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64'),
+    },
+  });
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="enter-shop"]' },
+      { action: 'expect_text', value: 'Arsenal Away Shirt' },
+      { action: 'click', selector: '[data-testid="leave-shop"]' },
+    ], 30000);
+    expect(result.ok).toBe(true);
+    expect((result.data as { stepsPassed: number }).stepsPassed).toBe(3);
+    expect(result.output ?? '').not.toContain('Broken images');
+  } finally { await srv.close(); }
+});
+
+it('passes a multi-screen flow with no images on any screen (per-step assertions stay silent)', async () => {
+  // Vacuity guard: screens without photos must not trip the per-step
+  // assertions — an empty image set is a pass, not a failure.
+  const srv = await servePage(`<!doctype html><html><head><title>Text Only App</title></head><body>
+    <h1>Sign in</h1>
+    <button data-testid="enter-app">Enter</button>
+    <div id="slot"></div>
+    <script>
+      const slot = document.getElementById('slot');
+      document.querySelector('[data-testid="enter-app"]').addEventListener('click', () => {
+        slot.innerHTML =
+          '<h2>Welcome back</h2>' +
+          '<p>Your tasks are text only.</p>' +
+          '<button data-testid="leave-app">Sign out</button>';
+        document.querySelector('[data-testid="leave-app"]').addEventListener('click', () => {
+          slot.innerHTML = '<p>Signed out</p>';
+        });
+      });
+    </script>
+  </body></html>`);
+  try {
+    const result = await checkBrowserAtUrl(srv.url, [
+      { action: 'click', selector: '[data-testid="enter-app"]' },
+      { action: 'expect_text', value: 'Welcome back' },
+      { action: 'click', selector: '[data-testid="leave-app"]' },
+      { action: 'expect_text', value: 'Signed out' },
+    ], 30000);
+    expect(result.ok).toBe(true);
+    expect((result.data as { stepsPassed: number }).stepsPassed).toBe(4);
   } finally { await srv.close(); }
 });
 
