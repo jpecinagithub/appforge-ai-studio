@@ -23,10 +23,14 @@ el esquema que producen las migraciones de un proyecto debe seguir siendo un
 tras la pasada de idempotencia y **antes** de `recordDynamicCheck(ctx,
 'migrations')`:
 
-- Aplica las migraciones de la plantilla servida a una segunda BD temporal
-  (dentro del mismo `tmpDir` que `run_migrations` ya limpia en todos los
-  caminos) con el mismo mecanismo cerrado: `runLive('npm', ['run',
-  'migrate'], { cwd: templateDir, extraEnv: { DB_PATH: <tmp> } })`.
+- Deriva el esquema de la plantilla ejecutando sus ficheros `.sql` de
+  migración directamente (orden de nombre, patrón `^\d+_.+\.sql$`) con
+  `db.exec` de `node:sqlite` sobre una segunda BD temporal (dentro del
+  mismo `tmpDir` que `run_migrations` ya limpia en todos los caminos).
+  Sin npm, sin compilación, sin dependencias instaladas: la derivación
+  funciona igual en desarrollo y en la imagen de producción, donde las
+  plantillas viajan como fuentes peladas (ver «Corrección de paridad con
+  producción»).
 - Lee ambas BDs en modo lectura con `node:sqlite` (`readDbSchema`:
   `sqlite_master` + `PRAGMA table_info` por tabla; se excluye la tabla de
   control `migrations`, que es estado del runner y no contrato).
@@ -81,27 +85,52 @@ nunca bloquea la escritura):
   proyecto — los tests de API ejercitan register/login, cuyos 500 nacen del
   esquema de sesiones.
 
+## Corrección de paridad con producción (21-oct-2026, segundo commit de la rama)
+
+La primera versión derivaba el esquema de la plantilla ejecutando su
+`npm run migrate`. Eso funcionaba en desarrollo pero NO en producción: la
+imagen Docker copia `templates/` como código fuente (`COPY templates
+templates` en `infra/Dockerfile`), sin instalar las dependencias del
+backend de la plantilla, y el `migrate` de la plantilla empieza
+compilando ese backend. Comprobado empíricamente sobre una copia pelada:
+`sh: 1: tsc: not found`. La guarda se saltaba a sí misma con su nota justo
+en el entorno que importa.
+
+La derivación final es la ejecución directa de SQL descrita en la capa 1:
+los `.sql` de la plantilla se aplican en orden sobre una BD temporal con
+`node:sqlite` y el resultado pasa por los mismos `readDbSchema` /
+`compareSchemas` ya existentes. Sin `runLive`, sin npm, sin dependencias
+externas. El lado del proyecto no cambia: su esquema sale de la
+`verify.db` real que `run_migrations` ya produce, y la tabla de control
+`migrations` sigue excluida de la comparación (la BD derivada por `exec`
+directo ni siquiera la crea; la `verify.db` del proyecto sí puede
+tenerla, y `readDbSchema` la excluye en ambos lados).
+
+Tests de paridad obligatorios (`dynamicTools.test.ts`): el fixture de
+plantilla de la guarda es ahora un árbol pelado con la forma de
+producción (sin `node_modules` y con el `migrate` real, que compila
+primero y no puede ejecutarse allí), y dos tests adicionales copian la
+plantilla REAL del repo sin `node_modules` en ninguna parte (verificado
+recorriendo el árbol) y comprueban que la guarda sigue activa y actúa en
+ambos sentidos: `sessions` sin `last_seen_at` →
+`SCHEMA_CONTRACT_VIOLATION` nombrándola y sin registrar el check; la 001
+de la plantilla verbatim → `run_migrations` ok.
+
 ## Límites honestos
 
 - **Fallback silencioso anotado:** si `APPFORGE_TEMPLATES_DIR` no está
-  definido, la plantilla no se localiza, su `npm run migrate` falla en ese
-  entorno o la introspección misma lanza, la guarda se **salta** y deja una
-  nota en el output de `run_migrations` (la misma filosofía que el fallback
-  de `implementationEvidence`). Nunca convierte un entorno no verificable
-  en un check fallido.
-- **Consecuencia práctica verificada hoy:** la imagen Docker de producción
-  copia `templates/` como código fuente (`COPY templates templates` en
-  `infra/Dockerfile`), sin instalar las dependencias del backend de la
-  plantilla, y el `npm run migrate` de la plantilla empieza compilando ese
-  backend (`tsc`). Comprobado empíricamente sobre una copia pelada:
-  `sh: 1: tsc: not found`. Tal como está la imagen, **en producción la
-  introspección se saltará con su nota** hasta que la imagen instale las
-  dependencias del backend de la plantilla (o `APPFORGE_TEMPLATES_DIR`
-  apunte a una copia instalada). Las capas 2 y 3 (lint al escribir, prompt,
-  contexto e inyección de `session.ts`) sí están activas en cualquier
-  entorno, y la introspección queda activa donde la plantilla servida es
-  ejecutable (checkouts de desarrollo con la plantilla instalada, fixtures
-  de CI).
+  definido, la plantilla no se localiza, algún `.sql` de la plantilla
+  falla al ejecutarse sobre una BD vacía o la introspección misma lanza,
+  la guarda se **salta** y deja una nota en el output de `run_migrations`
+  (la misma filosofía que el fallback de `implementationEvidence`). Nunca
+  convierte un entorno no verificable en un check fallido.
+- **Paridad con producción resuelta:** la derivación por SQL directo
+  solo necesita `node:sqlite`, presente donde corre el worker, así que la
+  introspección está activa también en la imagen de producción con las
+  plantillas como fuentes peladas (verificado por los tests de paridad
+  contra la copia pelada de la plantilla real). Las capas 2 y 3 (lint al
+  escribir, prompt, contexto e inyección de `session.ts`) actúan
+  igualmente en cualquier entorno.
 - **La comparación es contra la plantilla servida AHORA**, no contra la
   versión de la plantilla con la que se creó el proyecto: un proyecto creado
   con una plantilla antigua que difiera de la actual puede ser marcado
@@ -120,25 +149,30 @@ nunca bloquea la escritura):
 
 ## Tests
 
-11 tests nuevos; **ningún fixture existente necesitó ajuste** (los fixtures
-de `dynamicTools.test.ts` no definen `APPFORGE_TEMPLATES_DIR` → la guarda se
-salta con nota, comportamiento cubierto por un test nuevo; en
-`dynamicGate.test.ts` proyecto y plantilla stub son el mismo árbol → el
-superconjunto se cumple):
+13 tests nuevos (los demás fixtures existentes no necesitaron ajuste: los
+de `dynamicTools.test.ts` que no definen `APPFORGE_TEMPLATES_DIR`
+ejercitan el skip con nota, y en `dynamicGate.test.ts` proyecto y
+plantilla stub son el mismo árbol → el superconjunto se cumple). El
+fixture de plantilla de la propia guarda sí cambió con la corrección de
+paridad: pasó de un `migrate` falso ejecutable a un árbol pelado con la
+forma de producción:
 
 - `backendContracts.test.ts` (+6): parseo de columnas de la 001 fiel;
   constraints nunca cuentan como columnas; 001 fiel → silencio; `sessions`
   sin `last_seen_at` → nota que la nombra (el caso pcBOX); `users` sin
   `display_name` → nota; tablas no núcleo y `ALTER TABLE` → silencio.
-- `dynamicTools.test.ts` (+5): unidades puras de `compareSchemas`
+- `dynamicTools.test.ts` (+7): unidades puras de `compareSchemas`
   (superconjunto pasa; columna ausente nombrada; tabla ausente enumera sus
   columnas) y de `readDbSchema` (introspección real, `migrations`
-  excluida); extremo a extremo: 001 con `sessions` sin `last_seen_at` →
-  `SCHEMA_CONTRACT_VIOLATION` nombrando `sessions.last_seen_at`, check NO
-  registrado y temporales limpios; 001 fiel + tabla de dominio extra → ok;
-  sin dir de plantillas → skip con nota y check registrado.
+  excluida); extremo a extremo contra el fixture pelado: 001 con
+  `sessions` sin `last_seen_at` → `SCHEMA_CONTRACT_VIOLATION` nombrando
+  `sessions.last_seen_at`, check NO registrado y temporales limpios; 001
+  fiel + tabla de dominio extra → ok; sin dir de plantillas → skip con
+  nota y check registrado; y los dos tests PARITY contra la copia pelada
+  de la plantilla real del repo (violación y fiel), descritos en
+  «Corrección de paridad con producción».
 
-Resultados: worker **435 ✓ / 0 ✗** (baseline 424 + 11 nuevos; 18 skipped de
+Resultados: worker **437 ✓ / 0 ✗** (baseline 424 + 13 nuevos; 18 skipped de
 integración Docker, como siempre), server **110 ✓ / 0 ✗**, typecheck del
 worker (`npx tsc --noEmit -p tsconfig.json` en `apps/worker`) limpio.
 

@@ -7,6 +7,7 @@
  * node:sqlite in the fake migrate script).
  */
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,7 +17,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+
+/** The repo's real served templates root (what APPFORGE_TEMPLATES_DIR points at in production). */
+const REPO_TEMPLATES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'templates');
 import Database from 'better-sqlite3';
 import { describe, expect, test, afterEach } from 'vitest';
 import {
@@ -819,19 +824,50 @@ CREATE TABLE todos(
   updated_at TEXT NOT NULL
 );`;
 
-/** Templates root (the dir APPFORGE_TEMPLATES_DIR points at) with a runnable fake migrate. */
+/**
+ * Templates root (the dir APPFORGE_TEMPLATES_DIR points at) as a STRIPPED
+ * source tree — the production shape: no node_modules anywhere and a
+ * package.json whose migrate script mirrors the real template's (it
+ * compiles the backend first, so it cannot run in a bare tree: `tsc` is
+ * not installed there). The guard must derive the reference schema from
+ * the .sql files directly; if it ever went back to running the
+ * template's migrate, every guard test below would silently skip and the
+ * violation test would fail.
+ */
 function makeTemplateFixture(): string {
   const root = mkdtempSync(path.join(tmpdir(), 'af-dyn-templates-'));
   const tdir = path.join(root, 'dynamic-react-node');
-  mkdirSync(path.join(tdir, 'scripts'), { recursive: true });
   mkdirSync(path.join(tdir, 'migrations'), { recursive: true });
   writeFileSync(
     path.join(tdir, 'package.json'),
-    JSON.stringify({ name: 'fx-template', version: '0.1.0', private: true, scripts: { migrate: 'node scripts/fake-migrate.mjs' } }),
+    JSON.stringify({
+      name: 'fx-template',
+      version: '0.1.0',
+      private: true,
+      scripts: { migrate: 'npm --prefix backend run build && npm --prefix backend run migrate' },
+    }),
   );
-  writeFileSync(path.join(tdir, 'scripts', 'fake-migrate.mjs'), FAKE_MIGRATE);
   writeFileSync(path.join(tdir, 'migrations', '001_init.sql'), TEMPLATE_CORE_SQL);
   return root;
+}
+
+/** Stripped copy of the repo's REAL served templates (no node_modules in any part of the tree). */
+function makeStrippedRealTemplatesRoot(): string {
+  const root = mkdtempSync(path.join(tmpdir(), 'af-dyn-templates-real-'));
+  cpSync(REPO_TEMPLATES_DIR, root, {
+    recursive: true,
+    filter: (src) => !src.split(path.sep).includes('node_modules'),
+  });
+  return root;
+}
+
+function treeHasNodeModules(dir: string): boolean {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name === 'node_modules') return true;
+    if (treeHasNodeModules(path.join(dir, entry.name))) return true;
+  }
+  return false;
 }
 
 describe('schema contract guard', () => {
@@ -926,6 +962,54 @@ describe('schema contract guard', () => {
     expect(r.ok).toBe(true);
     expect(r.output).toContain('schema contract check skipped');
     expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    db.close();
+  });
+
+  // PARITY with production: the served templates are copied into the
+  // image as bare sources — no node_modules anywhere, and the template's
+  // own `npm run migrate` cannot run there (it compiles first). Against
+  // a stripped copy of the REAL repo template the guard must still be
+  // active and act in both directions (these two tests).
+  test('PARITY (violation): stripped real template, sessions without last_seen_at → SCHEMA_CONTRACT_VIOLATION, no check recorded', async () => {
+    const templatesRoot = track(makeStrippedRealTemplatesRoot());
+    expect(treeHasNodeModules(templatesRoot)).toBe(false);
+    const template001 = readFileSync(path.join(templatesRoot, 'dynamic-react-node', 'migrations', '001_init.sql'), 'utf8');
+    expect(template001).toContain('last_seen_at');
+    const dir = track(makeProject());
+    writeFileSync(path.join(dir, 'migrations', '001_init.sql'), template001.replace(',\n  last_seen_at TEXT NOT NULL', ''));
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    process.env.APPFORGE_TEMPLATES_DIR = templatesRoot;
+    try {
+      const r = await tools.run_migrations(ctx, {});
+      expect(r.ok).toBe(false);
+      expect(r.code).toBe('SCHEMA_CONTRACT_VIOLATION');
+      expect(r.error).toContain('sessions.last_seen_at');
+      expect(ctx.dynamicChecks?.migrations).toBeUndefined();
+    } finally {
+      delete process.env.APPFORGE_TEMPLATES_DIR;
+    }
+    db.close();
+  });
+
+  test('PARITY (faithful): stripped real template, project with the template 001 verbatim → run_migrations ok', async () => {
+    const templatesRoot = track(makeStrippedRealTemplatesRoot());
+    expect(treeHasNodeModules(templatesRoot)).toBe(false);
+    const template001 = readFileSync(path.join(templatesRoot, 'dynamic-react-node', 'migrations', '001_init.sql'), 'utf8');
+    const dir = track(makeProject());
+    writeFileSync(path.join(dir, 'migrations', '001_init.sql'), template001);
+    const db = makeStudioDb();
+    const ctx = makeCtx(db, dir);
+    const tools = createDynamicTools();
+    process.env.APPFORGE_TEMPLATES_DIR = templatesRoot;
+    try {
+      const r = await tools.run_migrations(ctx, {});
+      expect(r.ok).toBe(true);
+      expect(ctx.dynamicChecks?.migrations).toBeTruthy();
+    } finally {
+      delete process.env.APPFORGE_TEMPLATES_DIR;
+    }
     db.close();
   });
 });

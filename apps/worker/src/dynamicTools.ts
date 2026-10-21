@@ -558,12 +558,20 @@ const MIGRATION_FILE_RE = /^\d+_.+\.sql$/;
 //
 // The template reference is derived live from APPFORGE_TEMPLATES_DIR (the
 // same source implementationEvidence and verify() use): the template's
-// own `npm run migrate` is executed against a second temporary database
-// inside the same temp dir run_migrations already cleans up. When the
-// templates dir is unavailable, the template cannot run its migrations,
-// or introspection itself fails, the guard is SKIPPED with a note in the
-// tool output — it never turns an unverifiable environment into a failed
-// check (same philosophy as the implementation-evidence fallback).
+// migration .sql files are executed directly, in name order, against a
+// second temporary database inside the same temp dir run_migrations
+// already cleans up, and the result is introspected exactly like the
+// project's database. Deliberately NOT the template's `npm run migrate`:
+// in production the templates are copied into the image as bare sources
+// with no installed dependencies, and the migrate script starts by
+// compiling the backend — `tsc: not found` made the guard skip itself in
+// precisely the environment that matters. Plain SQL execution needs
+// nothing but node:sqlite, so the reference schema is derivable wherever
+// the worker runs. When the templates dir is unavailable, a template
+// migration fails on an empty database, or introspection itself fails,
+// the guard is SKIPPED with a note in the tool output — it never turns an
+// unverifiable environment into a failed check (same philosophy as the
+// implementation-evidence fallback).
 // ---------------------------------------------------------------------------
 
 /** Runner bookkeeping tables, not schema contract: excluded both sides. */
@@ -611,31 +619,43 @@ type SchemaGuardOutcome =
   | { kind: 'skipped'; note: string }
   | { kind: 'violation'; missing: string[] };
 
-async function checkSchemaContract(ctx: ToolContext, projectDbPath: string, tmpDir: string): Promise<SchemaGuardOutcome> {
+/**
+ * Derive the template's schema by executing its migration SQL files
+ * directly (name order, MIGRATION_FILE_RE) against a throwaway SQLite
+ * database inside run_migrations' temp dir, then introspecting that
+ * database with the same readDbSchema used for the project side. No npm,
+ * no build step, no installed dependencies — see the section comment
+ * above for why the template's own migrate script cannot be used here.
+ * Throws on any failure; the caller converts that into a skip.
+ */
+function deriveTemplateSchema(templateDir: string, tmpDir: string): Map<string, Set<string>> {
+  const migrationsDir = path.join(templateDir, 'migrations');
+  const files = fs.readdirSync(migrationsDir).filter((f) => MIGRATION_FILE_RE.test(f)).sort();
+  if (files.length === 0) throw new Error('dynamic template has no migration files');
+  const templateDbPath = path.join(tmpDir, 'template-verify.db');
+  const db = new DatabaseSync(templateDbPath);
+  try {
+    for (const file of files) {
+      db.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
+    }
+  } finally {
+    db.close();
+  }
+  return readDbSchema(templateDbPath);
+}
+
+function checkSchemaContract(projectDbPath: string, tmpDir: string): SchemaGuardOutcome {
   const templatesDir = (process.env.APPFORGE_TEMPLATES_DIR ?? '').trim();
   if (!templatesDir) return { kind: 'skipped', note: 'schema contract check skipped (APPFORGE_TEMPLATES_DIR is not set)' };
   const templateDir = path.join(templatesDir, 'dynamic-react-node');
   if (!fs.existsSync(path.join(templateDir, 'package.json')) || !fs.existsSync(path.join(templateDir, 'migrations'))) {
     return { kind: 'skipped', note: 'schema contract check skipped (dynamic template not found under APPFORGE_TEMPLATES_DIR)' };
   }
-  // Same mechanism as the project passes: closed `npm run migrate` with a
-  // throwaway DB_PATH, here inside run_migrations' own temp dir so the
-  // existing cleanup covers it on every path.
-  const templateDbPath = path.join(tmpDir, 'template-verify.db');
-  const r = await runLive('npm', ['run', 'migrate'], {
-    cwd: templateDir,
-    timeoutMs: ctx.buildTimeoutMs,
-    isCancelled: ctx.isCancelled,
-    extraEnv: { DB_PATH: templateDbPath },
-  });
-  if (r.cancelled || r.timedOut || r.code !== 0) {
-    return { kind: 'skipped', note: 'schema contract check skipped (the template migrations could not be applied in this environment)' };
-  }
   try {
-    const missing = compareSchemas(readDbSchema(templateDbPath), readDbSchema(projectDbPath));
+    const missing = compareSchemas(deriveTemplateSchema(templateDir, tmpDir), readDbSchema(projectDbPath));
     return missing.length === 0 ? { kind: 'ok' } : { kind: 'violation', missing };
   } catch {
-    return { kind: 'skipped', note: 'schema contract check skipped (schema introspection failed)' };
+    return { kind: 'skipped', note: 'schema contract check skipped (the template schema could not be derived in this environment)' };
   }
 }
 
@@ -821,7 +841,7 @@ async function runMigrations(ctx: ToolContext, args: Record<string, unknown>): P
     // must keep every table/column the served template defines. A
     // violation fails WITHOUT recording the check — the project does not
     // get a migrations receipt for a schema its own auth code cannot use.
-    const guard = await checkSchemaContract(ctx, dbPath, tmpDir);
+    const guard = checkSchemaContract(dbPath, tmpDir);
     if (guard.kind === 'violation') {
       cleanupTemp();
       return fail(
