@@ -15,11 +15,26 @@
  *  1. Key areas: BOTH `frontend/src` and `backend/src` must differ from
  *     the template. Changing only migrations/tests/docs does not count.
  *  2. Backend surface: at least one route file under `backend/src/routes/`
- *     that the template does not ship, or an existing route file (or
- *     `server.ts`) that declares MORE route handlers than its template
- *     counterpart.
- *  3. Frontend surface: `frontend/src/App.tsx` differs from the template,
- *     or `frontend/src` contains a file the template does not ship.
+ *     that the template does not ship, or an existing route file that
+ *     declares MORE route handlers than its template counterpart, or
+ *     `server.ts` itself declaring more handlers — AND, in every case,
+ *     the file must be WIRED: reachable from `backend/src/server.ts`
+ *     through the relative-import chain. A new route file that nothing
+ *     imports never runs, so it is not surface (symmetric hole, found by
+ *     characterization test on 2026-10-21: an unregistered routes file
+ *     satisfied the old check with `missing: []`).
+ *  3. Frontend surface: the app's ENTRY POINT must diverge from the
+ *     template — either `frontend/src/App.tsx` differs from the
+ *     template, or `frontend/src/main.tsx` differs AND the root
+ *     component it imports exists in the project and is new or differs
+ *     from its template counterpart (legitimate bypass of App.tsx).
+ *     New files under `frontend/src` that the entry chain never reaches
+ *     do NOT count: the live "T-shirts" case (2026-10-21, project
+ *     497f482d) closed done 6/6 and deployed the template's todo app
+ *     because the shop the agent built lived in unreferenced components
+ *     while App.tsx stayed byte-identical to the template — and the
+ *     authenticated flow only exercises auth, which the template passes
+ *     by construction.
  *
  * When the templates directory is unavailable the check reports
  * `checked: false` and the caller falls back to the legacy behaviour:
@@ -69,35 +84,142 @@ function countRouteHandlers(content: string): number {
   return (content.match(/\.(get|post|put|patch|delete|all)\s*\(/g) ?? []).length;
 }
 
+const CODE_EXTS = new Set(['.tsx', '.ts', '.jsx', '.js']);
+
+function isCodeFile(file: string): boolean {
+  return CODE_EXTS.has(path.extname(file));
+}
+
+/**
+ * Relative import specifiers ('./x', '../x') in a source file: static
+ * imports, side-effect imports, re-exports, dynamic import() and
+ * require(). Deliberately a regex, not a parser — good enough for
+ * import chains. (Residual imprecision, accepted: an import-shaped
+ * string inside a comment could add a phantom edge; a missed edge only
+ * ever makes the check stricter.)
+ */
+function relativeImports(content: string): string[] {
+  const specs = new Set<string>();
+  const re = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+)['"](\.[^'"]+)['"]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) specs.add(match[1]!);
+  return [...specs];
+}
+
+/** Resolve a relative specifier against the importing file's directory. */
+function resolveRelative(fromDir: string, spec: string): string | null {
+  const base = path.resolve(fromDir, spec);
+  const ext = path.extname(base);
+  const candidates: string[] = [];
+  if (ext) {
+    candidates.push(base);
+    // NodeNext-style specifiers in TS sources: './routes/todos.js' is
+    // really todos.ts on disk; '.jsx' maps to '.tsx', '.mjs' to '.ts'.
+    if (ext === '.js' || ext === '.mjs') candidates.push(base.slice(0, -ext.length) + '.ts');
+    if (ext === '.jsx') candidates.push(base.slice(0, -ext.length) + '.tsx');
+  } else {
+    for (const e of ['.tsx', '.ts', '.jsx', '.js']) candidates.push(base + e);
+    for (const e of ['.tsx', '.ts', '.jsx', '.js']) candidates.push(path.join(base, 'index' + e));
+  }
+  for (const candidate of candidates) {
+    try { if (fs.statSync(candidate).isFile()) return candidate; } catch { /* keep looking */ }
+  }
+  return null;
+}
+
+/**
+ * Every code file reachable from `entryFile` through relative imports
+ * (the entry file itself included). Bounded so a pathological import
+ * graph cannot hang the check.
+ */
+function reachableFrom(entryFile: string, maxFiles = 500): Set<string> {
+  const seen = new Set<string>();
+  const queue = [entryFile];
+  while (queue.length > 0 && seen.size < maxFiles) {
+    const file = queue.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const content = readOrNull(file);
+    if (content === null) continue;
+    for (const spec of relativeImports(content)) {
+      const resolved = resolveRelative(path.dirname(file), spec);
+      if (resolved !== null && isCodeFile(resolved) && !seen.has(resolved)) queue.push(resolved);
+    }
+  }
+  return seen;
+}
+
 function hasNewBackendSurface(projectDir: string, starter: string): boolean {
   const starterRoutesDir = path.join(starter, 'backend', 'src', 'routes');
   const projectRoutesDir = path.join(projectDir, 'backend', 'src', 'routes');
   const starterRoutes = listFiles(starterRoutesDir);
   const projectRoutes = listFiles(projectRoutesDir);
-  // A route file the template does not ship.
-  for (const file of projectRoutes) if (!starterRoutes.has(file)) return true;
-  // An existing route file (or server.ts) declaring more handlers than the
-  // template counterpart.
-  const comparable = [...projectRoutes].map((f) => path.join('routes', f));
-  comparable.push('server.ts');
-  for (const rel of comparable) {
-    const projectContent = readOrNull(path.join(projectDir, 'backend', 'src', rel));
+  const projectServer = path.join(projectDir, 'backend', 'src', 'server.ts');
+  // Wiring: a route file only counts if the server entry point reaches
+  // it through its import chain. An unregistered routes file is dead
+  // code, not surface.
+  const reachable = fs.existsSync(projectServer) ? reachableFrom(projectServer) : new Set<string>();
+  const isWired = (rel: string): boolean => reachable.has(path.join(projectRoutesDir, rel));
+  // server.ts itself declaring more handlers than its template
+  // counterpart (the entry point is wired by definition).
+  const serverContent = readOrNull(projectServer);
+  const starterServerContent = readOrNull(path.join(starter, 'backend', 'src', 'server.ts')) ?? '';
+  if (serverContent !== null && countRouteHandlers(serverContent) > countRouteHandlers(starterServerContent)) return true;
+  // A wired route file the template does not ship, declaring at least
+  // one handler (a barrel or helper with no handlers is not a route
+  // surface by itself — but the chain still reaches through it to the
+  // files that do declare them).
+  for (const file of projectRoutes) {
+    if (starterRoutes.has(file) || !isWired(file)) continue;
+    const content = readOrNull(path.join(projectRoutesDir, file));
+    if (content !== null && countRouteHandlers(content) > 0) return true;
+  }
+  // A wired route file declaring more handlers than its template
+  // counterpart.
+  for (const rel of projectRoutes) {
+    if (!isWired(rel)) continue;
+    const projectContent = readOrNull(path.join(projectRoutesDir, rel));
     if (projectContent === null) continue;
-    const starterContent = readOrNull(path.join(starter, 'backend', 'src', rel)) ?? '';
+    const starterContent = readOrNull(path.join(starterRoutesDir, rel)) ?? '';
     if (countRouteHandlers(projectContent) > countRouteHandlers(starterContent)) return true;
   }
   return false;
 }
 
-function hasNewFrontendSurface(projectDir: string, starter: string): boolean {
+/**
+ * Frontend surface = the app's entry point diverges from the template:
+ *  (a) `src/App.tsx` itself differs from the template; or
+ *  (b) `src/main.tsx` differs AND a root component it imports exists in
+ *      the project and is new or differs from its template counterpart
+ *      (legitimate bypass of App.tsx).
+ * Unreferenced new files no longer count — that was the T-shirts hole.
+ */
+function frontendSurface(projectDir: string, starter: string): { ok: boolean; appUnchanged: boolean } {
   const projectSrc = path.join(projectDir, 'frontend', 'src');
   const starterSrc = path.join(starter, 'frontend', 'src');
   const projectApp = readOrNull(path.join(projectSrc, 'App.tsx'));
   const starterApp = readOrNull(path.join(starterSrc, 'App.tsx'));
-  if (projectApp !== null && starterApp !== null && projectApp !== starterApp) return true;
-  const starterFiles = listFiles(starterSrc);
-  for (const file of listFiles(projectSrc)) if (!starterFiles.has(file)) return true;
-  return false;
+  const appUnchanged = projectApp !== null && starterApp !== null && projectApp === starterApp;
+  if (projectApp !== null && starterApp !== null && projectApp !== starterApp) {
+    return { ok: true, appUnchanged: false };
+  }
+  const projectMain = readOrNull(path.join(projectSrc, 'main.tsx'));
+  const starterMain = readOrNull(path.join(starterSrc, 'main.tsx'));
+  if (projectMain !== null && starterMain !== null && projectMain !== starterMain) {
+    for (const spec of relativeImports(projectMain)) {
+      const resolved = resolveRelative(projectSrc, spec);
+      if (resolved === null || !isCodeFile(resolved)) continue;
+      const rel = path.relative(projectSrc, resolved);
+      if (rel === 'main.tsx') continue;
+      const projectContent = readOrNull(resolved);
+      if (projectContent === null) continue;
+      const starterContent = readOrNull(path.join(starterSrc, rel));
+      if (starterContent === null || starterContent !== projectContent) {
+        return { ok: true, appUnchanged };
+      }
+    }
+  }
+  return { ok: false, appUnchanged };
 }
 
 export function implementationEvidence(projectDir: string, templatesDir?: string): ImplementationEvidence {
@@ -115,10 +237,13 @@ export function implementationEvidence(projectDir: string, templatesDir?: string
   if (!backendChanged) missing.push('backend/src is still the untouched starter template');
 
   if (!hasNewBackendSurface(projectDir, starter)) {
-    missing.push('no new backend route surface: add a route file under backend/src/routes or extend an existing one with new endpoints');
+    missing.push('no new backend route surface: add a route file under backend/src/routes and register it from backend/src/server.ts, or extend an existing registered route file with new endpoints');
   }
-  if (!hasNewFrontendSurface(projectDir, starter)) {
-    missing.push('no new frontend surface: src/App.tsx is unchanged and frontend/src has no new files');
+  const surface = frontendSurface(projectDir, starter);
+  if (!surface.ok) {
+    missing.push(surface.appUnchanged
+      ? 'entry point still renders the untouched template (frontend/src/App.tsx is unchanged); wire the root component so the app renders your implementation (e.g. render your main screen from App.tsx)'
+      : 'entry point still renders the untouched template (no new or changed root component is wired from frontend/src/main.tsx); wire the root component so the app renders your implementation (e.g. render your main screen from App.tsx)');
   }
   return { checked: true, implemented: missing.length === 0, missing };
 }
