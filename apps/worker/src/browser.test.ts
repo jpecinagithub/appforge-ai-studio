@@ -8,6 +8,7 @@ import {
   checkBrowser,
   checkBrowserAtUrl,
   composeFailureDiagnostic,
+  escapedBasePathWarnings,
   type BrowserSession,
   type PageDiagnostics,
 } from './browser.js';
@@ -244,11 +245,65 @@ it('resolves the page-error stack through the bundle sourcemap in the diagnostic
   }
 });
 
+it('base path warnings name the escaped request and stay silent otherwise', () => {
+  const page = 'http://127.0.0.1:3001/a/shop1/';
+  // The T-shirts signature: the app's own API works below the base, the
+  // hand-written absolute path escaped it.
+  const warnings = escapedBasePathWarnings(page, [
+    'http://127.0.0.1:3001/a/shop1/api/auth/me',
+    'http://127.0.0.1:3001/api/shirts',
+  ]);
+  expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toContain('request escaped the app base path');
+  expect(warnings[0]).toContain('/api/shirts');
+  expect(warnings[0]).toContain('/a/shop1/');
+  expect(warnings[0]).toContain('absolute /api path');
+  // Prefix-sibling paths are still escapes (base ends with '/').
+  expect(escapedBasePathWarnings(page, ['http://127.0.0.1:3001/a/shop1x/api'])).toHaveLength(1);
+  // The bare base without trailing slash is the app itself, not an escape.
+  expect(escapedBasePathWarnings(page, ['http://127.0.0.1:3001/a/shop1'])).toEqual([]);
+  // External origins owe nothing to the base path.
+  expect(escapedBasePathWarnings(page, ['https://cdn.example.com/api/shirts'])).toEqual([]);
+  // An app served at the root has no prefix to escape.
+  expect(escapedBasePathWarnings('http://127.0.0.1:3001/', ['http://127.0.0.1:3001/api/shirts'])).toEqual([]);
+});
+
+it('diagnostic carries the BASE PATH WARNING next to the network failures', async () => {
+  const srv = await servePage(`<!doctype html><html><head><title>Escape Shop</title></head><body>
+    <h1>Escape Shop</h1>
+    <p data-testid="user-email">someone@example.com</p>
+    <script>
+      fetch('/a/shop1/api/auth/me').catch(() => {});
+      fetch('/api/shirts').catch(() => {});
+    </script>
+  </body></html>`, {
+    '/a/shop1/api/auth/me': { status: 401, body: '{"error":{"code":"UNAUTHORIZED"}}' },
+    '/api/shirts': { status: 404, body: '{"error":{"code":"NOT_FOUND"}}' },
+  });
+  try {
+    // Navigate "into" the app prefix; a step then fails so the diagnostic
+    // is composed from the same screen the flow saw.
+    const result = await checkBrowserAtUrl(`${srv.url}a/shop1/`, [
+      { action: 'expect_text', selector: '[data-testid="user-email"]', value: 'someone@example.com' },
+      { action: 'expect_visible', selector: '[data-testid="never-rendered"]' },
+    ], 30000);
+    expect(result.ok).toBe(false);
+    const error = result.error ?? '';
+    expect(error).toContain('NETWORK FAILURES:');
+    expect(error).toContain('HTTP 404 GET /api/shirts');
+    expect(error).toContain('BASE PATH WARNING:');
+    expect(error).toContain('request escaped the app base path: /api/shirts');
+    // The in-prefix 401 is normal auth probing: listed, never warned about.
+    expect(error).not.toContain('escaped the app base path: /a/shop1/api/auth/me');
+  } finally { await srv.close(); }
+});
+
 it('caps the composed diagnostic at ~6000 chars with the actionable parts first', () => {
   const diag: PageDiagnostics = {
     pageErrors: ["TypeError: Cannot read properties of undefined (reading 'toFixed')"],
     hardNetwork: [],
     network: ['HTTP 500 POST /a/shop1/api/auth/login'],
+    networkUrls: ['http://127.0.0.1/a/shop1/api/auth/login'],
     consoleErrors: ['some console error'],
   };
   const out = composeFailureDiagnostic({

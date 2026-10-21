@@ -66,12 +66,14 @@ export interface PageDiagnostics {
   hardNetwork: string[];
   /** Every network failure (all resource types), compact lines, deduped. */
   network: string[];
+  /** Full URLs of the failed requests, parallel to `network`. */
+  networkUrls: string[];
   /** Console messages of type 'error', deduped, capped. Context only. */
   consoleErrors: string[];
 }
 
 function newPageDiagnostics(): PageDiagnostics {
-  return { pageErrors: [], hardNetwork: [], network: [], consoleErrors: [] };
+  return { pageErrors: [], hardNetwork: [], network: [], networkUrls: [], consoleErrors: [] };
 }
 
 /** Bounded text fetch for sourcemap resolution (bundles can be MBs). */
@@ -141,18 +143,29 @@ function attachPageDiagnostics(page: Page, diag: PageDiagnostics): void {
     if (msg.type() !== 'error') return;
     pushUnique(diag.consoleErrors, msg.text().slice(0, 300), MAX_CONSOLE_ERRORS);
   });
+  const recordFailure = (line: string, url: string, hard: boolean) => {
+    if (!diag.network.includes(line) && diag.network.length < 200) {
+      diag.network.push(line);
+      diag.networkUrls.push(url);
+    }
+    if (hard) pushUnique(diag.hardNetwork, line, 200);
+  };
   page.on('response', (response) => {
     if (response.status() < 400) return;
     const request = response.request();
-    const line = `HTTP ${response.status()} ${request.method()} ${urlPath(response.url())}`;
-    pushUnique(diag.network, line, 200);
-    if (STATIC_RESOURCE_TYPES.includes(request.resourceType())) pushUnique(diag.hardNetwork, line, 200);
+    recordFailure(
+      `HTTP ${response.status()} ${request.method()} ${urlPath(response.url())}`,
+      response.url(),
+      STATIC_RESOURCE_TYPES.includes(request.resourceType()),
+    );
   });
   page.on('requestfailed', (request) => {
     const failure = request.failure();
-    const line = `FAILED ${request.method()} ${urlPath(request.url())}${failure ? ` (${failure.errorText})` : ''}`;
-    pushUnique(diag.network, line, 200);
-    if (STATIC_RESOURCE_TYPES.includes(request.resourceType())) pushUnique(diag.hardNetwork, line, 200);
+    recordFailure(
+      `FAILED ${request.method()} ${urlPath(request.url())}${failure ? ` (${failure.errorText})` : ''}`,
+      request.url(),
+      STATIC_RESOURCE_TYPES.includes(request.resourceType()),
+    );
   });
 }
 
@@ -267,6 +280,46 @@ function selectNetworkLines(diag: PageDiagnostics): string[] {
 }
 
 /**
+ * Base-path escape warnings (deterministic, no guessing): a failed
+ * request whose same-origin path does NOT start with the page's own base
+ * path escaped the app — the signature of a hand-written absolute
+ * /api/... path (the app lives below /a/<projectId>/, or /p/<projectId>/
+ * for the static preview). In the T-shirts run the 404 on /api/shirts
+ * sat in NETWORK FAILURES next to the working /a/<id>/api/auth/me and
+ * the agent never connected them; this line names the conclusion.
+ * External origins are ignored (their paths owe nothing to the base),
+ * and an app served at the root cannot escape (no warnings).
+ */
+export function escapedBasePathWarnings(pageUrl: string, failedUrls: string[]): string[] {
+  let base: string;
+  let origin: string;
+  try {
+    const u = new URL(pageUrl);
+    origin = u.origin;
+    base = u.pathname.slice(0, u.pathname.lastIndexOf('/') + 1);
+  } catch {
+    return [];
+  }
+  if (!base || base === '/') return [];
+  const escaped = new Set<string>();
+  for (const raw of failedUrls) {
+    try {
+      const u = new URL(raw);
+      if (u.origin !== origin) continue;
+      if (u.pathname.startsWith(base) || u.pathname === base.slice(0, -1)) continue;
+      escaped.add(u.pathname);
+    } catch {
+      /* not a URL: ignore */
+    }
+  }
+  return [...escaped].slice(0, 5).map(
+    (p) =>
+      `request escaped the app base path: ${p} is outside the page base ${base} — likely an absolute /api path in the code; ` +
+      'route API calls through the project API client or a relative URL so they stay below the base path',
+  );
+}
+
+/**
  * Compose the labeled failure diagnostic, most actionable first, capped at
  * ~6000 chars (the visible-text excerpt and the testid inventory shrink
  * first). Layout:
@@ -274,6 +327,7 @@ function selectNetworkLines(diag: PageDiagnostics): string[] {
  *   PAGE ERRORS: ...
  *   selector [data-testid="..."]: NOT PRESENT in DOM        [when applicable]
  *   NETWORK FAILURES: ...
+ *   BASE PATH WARNING: ...                                  [when a request escaped the app prefix]
  *   CONSOLE ERRORS: ...
  *   PAGE: <url> — title: "..."
  *   DATA-TESTID INVENTORY: ...
@@ -300,6 +354,8 @@ export function composeFailureDiagnostic(args: {
     if (diag.pageErrors.length) sections.push(`PAGE ERRORS:\n${diag.pageErrors.join('\n')}`);
     if (snapshot?.selectorVerdict) sections.push(snapshot.selectorVerdict);
     if (networkLines.length) sections.push(`NETWORK FAILURES:\n${networkLines.join('\n')}`);
+    const baseWarnings = snapshot?.url ? escapedBasePathWarnings(snapshot.url, diag.networkUrls) : [];
+    if (baseWarnings.length) sections.push(`BASE PATH WARNING:\n${baseWarnings.join('\n')}`);
     if (diag.consoleErrors.length) sections.push(`CONSOLE ERRORS:\n${diag.consoleErrors.join('\n')}`);
     if (snapshot) {
       sections.push(`PAGE: ${snapshot.url} — title: "${snapshot.title}"`);
