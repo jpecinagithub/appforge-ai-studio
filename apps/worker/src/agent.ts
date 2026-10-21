@@ -39,6 +39,8 @@ export interface AgentSettings {
   maxHardIterations?: number;
   /** Fase 1: max failed repair verifications before the run is stopped. */
   maxRepairAttempts?: number;
+  /** Flexibilidad agéntica: per-run token ceiling (0 = no ceiling). */
+  maxRunTokens?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -63,6 +65,9 @@ const DEFAULT_LIMITS: AgentLimits = {
   // multi-step repairs (the identical-signature circuit breaker, at 3, is
   // the tight net for true loops), so the effective default is 12.
   maxRepairAttempts: 12,
+  // Flexibilidad agéntica (§4.1): the only cost ceiling. With counters no
+  // longer killing runs, this is the real economic safety net; 0 disables it.
+  maxRunTokens: 3_000_000,
   llmTimeoutMs: 120_000,
   cmdTimeoutMs: 180_000,
   runTimeoutMs: 900_000,
@@ -254,6 +259,8 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
     maxIterations: settings.maxIterations || DEFAULT_LIMITS.maxIterations,
     maxHardIterations: settings.maxHardIterations || DEFAULT_LIMITS.maxHardIterations,
     maxRepairAttempts: settings.maxRepairAttempts || DEFAULT_LIMITS.maxRepairAttempts,
+    // NOT `||`: 0 is a meaningful value here (no ceiling), not "unset".
+    maxRunTokens: settings.maxRunTokens ?? DEFAULT_LIMITS.maxRunTokens,
     llmTimeoutMs: settings.llmTimeoutMs || DEFAULT_LIMITS.llmTimeoutMs,
     cmdTimeoutMs: settings.cmdTimeoutMs || DEFAULT_LIMITS.cmdTimeoutMs,
     runTimeoutMs: settings.runTimeoutMs || DEFAULT_LIMITS.runTimeoutMs,
@@ -971,6 +978,16 @@ export async function runAgentOnce(db: Database.Database, runId: string, opts: R
       await failRun(t('runTimeout'), undefined, true);
       return;
     }
+    // Flexibilidad agéntica (§4.1): token ceiling — a fact, like the
+    // watchdog, checked at the same place. 0 means no ceiling.
+    if (limits.maxRunTokens > 0 && stats.tokensIn + stats.tokensOut >= limits.maxRunTokens) {
+      await failRun(
+        `${t('tokenBudget')}\n\nToken budget exhausted: ${stats.tokensIn + stats.tokensOut} tokens consumed (maxRunTokens=${limits.maxRunTokens}).`,
+        'TOKEN_BUDGET_EXHAUSTED',
+        true,
+      );
+      return;
+    }
     // Fase 1: hard iteration cap. Unlike maxIterations (which only forces
     // verify() and lets the repair phase run on), this always stops the
     // loop, so a runaway repair cannot iterate indefinitely.
@@ -1097,6 +1114,7 @@ const ES: Record<string, string> = {
   noKey: 'Falta la API key del proveedor LLM. Configura GROQ_API_KEY u OPENROUTER_API_KEY en el servidor (variables de entorno) y vuelve a intentarlo.',
   cancelled: 'Ejecución cancelada por el usuario.',
   runTimeout: 'La ejecución superó el tiempo máximo permitido y se detuvo. Los archivos generados se conservan.',
+  tokenBudget: 'La ejecución alcanzó el techo de tokens por run y se detuvo. Los archivos generados se conservan; puedes continuar desde este estado.',
   llmFailed: 'Fallo la llamada al modelo',
   emptySummary: 'Trabajo terminado.',
   loopDetected: 'Detecté que el agente repetía la misma operación sin avanzar y lo detuve. Los archivos generados se conservan; puedes continuar desde este estado.',
@@ -1114,6 +1132,7 @@ const EN: Record<string, string> = {
   noKey: 'Missing LLM provider API key. Set GROQ_API_KEY or OPENROUTER_API_KEY as server environment variables and retry.',
   cancelled: 'Run cancelled by the user.',
   runTimeout: 'The run exceeded the maximum allowed time and was stopped. Generated files are preserved.',
+  tokenBudget: 'The run reached its per-run token ceiling and was stopped. Generated files are preserved; you can continue from this state.',
   llmFailed: 'Model call failed',
   emptySummary: 'Work finished.',
   loopDetected: 'I detected the agent repeating the same operation without progress and stopped it. Generated files are preserved; you can continue from this state.',

@@ -300,6 +300,40 @@ describe('Fase 2 safety net', () => {
     db.close();
   }, 180000);
 
+  it('techo de tokens: agota maxRunTokens, restaura la mejor foto y cierra con TOKEN_BUDGET_EXHAUSTED', async () => {
+    const { runId, projectOnDisk } = setupRun(makeGateProject());
+    // Usage-heavy scripted responses: 1000 prompt tokens per completion.
+    const heavy = (r: LlmResponse): LlmResponse => ({ ...r, usage: { promptTokens: 1000, completionTokens: 0 } });
+    script([
+      heavy(toolCall('write_files', { files: [{ path: 'src/App.tsx', content: GOOD_APP }] })),
+      heavy(toolCall('run_frontend_build')),
+      heavy(toolCall('run_backend_build')),
+      heavy(toolCall('write_files', {
+        files: [
+          { path: 'src/App.tsx', content: BAD_APP },
+          { path: 'src/Junk.tsx', content: 'export const junk = "created while degrading";' },
+        ],
+      })),
+      heavy(toolCall('read_file', { path: 'package.json' })),
+    ]);
+    // Ceiling 3500: after 3 completions (3000) the degrade still runs;
+    // the 5th completion (4100 total) trips the check at iteration start.
+    await runAgentOnce(db, runId, { dataDir, settings: { ...settings, maxRunTokens: 3500 } });
+    const { status, error } = runStatus(runId);
+    expect(status).toBe('error');
+    expect(error ?? '').toMatch(/token ceiling/i);
+    expect(error ?? '').toContain('maxRunTokens=3500');
+    const errorEvents = (db.prepare("SELECT payload_json FROM run_events WHERE run_id=? AND kind='error'").all(runId) as Array<{ payload_json: string }>)
+      .map((r) => JSON.parse(r.payload_json) as { code?: string });
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]!.code).toBe('TOKEN_BUDGET_EXHAUSTED');
+    // The token death is a fact-based termination: it restores like the others.
+    expect(eventPhases(runId)).toContain('restored_best');
+    expect(fs.readFileSync(path.join(projectOnDisk, 'frontend', 'src', 'App.tsx'), 'utf8')).toBe(GOOD_APP);
+    expect(fs.existsSync(path.join(projectOnDisk, 'frontend', 'src', 'Junk.tsx'))).toBe(false);
+    db.close();
+  }, 180000);
+
   it('consulta de estado: get_dynamic_status devuelve el prefijo y el mejor estado en cada momento', async () => {
     const { runId } = setupRun(makeGateProject());
     const seen: Array<Record<string, any>> = [];

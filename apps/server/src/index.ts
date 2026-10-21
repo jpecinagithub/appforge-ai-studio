@@ -119,6 +119,8 @@ interface StoredSettings {
   maxHardIterations?: number;
   /** Fase 1: max failed repair verifications per run. */
   maxRepairAttempts?: number;
+  /** Flexibilidad agéntica: per-run token ceiling for the worker agent (0 = no ceiling). */
+  maxRunTokens?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -138,6 +140,7 @@ function defaultSettings(): StoredSettings {
     maxIterations: 8,
     maxHardIterations: 60,
     maxRepairAttempts: 12,
+    maxRunTokens: 3_000_000,
     llmTimeoutMs: Number(process.env.LLM_TIMEOUT_MS ?? 120_000),
     cmdTimeoutMs: 180_000,
     runTimeoutMs: 900_000,
@@ -166,6 +169,7 @@ export function toPublicSettings(s: StoredSettings): Settings {
     maxIterations: s.maxIterations,
     maxHardIterations: s.maxHardIterations,
     maxRepairAttempts: s.maxRepairAttempts,
+    maxRunTokens: s.maxRunTokens,
     llmTimeoutMs: s.llmTimeoutMs,
     cmdTimeoutMs: s.cmdTimeoutMs,
     runTimeoutMs: s.runTimeoutMs,
@@ -191,6 +195,7 @@ export function getAgentSettings(db: Database.Database): AgentSettings {
     maxIterations: s.maxIterations,
     maxHardIterations: s.maxHardIterations,
     maxRepairAttempts: s.maxRepairAttempts,
+    maxRunTokens: s.maxRunTokens,
     llmTimeoutMs: s.llmTimeoutMs,
     cmdTimeoutMs: s.cmdTimeoutMs,
     runTimeoutMs: s.runTimeoutMs,
@@ -553,6 +558,7 @@ const SettingsPatch = z.object({
   maxIterations: z.number().int().min(1).max(32).optional(),
   maxHardIterations: z.number().int().min(8).max(500).optional(),
   maxRepairAttempts: z.number().int().min(1).max(50).optional(),
+  maxRunTokens: z.number().int().min(0).max(20_000_000).optional(),
   llmTimeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   cmdTimeoutMs: z.number().int().min(1_000).max(600_000).optional(),
   runTimeoutMs: z.number().int().min(60_000).max(3_600_000).optional(),
@@ -1933,7 +1939,7 @@ export function buildServer(opts: ServerOptions): FastifyInstance {
     const body = SettingsPatch.parse(req.body);
     const stored = ensureSettingsRow(db);
     const next: StoredSettings = { ...stored };
-    for (const k of ['provider', 'model', 'temperature', 'maxTokens', 'maxIterations', 'maxHardIterations', 'maxRepairAttempts', 'llmTimeoutMs', 'cmdTimeoutMs', 'runTimeoutMs', 'language', 'theme', 'autoRevision', 'autoBuild'] as const) {
+    for (const k of ['provider', 'model', 'temperature', 'maxTokens', 'maxIterations', 'maxHardIterations', 'maxRepairAttempts', 'maxRunTokens', 'llmTimeoutMs', 'cmdTimeoutMs', 'runTimeoutMs', 'language', 'theme', 'autoRevision', 'autoBuild'] as const) {
       const v = (body as Record<string, unknown>)[k];
       if (v !== undefined) (next as unknown as Record<string, unknown>)[k] = v;
     }

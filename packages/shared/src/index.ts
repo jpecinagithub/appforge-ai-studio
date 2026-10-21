@@ -206,6 +206,8 @@ export interface Settings {
   /** Fase 1: optional — settings stored before the agent hardening may lack them. */
   maxHardIterations?: number;
   maxRepairAttempts?: number;
+  /** Flexibilidad agéntica: per-run token ceiling (0 = no ceiling). Optional for the same reason. */
+  maxRunTokens?: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;
@@ -271,8 +273,10 @@ export interface AgentLimits {
   maxIterations: number;
   /** Fase 1: hard stop for the agent loop (maxIterations only forces verify()). */
   maxHardIterations: number;
-  /** Fase 1: max failed repair verifications per run (was dead config before). */
+  /** Fase 1: failed repair verifications without progress that raise a stuck signal (was dead config before). */
   maxRepairAttempts: number;
+  /** Flexibilidad agéntica: per-run token ceiling (prompt + completion); 0 = no ceiling. */
+  maxRunTokens: number;
   llmTimeoutMs: number;
   cmdTimeoutMs: number;
   runTimeoutMs: number;

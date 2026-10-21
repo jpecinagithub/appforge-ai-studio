@@ -1,7 +1,9 @@
 /**
  * Fase 1 (agent hardening): the new loop limits are real settings —
  * defaults exist for fresh installs, stored values win, and they reach
- * the worker through getAgentSettings.
+ * the worker through getAgentSettings. Flexibilidad agéntica adds the
+ * per-run token ceiling (maxRunTokens, default 3M, 0 = no ceiling) to
+ * the same roundtrip.
  */
 import { describe, expect, it } from 'vitest';
 import Database from 'better-sqlite3';
@@ -47,6 +49,31 @@ describe('Fase 1 agent limit settings', () => {
     const merged = ensureSettingsRow(db);
     expect(merged.maxHardIterations).toBe(60);
     expect(merged.maxRepairAttempts).toBe(12);
+    db.close();
+  });
+
+  it('maxRunTokens: defaults to 3M, reaches the agent settings, and 0 (no ceiling) roundtrips', () => {
+    const db = makeDb();
+    const s = ensureSettingsRow(db);
+    expect(s.maxRunTokens).toBe(3_000_000);
+    expect(getAgentSettings(db).maxRunTokens).toBe(3_000_000);
+    db.prepare('UPDATE settings SET data_json=? WHERE id=1').run(
+      JSON.stringify({ ...s, maxRunTokens: 0 }),
+    );
+    // 0 is a real value (ceiling disabled), never replaced by the default.
+    expect(ensureSettingsRow(db).maxRunTokens).toBe(0);
+    expect(getAgentSettings(db).maxRunTokens).toBe(0);
+    db.close();
+  });
+
+  it('settings stored before the token ceiling fall back to the 3M default', () => {
+    const db = makeDb();
+    const s = ensureSettingsRow(db);
+    const legacy = { ...s } as Record<string, unknown>;
+    delete legacy.maxRunTokens;
+    db.prepare('UPDATE settings SET data_json=? WHERE id=1').run(JSON.stringify(legacy));
+    expect(ensureSettingsRow(db).maxRunTokens).toBe(3_000_000);
+    expect(getAgentSettings(db).maxRunTokens).toBe(3_000_000);
     db.close();
   });
 });
